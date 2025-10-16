@@ -1,150 +1,260 @@
 # adapters/binance_ws.py
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from typing import AsyncIterator, Iterable
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
-
-from stream.hub import Tick
-
-# Binance Futures combined stream endpoint
-FSTREAM = "wss://fstream.binance.com/stream"
 
 
-def _sym(s: str) -> str:
-    return s.lower()
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-def _streams(symbols: Iterable[str]) -> str:
-    """BTCUSDT,ETHUSDT -> 'btcusdt@bookTicker/btcusdt@aggTrade/btcusdt@markPrice@1s/...'"""
-    parts: list[str] = []
-    for s in symbols:
-        ls = _sym(s)
-        parts.append(f"{ls}@bookTicker")
-        parts.append(f"{ls}@aggTrade")
-        parts.append(f"{ls}@markPrice@1s")
-    return "/".join(parts)
-
-
-# --- простая диагностика для /debug/ws ---
-_last_rx_ts_ms: int | None = None
-_msg_counter: int = 0
-
-
-def ws_diag() -> dict:
-    return {"count": _msg_counter, "last_rx_ts_ms": _last_rx_ts_ms}
-
-
-@retry(stop=stop_after_attempt(10), wait=wait_exponential_jitter(0.5, 3.0))
-async def binance_stream(symbols: Iterable[str]) -> AsyncIterator[Tick]:
+class BinanceWS:
     """
-    Реальный комбинированный WS поток Binance Futures:
-    bookTicker + aggTrade + markPrice@1s.
-    Формируем нормализованные тик-снэпы Tick.
+    Тонкий WS-адаптер Binance:
+      - подписка на {symbol}@bookTicker и {symbol}@markPrice(@1s)
+      - хранит последние book/mark по каждому символу
+      - при любом апдейте эмитит ОДНО объединённое событие:
+        {
+          "symbol": "BTCUSDT", "ts_ms": 123, "price": mid,
+          "bid": ..., "ask": ..., "bid_size": ..., "ask_size": ...,
+          "mark_price":  ...
+        }
+      - никаких импортов из stream.hub / coalescer — только raw dict → внешний on_message()
     """
-    global _last_rx_ts_ms, _msg_counter
 
-    streams = _streams(symbols)
-    url = f"{FSTREAM}?streams={streams}"
+    def __init__(
+        self,
+        symbols: List[str],
+        *,
+        futures: bool = True,
+        mark_interval_1s: bool = True,
+        reconnect_min_delay_s: float = 1.0,
+        reconnect_max_delay_s: float = 8.0,
+        http_timeout_s: float = 20.0,
+    ) -> None:
+        self._symbols = [s.upper() for s in symbols]
+        self._futures = futures
+        self._mark_suffix = "@markPrice@1s" if mark_interval_1s else "@markPrice"
+        self._reconnect_min = reconnect_min_delay_s
+        self._reconnect_max = reconnect_max_delay_s
+        self._http_timeout_s = http_timeout_s
 
-    # кэши последних значений по символам
-    last_bid: dict[str, float] = {}
-    last_ask: dict[str, float] = {}
-    last_bsz: dict[str, float] = {}
-    last_asz: dict[str, float] = {}
-    last_trade: dict[str, float] = {}
-    last_mark: dict[str, float] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._runner_task: Optional[asyncio.Task] = None
+        self._stopping = asyncio.Event()
 
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=90)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.ws_connect(url, heartbeat=20) as ws:
-            async for msg in ws:
-                if msg.type is aiohttp.WSMsgType.CLOSED:
-                    break
-                if msg.type is not aiohttp.WSMsgType.TEXT:
-                    continue
+        # кэш последних значений для мерджа
+        self._book: Dict[str, Dict[str, float]] = {}  # {sym: {"bid":..., "ask":..., "bid_size":..., "ask_size":...}}
+        self._mark: Dict[str, float] = {}             # {sym: mark_price}
+        self._lock = asyncio.Lock()
 
-                try:
-                    payload = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    continue
+        # внешний колбэк
+        self._on_message: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
-                data = payload.get("data")
-                if not data:
-                    continue
+    # ------------- public API -------------
 
-                _msg_counter += 1
-                _last_rx_ts_ms = int(time.time() * 1000)
+    async def connect(self, on_message: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
+        """Старт фонового процесса с авто-переподключением."""
+        self._on_message = on_message
+        self._stopping.clear()
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._http_timeout_s))
+        self._runner_task = asyncio.create_task(self._runner())
 
-                # В комбинированном стриме внутри "data":
-                # bookTicker: иногда БЕЗ "e" (просто поля b/B, a/A), иногда c e="bookTicker"
-                # aggTrade: e="aggTrade"
-                # markPrice: e="markPriceUpdate"
-                stype = data.get("e")
-                sym = (data.get("s") or data.get("symbol") or "").upper()
-                if not sym:
-                    continue
+    async def close(self) -> None:
+        """Остановка и закрытие WS/HTTP."""
+        self._stopping.set()
+        if self._runner_task:
+            self._runner_task.cancel()
+            try:
+                await self._runner_task
+            except asyncio.CancelledError:
+                pass
+            self._runner_task = None
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._session:
+            await self._session.close()
+            self._session = None
 
-                # --- FIX: принимаем оба варианта bookTicker ---
-                is_book_ticker = (
-                    (stype is None and "b" in data and "a" in data)  # без e
-                    or (stype == "bookTicker")  # с e="bookTicker"
-                )
+    # ------------- internal -------------
 
-                if is_book_ticker:
+    def _build_url(self) -> str:
+        base = "wss://fstream.binance.com/stream" if self._futures else "wss://stream.binance.com:9443/stream"
+        parts: List[str] = []
+        for s in self._symbols:
+            parts.append(f"{s.lower()}@bookTicker")
+        for s in self._symbols:
+            # для спота тоже доступен markPrice@1s, оставим универсально
+            parts.append(f"{s.lower()}{self._mark_suffix}")
+        streams = "/".join(parts)
+        return f"{base}?streams={streams}"
+
+    async def _runner(self) -> None:
+        """Основной цикл с переподключением и чтением сообщений."""
+        backoff = self._reconnect_min
+        assert self._session is not None
+
+        while not self._stopping.is_set():
+            url = self._build_url()
+            try:
+                async with self._session.ws_connect(url, heartbeat=30) as ws:
+                    self._ws = ws
+                    backoff = self._reconnect_min  # сбросить бэкофф после успешного коннекта
+                    async for msg in ws:
+                        if self._stopping.is_set():
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._handle_ws_text(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.BINARY:
+                            # бинанс иногда шлёт gzip — aiohttp уже разжимает в TEXT,
+                            # на всякий случай поддержим бинарь как текст
+                            try:
+                                payload = msg.data.decode("utf-8")
+                                await self._handle_ws_text(payload)
+                            except Exception:
+                                continue
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            break
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            break
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # тихо подождём и переподключимся
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, self._reconnect_max)
+            finally:
+                if self._ws:
                     try:
-                        bid = float(data["b"])
-                        ask = float(data["a"])
-                        bsz = float(data.get("B", 0.0))
-                        asz = float(data.get("A", 0.0))
+                        await self._ws.close()
                     except Exception:
-                        continue
-                    last_bid[sym], last_ask[sym] = bid, ask
-                    last_bsz[sym], last_asz[sym] = bsz, asz
+                        pass
+                    self._ws = None
 
-                elif stype == "aggTrade":
-                    # последняя цена сделки
-                    p = data.get("p")
-                    if p is not None:
-                        try:
-                            last_trade[sym] = float(p)
-                        except Exception:
-                            pass
+        # выход
+        return
 
-                elif stype == "markPriceUpdate":
-                    # марк-цена
-                    p = data.get("p") or data.get("P")
-                    if p is not None:
-                        try:
-                            last_mark[sym] = float(p)
-                        except Exception:
-                            pass
+    async def _handle_ws_text(self, text: str) -> None:
+        """
+        Binance combined streams формат:
+          {"stream": "btcusdt@bookTicker", "data": {...}}
+        Нас интересуют два типа событий: bookTicker и markPriceUpdate.
+        """
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return
 
-                # Собираем тик только когда есть bid/ask и хоть какая-то цена
-                price = (
-                    last_trade.get(sym)
-                    or last_mark.get(sym)
-                    or (
-                        (last_bid.get(sym, 0.0) + last_ask.get(sym, 0.0)) / 2
-                        if sym in last_bid and sym in last_ask
-                        else None
-                    )
-                )
-                bid = last_bid.get(sym)
-                ask = last_ask.get(sym)
-                if price is None or bid is None or ask is None:
-                    continue
+        data = obj.get("data", obj)
+        if not isinstance(data, dict):
+            return
 
-                yield Tick(
-                    ts_ms=_last_rx_ts_ms,
-                    symbol=sym,
-                    price=float(price),
-                    bid=float(bid),
-                    ask=float(ask),
-                    bid_size=float(last_bsz.get(sym, 0.0)),
-                    ask_size=float(last_asz.get(sym, 0.0)),
-                    mark_price=last_mark.get(sym),
-                )
+        ev = data.get("e")
+        if ev == "bookTicker":
+            await self._on_book_ticker(data)
+        elif ev == "markPriceUpdate":
+            await self._on_mark_price(data)
+        else:
+            # некоторые реализации возвращают "miniTicker" или иные — игнорим
+            return
+
+    # ---------- parsers & merge ----------
+
+    async def _on_book_ticker(self, d: Dict[str, Any]) -> None:
+        """
+        Пример payload:
+          {
+            "e":"bookTicker","E":1680000000000,"u":..., "s":"BTCUSDT",
+            "b":"28000.10","B":"1.23","a":"28000.20","A":"2.34"
+          }
+        """
+        symbol = str(d.get("s", "")).upper()
+        if not symbol:
+            return
+
+        try:
+            bid = float(d["b"])
+            ask = float(d["a"])
+            bid_sz = float(d.get("B", 0.0))
+            ask_sz = float(d.get("A", 0.0))
+        except Exception:
+            return
+
+        async with self._lock:
+            self._book[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "bid_size": bid_sz,
+                "ask_size": ask_sz,
+            }
+            await self._emit_merged(symbol, ts_ms=int(d.get("E") or _now_ms()))
+
+    async def _on_mark_price(self, d: Dict[str, Any]) -> None:
+        """
+        Futures markPriceUpdate payload:
+          {"e":"markPriceUpdate","E":1680000000000,"s":"BTCUSDT","p":"28001.12", ...}
+        Иногда поле может называться 'p' или 'P' (строка). Поддержим оба.
+        """
+        symbol = str(d.get("s", "")).upper()
+        if not symbol:
+            return
+
+        p = d.get("p", d.get("P"))
+        try:
+            mark_price = float(p) if p is not None else None
+        except Exception:
+            mark_price = None
+
+        async with self._lock:
+            if mark_price is not None:
+                self._mark[symbol] = mark_price
+            # эмитим только если уже есть book — иначе нечем заполнить bid/ask
+            await self._emit_merged(symbol, ts_ms=int(d.get("E") or _now_ms()))
+
+    async def _emit_merged(self, symbol: str, ts_ms: int) -> None:
+        """
+        Собирает объединённый raw-снап и отдаёт его наружу через on_message().
+        Если нет book — ничего не посылаем (coalescer не соберёт тик).
+        """
+        if self._on_message is None:
+            return
+
+        book = self._book.get(symbol)
+        if not book:
+            return
+
+        bid = book["bid"]
+        ask = book["ask"]
+        bid_sz = book["bid_size"]
+        ask_sz = book["ask_size"]
+        mid = (bid + ask) / 2.0
+
+        raw = {
+            "symbol": symbol,
+            "ts_ms": ts_ms,
+            "price": mid,
+            "bid": bid,
+            "ask": ask,
+            "bid_size": bid_sz,
+            "ask_size": ask_sz,
+        }
+
+        mark = self._mark.get(symbol)
+        if mark is not None:
+            raw["mark_price"] = mark
+
+        try:
+            await self._on_message(raw)
+        except Exception:
+            # не роняем поток из-за ошибки внешнего обработчика
+            pass
