@@ -20,11 +20,13 @@ class BinanceWS:
       - хранит последние book/mark по каждому символу
       - при любом апдейте эмитит ОДНО объединённое событие:
         {
-          "symbol": "BTCUSDT", "ts_ms": 123, "price": mid,
+          "symbol": "BTCUSDT",
+          "ts_ms": 1739820000000, "ts": 1739820000,
+          "price": mid,
           "bid": ..., "ask": ..., "bid_size": ..., "ask_size": ...,
-          "mark_price":  ...
+          "mark_price":  ... (опционально)
         }
-      - никаких импортов из stream.hub / coalescer — только raw dict → внешний on_message()
+      - отдаёт raw dict через внешний on_message()
     """
 
     def __init__(
@@ -36,6 +38,7 @@ class BinanceWS:
         reconnect_min_delay_s: float = 1.0,
         reconnect_max_delay_s: float = 8.0,
         http_timeout_s: float = 20.0,
+        heartbeat_s: int = 30,
     ) -> None:
         self._symbols = [s.upper() for s in symbols]
         self._futures = futures
@@ -43,6 +46,7 @@ class BinanceWS:
         self._reconnect_min = reconnect_min_delay_s
         self._reconnect_max = reconnect_max_delay_s
         self._http_timeout_s = http_timeout_s
+        self._heartbeat_s = heartbeat_s
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -57,14 +61,29 @@ class BinanceWS:
         # внешний колбэк
         self._on_message: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
+        # диагностика
+        self._diag = {
+            "connects": 0,
+            "messages": 0,
+            "book_updates": 0,
+            "mark_updates": 0,
+            "merged_emits": 0,
+            "errors": 0,
+            "last_rx_ms": 0,
+            "last_emit_ms": 0,
+            "url": "",
+        }
+
     # ------------- public API -------------
 
     async def connect(self, on_message: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Старт фонового процесса с авто-переподключением."""
         self._on_message = on_message
         self._stopping.clear()
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._http_timeout_s))
-        self._runner_task = asyncio.create_task(self._runner())
+        if self._session is None:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._http_timeout_s))
+        if self._runner_task is None or self._runner_task.done():
+            self._runner_task = asyncio.create_task(self._runner())
 
     async def close(self) -> None:
         """Остановка и закрытие WS/HTTP."""
@@ -83,8 +102,18 @@ class BinanceWS:
                 pass
             self._ws = None
         if self._session:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:
+                pass
             self._session = None
+
+    def diag(self) -> Dict[str, Any]:
+        """Снимок диагностической информации (для /debug/diag)."""
+        # копию, чтобы не гонять мьютекс
+        d = dict(self._diag)
+        d["symbols"] = list(self._symbols)
+        return d
 
     # ------------- internal -------------
 
@@ -94,7 +123,7 @@ class BinanceWS:
         for s in self._symbols:
             parts.append(f"{s.lower()}@bookTicker")
         for s in self._symbols:
-            # для спота тоже доступен markPrice@1s, оставим универсально
+            # на spot markPrice@1s тоже есть; оставляем универсально
             parts.append(f"{s.lower()}{self._mark_suffix}")
         streams = "/".join(parts)
         return f"{base}?streams={streams}"
@@ -106,31 +135,36 @@ class BinanceWS:
 
         while not self._stopping.is_set():
             url = self._build_url()
+            self._diag["url"] = url
             try:
-                async with self._session.ws_connect(url, heartbeat=30) as ws:
+                async with self._session.ws_connect(url, heartbeat=self._heartbeat_s) as ws:
                     self._ws = ws
-                    backoff = self._reconnect_min  # сбросить бэкофф после успешного коннекта
+                    self._diag["connects"] += 1
+                    backoff = self._reconnect_min  # сброс бэкоффа после успеха
                     async for msg in ws:
                         if self._stopping.is_set():
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            self._diag["messages"] += 1
+                            self._diag["last_rx_ms"] = _now_ms()
                             await self._handle_ws_text(msg.data)
                         elif msg.type == aiohttp.WSMsgType.BINARY:
-                            # бинанс иногда шлёт gzip — aiohttp уже разжимает в TEXT,
-                            # на всякий случай поддержим бинарь как текст
+                            # aiohttp обычно уже даёт TEXT; на всякий — поддержим
                             try:
                                 payload = msg.data.decode("utf-8")
+                                self._diag["messages"] += 1
+                                self._diag["last_rx_ms"] = _now_ms()
                                 await self._handle_ws_text(payload)
                             except Exception:
+                                self._diag["errors"] += 1
                                 continue
-                        elif msg.type == aiohttp.WSMsgType.CLOSED:
-                            break
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
             except asyncio.CancelledError:
                 break
             except Exception:
-                # тихо подождём и переподключимся
+                # тихий бэкофф и переподключение
+                self._diag["errors"] += 1
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, self._reconnect_max)
             finally:
@@ -146,13 +180,15 @@ class BinanceWS:
 
     async def _handle_ws_text(self, text: str) -> None:
         """
-        Binance combined streams формат:
+        Combined streams формат:
           {"stream": "btcusdt@bookTicker", "data": {...}}
-        Нас интересуют два типа событий: bookTicker и markPriceUpdate.
+        Нас интересуют bookTicker и markPriceUpdate. Бывает, что 'e' отсутствует —
+        тогда определяем по набору полей.
         """
         try:
             obj = json.loads(text)
         except Exception:
+            self._diag["errors"] += 1
             return
 
         data = obj.get("data", obj)
@@ -160,13 +196,25 @@ class BinanceWS:
             return
 
         ev = data.get("e")
-        if ev == "bookTicker":
+        if ev == "bookTicker" or self._looks_like_book_ticker(data):
             await self._on_book_ticker(data)
-        elif ev == "markPriceUpdate":
-            await self._on_mark_price(data)
-        else:
-            # некоторые реализации возвращают "miniTicker" или иные — игнорим
             return
+
+        if ev == "markPriceUpdate" or self._looks_like_mark_price(data):
+            await self._on_mark_price(data)
+            return
+
+        # прочие события игнорируем
+
+    @staticmethod
+    def _looks_like_book_ticker(d: Dict[str, Any]) -> bool:
+        # bookTicker обычно содержит ключи: s,b,a (и B,A для сайза)
+        return "s" in d and "b" in d and "a" in d
+
+    @staticmethod
+    def _looks_like_mark_price(d: Dict[str, Any]) -> bool:
+        # markPriceUpdate содержит s и p/P; иногда ещё i=индекс. Цена — p/P
+        return "s" in d and ("p" in d or "P" in d)
 
     # ---------- parsers & merge ----------
 
@@ -188,6 +236,7 @@ class BinanceWS:
             bid_sz = float(d.get("B", 0.0))
             ask_sz = float(d.get("A", 0.0))
         except Exception:
+            self._diag["errors"] += 1
             return
 
         async with self._lock:
@@ -197,6 +246,7 @@ class BinanceWS:
                 "bid_size": bid_sz,
                 "ask_size": ask_sz,
             }
+            self._diag["book_updates"] += 1
             await self._emit_merged(symbol, ts_ms=int(d.get("E") or _now_ms()))
 
     async def _on_mark_price(self, d: Dict[str, Any]) -> None:
@@ -218,6 +268,7 @@ class BinanceWS:
         async with self._lock:
             if mark_price is not None:
                 self._mark[symbol] = mark_price
+                self._diag["mark_updates"] += 1
             # эмитим только если уже есть book — иначе нечем заполнить bid/ask
             await self._emit_merged(symbol, ts_ms=int(d.get("E") or _now_ms()))
 
@@ -242,6 +293,7 @@ class BinanceWS:
         raw = {
             "symbol": symbol,
             "ts_ms": ts_ms,
+            "ts": ts_ms // 1000,   # ← добавили для совместимости, если где-то ждут ts (секунды)
             "price": mid,
             "bid": bid,
             "ask": ask,
@@ -255,6 +307,9 @@ class BinanceWS:
 
         try:
             await self._on_message(raw)
+            self._diag["merged_emits"] += 1
+            self._diag["last_emit_ms"] = ts_ms
         except Exception:
             # не роняем поток из-за ошибки внешнего обработчика
+            self._diag["errors"] += 1
             pass
