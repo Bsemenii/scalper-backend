@@ -1,36 +1,26 @@
 # bot/api/app.py
 from __future__ import annotations
 
-import asyncio
-import inspect
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Literal, Iterable
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# Внутренние модули
-from stream.hub import TickerHub            # хаб сам управляет WS и коалесцером
-from stream.coalescer import TickerTick      # стабилизированный тик
+from bot.core.config import get_settings
+from bot.worker import Worker
 from features.microstructure import MicroFeatureEngine
 from features.indicators import IndiEngine
 
+# ------------------------------------------------------------------------------
+# App init & CORS
+# ------------------------------------------------------------------------------
 
-app = FastAPI(title="AI Scalping Backend", version="0.2.3")
+app = FastAPI(title="AI Scalping Backend", version="0.4.0")
+app.state.worker: Optional[Worker] = None
 
-# -------------------------
-# КОНФИГ ПО УМОЛЧАНИЮ/ENV
-# -------------------------
-
-DEFAULT_SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-# Параметры коалесера/истории можно переопределять через ENV без изменения кода
-COALESCE_MS = int(os.getenv("COALESCE_MS", "75"))
-HISTORY_SECONDS = int(os.getenv("HISTORY_SECONDS", "600"))  # 10 минут истории по умолчанию
-
-# (Опционально) включить CORS, если фронт будет дёргать API из браузера
 if os.getenv("ENABLE_CORS", "1") == "1":
     app.add_middleware(
         CORSMiddleware,
@@ -41,32 +31,39 @@ if os.getenv("ENABLE_CORS", "1") == "1":
     )
 
 
-# -------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# -------------------------
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 
-def _ensure_inited(app: FastAPI) -> None:
-    """
-    Ленивая инициализация app.state, чтобы ручки работали и в тестах, и без on_startup.
-    """
-    st = app.state
-    if not hasattr(st, "symbols"):
-        st.symbols = [s.upper() for s in DEFAULT_SYMBOLS]
-    if not hasattr(st, "hub"):
-        # Хаб сам крутит коалесцер внутри (идём по ENV-конфигу)
-        st.hub = TickerHub(
-            symbols=st.symbols,
-            coalesce_ms=COALESCE_MS,
-            history_seconds=HISTORY_SECONDS,
-        )
+def _symbols_from_settings() -> List[str]:
+    try:
+        s = get_settings()
+        return [sym.upper() for sym in s.symbols]
+    except Exception:
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
-def _normalize_symbol(app: FastAPI, symbol: str) -> str:
+def _coalesce_from_settings() -> int:
+    try:
+        s = get_settings()
+        return int(s.streams.coalesce_ms)
+    except Exception:
+        return int(os.getenv("COALESCE_MS", "75"))
+
+
+def _worker_required() -> Worker:
+    w: Optional[Worker] = app.state.worker
+    if not w:
+        raise HTTPException(status_code=503, detail="Worker is not started yet")
+    return w
+
+
+def _normalize_symbol(symbol: str, allowed: Iterable[str]) -> str:
     sym = symbol.upper()
-    if sym not in app.state.symbols:
+    if sym not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown symbol '{symbol}'. Allowed: {', '.join(app.state.symbols)}",
+            detail=f"Unknown symbol '{symbol}'. Allowed: {', '.join(list(allowed))}",
         )
     return sym
 
@@ -75,248 +72,272 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _latest_to_dict(hub: TickerHub, symbol: str) -> Optional[Dict[str, Any]]:
-    t: Optional[TickerTick] = hub.latest(symbol)
-    return t.__dict__ if t else None
-
-
-def _history_last_ms(hub: TickerHub, symbol: str, ms: int) -> List[TickerTick]:
-    """
-    Достаём недавние тики за окно `ms`:
-    1) если у хаба есть history_window(symbol, since_ms) — используем,
-    2) иначе, если есть history(symbol, n) — берём разумный хвост и фильтруем,
-    3) fallback: только последний тик (если есть).
-    """
-    since = _now_ms() - ms
-
-    if hasattr(hub, "history_window"):
-        try:
-            return list(getattr(hub, "history_window")(symbol, since))  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    if hasattr(hub, "history"):
-        try:
-            raw: List[TickerTick] = list(getattr(hub, "history")(symbol, 512))  # type: ignore[attr-defined]
-            return [t for t in raw if getattr(t, "ts_ms", 0) >= since]
-        except Exception:
-            pass
-
-    last = hub.latest(symbol)
-    return [last] if last else []
-
-
-async def _maybe_call_async(fn, *args, **kwargs):
-    """
-    Безопасно вызываем fn, поддерживая и sync, и async.
-    """
-    if fn is None or not callable(fn):
-        return
-    if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-    # если вернули корутину из обычной функции — тоже подождём
-    res = fn(*args, **kwargs)
-    if inspect.isawaitable(res):
-        return await res
-    return res
-
-
-# -------------------------
-# LIFE-CYCLE (on_event)
-# -------------------------
+# ------------------------------------------------------------------------------
+# Lifecycle
+# ------------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def _startup() -> None:
-    _ensure_inited(app)
-    hub: TickerHub = app.state.hub
-    # если у хаба есть явный start — запустим (поддержка sync/async)
-    await _maybe_call_async(getattr(hub, "start", None))
+    symbols = _symbols_from_settings()
+    coalesce_ms = _coalesce_from_settings()
+
+    w = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms)
+    await w.start()
+    app.state.worker = w
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    hub: Optional[TickerHub] = getattr(app.state, "hub", None)
-    if hub is not None:
-        await _maybe_call_async(getattr(hub, "stop", None))
+    w: Optional[Worker] = app.state.worker
+    if w:
+        await w.stop()
+        app.state.worker = None
 
 
-# -------------
-# БАЗОВЫЕ РУЧКИ
-# -------------
+# ------------------------------------------------------------------------------
+# Basic endpoints
+# ------------------------------------------------------------------------------
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
-    return {"ok": True, "app": "ai-scalping-backend"}
+    return {"ok": True, "app": "ai-scalping-backend", "version": app.version}
 
 
 @app.get("/healthz")
 async def healthz() -> Dict[str, Any]:
-    return {"ok": True}
+    try:
+        w = _worker_required()
+        d = w.diag()
+        ok = d.get("ws_detail", {}).get("messages", 0) > 0 and d.get("coal", {}).get("emit_count", 0) > 0
+        return {"ok": ok, "ws_messages": d.get("ws_detail", {}).get("messages", 0), "emits": d.get("coal", {}).get("emit_count", 0)}
+    except Exception:
+        return {"ok": False}
 
 
 @app.get("/status")
-async def status() -> JSONResponse:
-    """
-    Всегда отдаёт:
-      {
-        "ws":   {"count": int, "last_rx_ts_ms": int|null},
-        "coal": {"push_count": int, "last_tick_ts_ms": int|null},
-        "symbols": { "BTCUSDT": {...}|null, "ETHUSDT": {...}|null, ... }
-      }
-    """
-    _ensure_inited(app)
-    hub: TickerHub = app.state.hub
-    symbols: List[str] = app.state.symbols
-
-    ws_stats = hub.ws_stats()             # {count, last_rx_ts_ms}
-    coal_stats = hub.coalescer_stats()    # {push_count, last_tick_ts_ms}
-
-    symbols_map: Dict[str, Optional[Dict[str, Any]]] = {
-        s: _latest_to_dict(hub, s) for s in symbols
+def status() -> Dict[str, Any]:
+    s = get_settings()
+    return {
+        "mode": s.mode,
+        "symbols": s.symbols,
+        "streams": {"coalesce_ms": s.streams.coalesce_ms},
+        "risk": {
+            "risk_per_trade_pct": s.risk.risk_per_trade_pct,
+            "daily_stop_r": s.risk.daily_stop_r,
+            "daily_target_r": s.risk.daily_target_r,
+            "max_consec_losses": s.risk.max_consec_losses,
+            "cooldown_after_sl_s": s.risk.cooldown_after_sl_s,
+        },
+        "safety": {
+            "max_spread_ticks": s.safety.max_spread_ticks,
+            "min_top5_liquidity_usd": s.safety.min_top5_liquidity_usd,
+            "skip_funding_minute": s.safety.skip_funding_minute,
+            "skip_minute_zero": s.safety.skip_minute_zero,
+            "min_liq_buffer_sl_mult": s.safety.min_liq_buffer_sl_mult,
+        },
+        "execution": {
+            "limit_offset_ticks": s.execution.limit_offset_ticks,
+            "limit_timeout_ms": s.execution.limit_timeout_ms,
+            "max_slippage_bp": s.execution.max_slippage_bp,
+            "time_in_force": getattr(s.execution, "time_in_force", "GTC"),
+        },
+        "ml": {
+            "enabled": s.ml.enabled,
+            "p_threshold_mom": s.ml.p_threshold_mom,
+            "p_threshold_rev": s.ml.p_threshold_rev,
+        },
+        "log_dir": getattr(s, "log_dir", "./logs"),
+        "log_level": getattr(s, "log_level", "INFO"),
     }
-    return JSONResponse({"ws": ws_stats, "coal": coal_stats, "symbols": symbols_map})
+
+
+# ------------------------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------------------------
+
+@app.get("/debug/diag")
+async def debug_diag() -> Dict[str, Any]:
+    """
+    Расширенная диагностика пайплайна.
+    Формат сохранён максимально близким к прежнему для фронта.
+    """
+    w = _worker_required()
+    d = w.diag()
+    return {
+        "ws": {
+            "count": d.get("ws_detail", {}).get("messages", 0),
+            "last_rx_ts_ms": d.get("ws_detail", {}).get("last_rx_ms", 0),
+        },
+        "ws_detail": d.get("ws_detail", {}),
+        "coal": d.get("coal", {}),
+        "symbols": d.get("symbols", []),
+        "coalesce_ms": d.get("coal", {}).get("window_ms"),
+        "history_seconds": 600,  # для совместимости с фронтом
+        "best": d.get("best", {}),
+        "exec_cfg": d.get("exec_cfg", {}),
+    }
 
 
 @app.get("/symbols")
 async def symbols_summary() -> Dict[str, Any]:
     """
-    Короткая сводка по последним снапам символов.
+    Сводка по лучшим ценам всех символов.
     """
-    _ensure_inited(app)
-    hub: TickerHub = app.state.hub
-    symbols: List[str] = app.state.symbols
-
-    out: Dict[str, Optional[Dict[str, Any]]] = {s: _latest_to_dict(hub, s) for s in symbols}
-    return {"symbols": out}
+    w = _worker_required()
+    out: Dict[str, Tuple[float, float]] = {s: w.best_bid_ask(s) for s in w.symbols}
+    return {"symbols": list(w.symbols), "best": out}
 
 
-# ----------------
-# DEBUG / DIАГНОСТИКА
-# ----------------
-
-@app.get("/debug/ws")
-async def debug_ws() -> Dict[str, Any]:
-    _ensure_inited(app)
-    hub: TickerHub = app.state.hub
-    return hub.ws_stats()
-
-
-@app.get("/debug/diag")
-async def debug_diag() -> Dict[str, Any]:
+@app.get("/best")
+async def best(
+    symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT"),
+) -> Dict[str, Any]:
     """
-    Расширенная диагностика:
-      - ws: короткая статистика по приёму WS
-      - ws_detail: опциональная диагностика адаптера (URL, ошибки, счётчики) — если реализована в hub
-      - coal: статистика коалесцера
-      - конфиг (символы, параметры окна/истории)
+    Последняя лучшая цена (bid/ask) по символу.
     """
-    _ensure_inited(app)
-    hub: TickerHub = app.state.hub
-    ws_detail = {}
-    try:
-        # безопасно дернём опциональный метод
-        ws_detail = getattr(hub, "ws_diag", lambda: {})()
-    except Exception:
-        ws_detail = {}
-    return {
-        "ws": hub.ws_stats(),
-        "ws_detail": ws_detail,
-        "coal": hub.coalescer_stats(),
-        "symbols": app.state.symbols,
-        "coalesce_ms": COALESCE_MS,
-        "history_seconds": HISTORY_SECONDS,
-    }
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    bid, ask = w.best_bid_ask(sym)
+    return {"symbol": sym, "bid": bid, "ask": ask}
 
 
-# -------------
-# ТИКИ
-# -------------
+# ------------------------------------------------------------------------------
+# Ticks (latest / peek)
+# ------------------------------------------------------------------------------
+
+def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Унифицированный доступ к последнему тика по символу.
+    Если у Worker нет метода latest_tick() — соберём снимок из best bid/ask.
+    """
+    # 1) Если в воркере есть last_tick — используем
+    if hasattr(w, "latest_tick"):
+        try:
+            t = getattr(w, "latest_tick")(symbol)  # type: ignore[attr-defined]
+            if t:
+                return dict(t)
+        except Exception:
+            pass
+
+    # 2) Фолбэк: best bid/ask → псевдо-тик
+    bid, ask = w.best_bid_ask(symbol)
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        return {
+            "symbol": symbol,
+            "ts_ms": _now_ms(),
+            "price": mid,
+            "bid": bid,
+            "ask": ask,
+            "bid_size": 0.0,
+            "ask_size": 0.0,
+            "mark_price": None,
+        }
+    return None
+
+
+def _worker_history_ticks(w: Worker, symbol: str, since_ms: int, limit: int) -> List[Dict[str, Any]]:
+    """
+    Унифицированный доступ к истории. Если у Worker нет history — вернём <=1 элемента (latest).
+    """
+    # 1) Предпочтительно: метод history_ticks(symbol, since_ms, limit)
+    if hasattr(w, "history_ticks"):
+        try:
+            items = getattr(w, "history_ticks")(symbol, since_ms, limit)  # type: ignore[attr-defined]
+            return [dict(t) for t in items]  # ожидаем итерируемые структуры
+        except Exception:
+            pass
+
+    # 2) Фолбэк: только последний тик
+    last = _worker_latest_tick(w, symbol)
+    return [last] if last else []
+
 
 @app.get("/ticks/latest")
 async def ticks_latest(
     symbol: str = Query("BTCUSDT", description="Напр. BTCUSDT"),
 ) -> Dict[str, Any]:
     """
-    Возвращает последний тик по символу.
+    Последний тик по символу (если истории нет — снимок из best bid/ask).
     """
-    _ensure_inited(app)
-    sym = _normalize_symbol(app, symbol)
-    hub: TickerHub = app.state.hub
-    t: Optional[TickerTick] = hub.latest(sym)
-    return {"symbol": sym, "item": (t.__dict__ if t else None)}
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    item = _worker_latest_tick(w, sym)
+    return {"symbol": sym, "item": item}
 
 
 @app.get("/ticks/peek")
 async def ticks_peek(
     symbol: str = Query("BTCUSDT", description="Напр. BTCUSDT"),
     ms: int = Query(1500, ge=1, le=60_000, description="Окно, миллисекунды"),
-    limit: int = Query(512, ge=1, le=4096, description="Максимум элементов в ответе (хвост)"),
+    limit: int = Query(512, ge=1, le=4096, description="Максимум элементов в ответе"),
 ) -> Dict[str, Any]:
     """
-    Возвращает список тик-снапшотов за последние `ms` миллисекунд, обрезая хвостом до `limit`.
+    История тик-снапшотов за последние `ms` (если воркер не хранит историю — вернём последний тик).
     """
-    _ensure_inited(app)
-    sym = _normalize_symbol(app, symbol)
-    hub: TickerHub = app.state.hub
-    items: List[TickerTick] = _history_last_ms(hub, sym, ms)
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    since = _now_ms() - ms
+    items = _worker_history_ticks(w, sym, since_ms=since, limit=limit)
     if len(items) > limit:
         items = items[-limit:]
-    return {
-        "symbol": sym,
-        "count": len(items),
-        "items": [t.__dict__ for t in items],
-    }
+    return {"symbol": sym, "count": len(items), "items": items}
 
 
-# ----------------
-# FEATURES DEBUG
-# ----------------
+# ------------------------------------------------------------------------------
+# Features debug (micro + indicators)
+# ------------------------------------------------------------------------------
 
 @app.get("/debug/features")
 async def debug_features(
-    symbol: str = Query("BTCUSDT", description="Торговый символ, например BTCUSDT"),
+    symbol: str = Query("BTCUSDT", description="Символ, напр. BTCUSDT"),
     lookback_ms: int = Query(10_000, ge=100, le=120_000, description="Окно истории для индикаторов"),
 ) -> Dict[str, Any]:
     """
-    Быстрый расчёт микроструктуры и базовых индикаторов.
-    - micro: spread_ticks, mid, top_liq_usd, microprice_drift, tick_velocity, aggressor_ratio (может быть None), obi
-    - indi:  ema9/ema21/ema_slope_ticks, vwap_drift, bb_z, rsi, realized_vol_bp
-    - risk:  allow|false + reasons и пример оценки stop-loss в USD
+    Быстрый расчёт микроструктуры и индикаторов.
+    Если нет истории в воркере — считаем по последнему тіку и псевдо-ценам.
     """
-    _ensure_inited(app)
-    sym = _normalize_symbol(app, symbol)
-    hub: TickerHub = app.state.hub
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
 
-    last: Optional[TickerTick] = hub.latest(sym)
+    last = _worker_latest_tick(w, sym)
     if not last:
         return {"symbol": sym, "micro": None, "indi": None, "reason": "no_tick"}
 
-    # --- Micro (по одному снапу)
+    # --- Micro по последнему снапу
+    # Эти дефолты не критичны; потом можно забирать из settings при желании.
     micro = MicroFeatureEngine(tick_size=0.1, lot_usd=10_000.0).update(
-        price=last.price,
-        bid=last.bid,
-        ask=last.ask,
-        bid_sz=last.bid_size,
-        ask_sz=last.ask_size,
+        price=last["price"],
+        bid=last["bid"],
+        ask=last["ask"],
+        bid_sz=last.get("bid_size", 0.0),
+        ask_sz=last.get("ask_size", 0.0),
     )
 
-    # --- Indicators (по истории)
-    hist: List[TickerTick] = _history_last_ms(hub, sym, lookback_ms)
-    prices: List[float] = [t.price for t in hist] or [last.price] * 10  # fallback
+    # --- Indicators по истории (если есть); иначе — псевдо-ряд из последней цены
+    since = _now_ms() - lookback_ms
+    hist = _worker_history_ticks(w, sym, since_ms=since, limit=2048)
+    prices: List[float] = [float(t.get("price", last["price"])) for t in hist] or [last["price"]] * 10
 
     indi_eng = IndiEngine(price_step=0.1)
     indi = None
     for p in prices:
         indi = indi_eng.update(price=p)
 
-    if indi is None:
-        return {"symbol": sym, "micro": micro.__dict__, "indi": None, "reason": "no_indicators"}
+    indi_dict = None if indi is None else {
+        "ema9": indi.ema9,
+        "ema21": indi.ema21,
+        "ema_slope_ticks": indi.ema_slope_ticks,
+        "vwap_drift": indi.vwap_drift,
+        "bb_z": indi.bb_z,
+        "rsi": indi.rsi,
+        "realized_vol_bp": indi.realized_vol_bp,
+    }
 
-    # --- Условный риск (пример оценки SL из волатильности)
+    # пример risk-оценки (SL ~ vol)
     sl_usd_est = (
-        round((indi.realized_vol_bp / 10_000.0) * last.price, 4)
-        if indi.realized_vol_bp is not None
-        else None
+        round((indi.realized_vol_bp / 10_000.0) * last["price"], 4)
+        if (indi and indi.realized_vol_bp is not None) else None
     )
     risk = {
         "allow": sl_usd_est is not None,
@@ -335,14 +356,48 @@ async def debug_features(
             "aggressor_ratio": micro.aggressor_ratio,
             "obi": micro.obi,
         },
-        "indi": {
-            "ema9": indi.ema9,
-            "ema21": indi.ema21,
-            "ema_slope_ticks": indi.ema_slope_ticks,
-            "vwap_drift": indi.vwap_drift,
-            "bb_z": indi.bb_z,
-            "rsi": indi.rsi,
-            "realized_vol_bp": indi.realized_vol_bp,
-        },
+        "indi": indi_dict,
         "risk": risk,
     }
+
+
+# ------------------------------------------------------------------------------
+# Control (paper executor)
+# ------------------------------------------------------------------------------
+
+class EntryReq(BaseModel):
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    qty: float  # проверим ниже
+
+    def normalize(self, allowed: List[str]) -> None:
+        s = self.symbol.upper()
+        if s not in allowed:
+            raise ValueError(f"Unknown symbol '{self.symbol}'. Allowed: {', '.join(allowed)}")
+        self.symbol = s
+        if not (self.qty > 0):
+            raise ValueError("qty must be > 0")
+
+@app.post("/control/test-entry")
+async def control_test_entry(req: EntryReq) -> Dict[str, Any]:
+    w = _worker_required()
+    try:
+        req.normalize(w.symbols)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    report = await w.place_entry(req.symbol, req.side, req.qty)
+    return {"ok": True, **report}
+
+@app.get("/control/test-entry")
+async def control_test_entry_get(
+    symbol: str = Query(..., description="Напр. BTCUSDT"),
+    side: Literal["BUY", "SELL"] = Query(...),
+    qty: float = Query(..., gt=0),
+) -> Dict[str, Any]:
+    w = _worker_required()
+    # нормализация символа и базовая валидация qty уже в сигнатуре (gt=0)
+    symbol = symbol.upper()
+    if symbol not in w.symbols:
+        raise HTTPException(status_code=400, detail=f"Unknown symbol '{symbol}'. Allowed: {', '.join(w.symbols)}")
+    report = await w.place_entry(symbol, side, qty)
+    return {"ok": True, **report}

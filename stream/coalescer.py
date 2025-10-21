@@ -21,153 +21,153 @@ class TickerTick:
 
 class Coalescer:
     """
-    Принимает raw-события (dict) и выдаёт стабилизированные TickerTick.
-    В каждом окне coalesce_ms на символ выпускает максимум ОДИН тик (последний в окне).
-    НИКАКИХ импортов из hub.
+    Стабилизатор тиков:
+      • Принимает raw dict события (WS/хаб).
+      • Раз в окно coalesce_ms выпускает по ОДНОМУ тіку на символ (последний в окне).
+      • Никаких зависимостей от hub/fastapi/и т.п.
+
+    Требуемые поля raw (combined-формат от BinanceWS):
+      symbol(str), ts_ms(int|str), bid(float), ask(float), [price=float], [bid_size, ask_size], [mark_price]
+    Допускается сырой bookTicker (b/a/B/A/E/s) — тогда mid рассчитывается на лету.
     """
 
     def __init__(self, coalesce_ms: int = 75) -> None:
         self._coalesce_ms = max(10, int(coalesce_ms))
-        self._queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
-        self._stopping = asyncio.Event()
+        self._q: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        self._stop = asyncio.Event()
 
-        # Буферы по символу: последний raw и номер "бакета" времени
+        # Последнее сырое событие по символу и флаг «грязно» для текущего окна.
         self._last_raw: Dict[str, Dict[str, Any]] = {}
-        self._last_bucket: Dict[str, int] = {}
-        # Флаг, что по символу в текущем окне есть новые данные, готовые к выпуску
         self._dirty: Dict[str, bool] = {}
 
+        # Диагностика
+        self._push_count: int = 0
+        self._emit_count: int = 0
+        self._last_tick_ts_ms: int = 0
+        self._start_monotonic: float = time.monotonic()
+
+    # ---------- публичный API ----------
+
     async def on_event(self, raw: Dict[str, Any]) -> None:
-        """Хаб кладёт raw-событие в очередь коалесцера."""
-        await self._queue.put(raw)
+        """Положить raw-событие в очередь коалесцера."""
+        await self._q.put(raw)
+        self._push_count += 1
 
     async def run(self, on_tick: Callable[[TickerTick], Awaitable[None]]) -> None:
         """
         Главный цикл:
-          - быстро читаем очередь (non-blocking с коротким таймаутом),
-          - обновляем last_raw по символу,
-          - раз в coalesce_ms выпускаем по одному тіку на символ.
+          — ждём новые события до конца ближайшего окна;
+          — по таймауту окна эмитим по одному тіку на все «грязные» символы.
         """
         try:
-            # период опроса очереди — небольшая доля окна, чтобы не жечь CPU
-            poll_sleep = max(0.005, self._coalesce_ms / 1000.0 / 5.0)
-            next_flush_ms = self._now_ms() + self._coalesce_ms
+            period = self._coalesce_ms / 1000.0
+            next_flush = time.monotonic() + period
 
-            while not self._stopping.is_set():
-                # 1) Забираем все доступные raw без долгого ожидания
-                drained = 0
-                while not self._queue.empty():
-                    try:
-                        raw = self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+            while not self._stop.is_set():
+                timeout = max(0.0, next_flush - time.monotonic())
+                try:
+                    # получаем одно событие с таймаутом до конца окна…
+                    raw = await asyncio.wait_for(self._q.get(), timeout=timeout)
                     self._ingest_raw(raw)
-                    drained += 1
-
-                # 2) Если пришло мало/ничего — попробуем чуть подождать,
-                #    чтобы собрать пачку raw в один тик, но не дольше poll_sleep
-                if drained == 0:
-                    try:
-                        raw = await asyncio.wait_for(self._queue.get(), timeout=poll_sleep)
-                        self._ingest_raw(raw)
-                    except asyncio.TimeoutError:
-                        pass
-
-                # 3) Время флашить окно?
-                now = self._now_ms()
-                if now >= next_flush_ms:
-                    await self._flush_ready(now, on_tick)
-                    next_flush_ms = now + self._coalesce_ms
+                    # …а затем сглатываем все, что уже накопилось без ожидания
+                    while True:
+                        try:
+                            raw2 = self._q.get_nowait()
+                            self._ingest_raw(raw2)
+                        except asyncio.QueueEmpty:
+                            break
+                except asyncio.TimeoutError:
+                    # конец окна → эмитим «грязные» символы
+                    if self._dirty:
+                        for sym, fl in list(self._dirty.items()):
+                            if not fl:
+                                continue
+                            r = self._last_raw.get(sym)
+                            if not r:
+                                self._dirty[sym] = False
+                                continue
+                            tick = self._to_tick(r)
+                            if tick and self._spread_ok(tick):
+                                await on_tick(tick)
+                                self._emit_count += 1
+                                self._last_tick_ts_ms = int(tick.ts_ms)
+                            self._dirty[sym] = False
+                    # планируем следующее окно от «сейчас» (без дрейфа)
+                    next_flush = time.monotonic() + period
         except asyncio.CancelledError:
+            # мягкое завершение
             pass
 
     async def close(self) -> None:
-        self._stopping.set()
+        """Остановить коалесцер (завершит run-петлю)."""
+        self._stop.set()
 
-    # ---------- internals ----------
+    def stats(self) -> Dict[str, Any]:
+        """Короткая диагностика для /status."""
+        elapsed = max(1e-6, time.monotonic() - (self._start_monotonic or time.monotonic()))
+        emits_per_sec = self._emit_count / elapsed
+        return {
+            "push_count": self._push_count,
+            "emit_count": self._emit_count,
+            "emits_per_sec": round(emits_per_sec, 3),
+            "last_tick_ts_ms": self._last_tick_ts_ms,
+            "window_ms": self._coalesce_ms,
+        }
+
+    # ---------- внутреннее ----------
 
     def _ingest_raw(self, d: Dict[str, Any]) -> None:
-        """
-        Принять очередной raw, определить символ и положить как last_raw.
-        Сразу помечаем символ как dirty, чтобы на ближайшем флаше выпустить тик.
-        """
-        # Определяем символ и ts_ms из обоих форматов
-        symbol = d.get("symbol") or d.get("s")
-        if not symbol:
+        """Нормализуем и кладём последнее raw по символу, помечаем «грязно»."""
+        sym = (d.get("symbol") or d.get("s") or "").upper()
+        if not sym:
             return
 
-        # метка времени: берём из ts_ms/E/T; если нет — текущее время
         ts_ms = d.get("ts_ms") or d.get("E") or d.get("T")
-        ts_ms = int(ts_ms) if ts_ms is not None else self._now_ms()
-        d["ts_ms"] = ts_ms  # нормализуем, чтобы downstream не гадал
+        d["ts_ms"] = int(ts_ms) if ts_ms is not None else int(time.time() * 1000)
 
-        bucket = ts_ms // self._coalesce_ms
-        self._last_raw[symbol] = d
-        self._dirty[symbol] = True
-        # если перепрыгнули в новый бакет — тоже ок, просто выпустим при следующем flush
+        self._last_raw[sym] = d
+        self._dirty[sym] = True
 
-        # запомним последний бакет (может пригодиться для дебага/метрик)
-        self._last_bucket[symbol] = bucket
-
-    async def _flush_ready(self, now_ms: int, on_tick: Callable[[TickerTick], Awaitable[None]]) -> None:
-        """
-        Выпустить по одному тику на каждый символ, у которого есть новые данные в текущем окне.
-        После выпуска сбрасываем dirty-флаг.
-        """
-        if not self._dirty:
-            return
-
-        dirty_symbols = [s for s, is_dirty in self._dirty.items() if is_dirty]
-        for sym in dirty_symbols:
-            raw = self._last_raw.get(sym)
-            if not raw:
-                self._dirty[sym] = False
-                continue
-            t = self._to_tick(raw)
-            if t:
-                # гарантируем монотонность: если ts в прошлом, подвинем на now_ms
-                if t.ts_ms > 0 and t.ts_ms > now_ms + 5:
-                    # редкий случай: будущее — оставим как есть
-                    pass
-                await on_tick(t)
-            self._dirty[sym] = False
+    @staticmethod
+    def _spread_ok(t: TickerTick) -> bool:
+        """Базовая санитация спреда, чтобы не пускать мусор вниз по пайплайну."""
+        try:
+            return (t.bid > 0.0) and (t.ask > 0.0) and (t.ask >= t.bid)
+        except Exception:
+            return False
 
     def _to_tick(self, d: Dict[str, Any]) -> Optional[TickerTick]:
         """
-        Универсальный парсер: либо "combined" из адаптера, либо сырой bookTicker.
-        Ожидаемые поля combined:
-          {symbol, ts_ms, price, bid, ask, bid_size, ask_size, mark_price?}
+        Поддерживает два формата:
+          1) combined: symbol, ts_ms, bid, ask, [price], [bid_size, ask_size], [mark_price]
+          2) сырой bookTicker: s, E, b, a, B, A
         """
         try:
-            # combined формат
-            if "price" in d and "bid" in d and "ask" in d:
-                symbol = d.get("symbol") or d.get("s")
-                ts_ms = int(d["ts_ms"])
-                price = float(d["price"])
+            # combined
+            if "bid" in d and "ask" in d:
+                symbol = (d.get("symbol") or d.get("s") or "").upper()
+                ts_ms = int(d.get("ts_ms") or int(time.time() * 1000))
                 bid = float(d["bid"])
                 ask = float(d["ask"])
-                bid_sz = float(d.get("bid_size") or d.get("B", 0.0))
-                ask_sz = float(d.get("ask_size") or d.get("A", 0.0))
-                mark_price = d.get("mark_price")
-                mark = float(mark_price) if mark_price is not None else None
-                return TickerTick(symbol, ts_ms, price, bid, ask, bid_sz, ask_sz, mark)
+                bid_sz = float(d.get("bid_size", d.get("B", 0.0)))
+                ask_sz = float(d.get("ask_size", d.get("A", 0.0)))
+                price = float(d.get("price", (bid + ask) / 2.0))
+                mark = d.get("mark_price")
+                mark_price = float(mark) if mark is not None else None
+                return TickerTick(symbol, ts_ms, price, bid, ask, bid_sz, ask_sz, mark_price)
 
-            # сырой bookTicker → соберём mid
+            # сырой bookTicker
             if "b" in d and "a" in d:
-                symbol = d.get("s") or d.get("symbol")
-                ts_ms = int(d.get("E") or d.get("T") or d["ts_ms"])
+                symbol = (d.get("s") or d.get("symbol") or "").upper()
+                ts_ms = int(d.get("E") or d.get("T") or d.get("ts_ms") or int(time.time() * 1000))
                 bid = float(d["b"])
                 ask = float(d["a"])
                 bid_sz = float(d.get("B", 0.0))
                 ask_sz = float(d.get("A", 0.0))
                 price = (bid + ask) / 2.0
-                mark_price = d.get("mark_price")
-                mark = float(mark_price) if mark_price is not None else None
-                return TickerTick(symbol, ts_ms, price, bid, ask, bid_sz, ask_sz, mark)
+                mark = d.get("mark_price")
+                mark_price = float(mark) if mark is not None else None
+                return TickerTick(symbol, ts_ms, price, bid, ask, bid_sz, ask_sz, mark_price)
         except Exception:
             return None
         return None
-
-    @staticmethod
-    def _now_ms() -> int:
-        return int(time.time() * 1000)
