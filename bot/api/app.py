@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple, Literal, Iterable
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +14,13 @@ from bot.worker import Worker
 from features.microstructure import MicroFeatureEngine
 from features.indicators import IndiEngine
 
+APP_VERSION = "0.5.0"
+
 # ------------------------------------------------------------------------------
 # App init & CORS
 # ------------------------------------------------------------------------------
 
-app = FastAPI(title="AI Scalping Backend", version="0.4.0")
+app = FastAPI(title="AI Scalping Backend", version=APP_VERSION)
 app.state.worker: Optional[Worker] = None
 
 if os.getenv("ENABLE_CORS", "1") == "1":
@@ -81,7 +83,7 @@ async def _startup() -> None:
     symbols = _symbols_from_settings()
     coalesce_ms = _coalesce_from_settings()
 
-    w = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms)
+    w = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms, history_maxlen=4000)
     await w.start()
     app.state.worker = w
 
@@ -100,7 +102,7 @@ async def _shutdown() -> None:
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
-    return {"ok": True, "app": "ai-scalping-backend", "version": app.version}
+    return {"ok": True, "app": "ai-scalping-backend", "version": APP_VERSION}
 
 
 @app.get("/healthz")
@@ -108,8 +110,9 @@ async def healthz() -> Dict[str, Any]:
     try:
         w = _worker_required()
         d = w.diag()
-        ok = d.get("ws_detail", {}).get("messages", 0) > 0 and d.get("coal", {}).get("emit_count", 0) > 0
-        return {"ok": ok, "ws_messages": d.get("ws_detail", {}).get("messages", 0), "emits": d.get("coal", {}).get("emit_count", 0)}
+        ws_msgs = d.get("ws_detail", {}).get("messages", 0)
+        emits = d.get("coal", {}).get("emit_count", 0)
+        return {"ok": (ws_msgs > 0 and emits > 0), "ws_messages": ws_msgs, "emits": emits}
     except Exception:
         return {"ok": False}
 
@@ -158,8 +161,7 @@ def status() -> Dict[str, Any]:
 @app.get("/debug/diag")
 async def debug_diag() -> Dict[str, Any]:
     """
-    Расширенная диагностика пайплайна.
-    Формат сохранён максимально близким к прежнему для фронта.
+    Расширенная диагностика пайплайна (стабильная форма для фронта).
     """
     w = _worker_required()
     d = w.diag()
@@ -172,7 +174,7 @@ async def debug_diag() -> Dict[str, Any]:
         "coal": d.get("coal", {}),
         "symbols": d.get("symbols", []),
         "coalesce_ms": d.get("coal", {}).get("window_ms"),
-        "history_seconds": 600,  # для совместимости с фронтом
+        "history_seconds": 600,  # совместимость с фронтом
         "best": d.get("best", {}),
         "exec_cfg": d.get("exec_cfg", {}),
     }
@@ -207,19 +209,16 @@ async def best(
 
 def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Унифицированный доступ к последнему тика по символу.
-    Если у Worker нет метода latest_tick() — соберём снимок из best bid/ask.
+    Последний тик по символу. Если истории нет — соберём снимок из best bid/ask.
     """
-    # 1) Если в воркере есть last_tick — используем
     if hasattr(w, "latest_tick"):
         try:
-            t = getattr(w, "latest_tick")(symbol)  # type: ignore[attr-defined]
+            t = w.latest_tick(symbol)  # type: ignore[attr-defined]
             if t:
                 return dict(t)
         except Exception:
             pass
 
-    # 2) Фолбэк: best bid/ask → псевдо-тик
     bid, ask = w.best_bid_ask(symbol)
     if bid > 0 and ask > 0:
         mid = (bid + ask) / 2.0
@@ -238,17 +237,16 @@ def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
 
 def _worker_history_ticks(w: Worker, symbol: str, since_ms: int, limit: int) -> List[Dict[str, Any]]:
     """
-    Унифицированный доступ к истории. Если у Worker нет history — вернём <=1 элемента (latest).
+    История тиков с ts_ms >= since_ms, обрезанная хвостом до limit.
+    Если истории нет — вернём <=1 элемента (latest).
     """
-    # 1) Предпочтительно: метод history_ticks(symbol, since_ms, limit)
     if hasattr(w, "history_ticks"):
         try:
-            items = getattr(w, "history_ticks")(symbol, since_ms, limit)  # type: ignore[attr-defined]
-            return [dict(t) for t in items]  # ожидаем итерируемые структуры
+            items = w.history_ticks(symbol, since_ms, limit)  # type: ignore[attr-defined]
+            return [dict(t) for t in items]
         except Exception:
             pass
 
-    # 2) Фолбэк: только последний тик
     last = _worker_latest_tick(w, symbol)
     return [last] if last else []
 
@@ -295,7 +293,7 @@ async def debug_features(
 ) -> Dict[str, Any]:
     """
     Быстрый расчёт микроструктуры и индикаторов.
-    Если нет истории в воркере — считаем по последнему тіку и псевдо-ценам.
+    Если нет истории — считаем по последнему тіку и псевдо-ценам.
     """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
@@ -304,8 +302,7 @@ async def debug_features(
     if not last:
         return {"symbol": sym, "micro": None, "indi": None, "reason": "no_tick"}
 
-    # --- Micro по последнему снапу
-    # Эти дефолты не критичны; потом можно забирать из settings при желании.
+    # Micro по последнему снапу
     micro = MicroFeatureEngine(tick_size=0.1, lot_usd=10_000.0).update(
         price=last["price"],
         bid=last["bid"],
@@ -314,7 +311,7 @@ async def debug_features(
         ask_sz=last.get("ask_size", 0.0),
     )
 
-    # --- Indicators по истории (если есть); иначе — псевдо-ряд из последней цены
+    # Indicators по истории (если есть); иначе — псевдо-ряд из последней цены
     since = _now_ms() - lookback_ms
     hist = _worker_history_ticks(w, sym, since_ms=since, limit=2048)
     prices: List[float] = [float(t.get("price", last["price"])) for t in hist] or [last["price"]] * 10
@@ -334,7 +331,6 @@ async def debug_features(
         "realized_vol_bp": indi.realized_vol_bp,
     }
 
-    # пример risk-оценки (SL ~ vol)
     sl_usd_est = (
         round((indi.realized_vol_bp / 10_000.0) * last["price"], 4)
         if (indi and indi.realized_vol_bp is not None) else None
@@ -368,7 +364,7 @@ async def debug_features(
 class EntryReq(BaseModel):
     symbol: str
     side: Literal["BUY", "SELL"]
-    qty: float  # проверим ниже
+    qty: float
 
     def normalize(self, allowed: List[str]) -> None:
         s = self.symbol.upper()
@@ -377,6 +373,7 @@ class EntryReq(BaseModel):
         self.symbol = s
         if not (self.qty > 0):
             raise ValueError("qty must be > 0")
+
 
 @app.post("/control/test-entry")
 async def control_test_entry(req: EntryReq) -> Dict[str, Any]:
@@ -388,6 +385,7 @@ async def control_test_entry(req: EntryReq) -> Dict[str, Any]:
     report = await w.place_entry(req.symbol, req.side, req.qty)
     return {"ok": True, **report}
 
+
 @app.get("/control/test-entry")
 async def control_test_entry_get(
     symbol: str = Query(..., description="Напр. BTCUSDT"),
@@ -395,9 +393,86 @@ async def control_test_entry_get(
     qty: float = Query(..., gt=0),
 ) -> Dict[str, Any]:
     w = _worker_required()
-    # нормализация символа и базовая валидация qty уже в сигнатуре (gt=0)
-    symbol = symbol.upper()
-    if symbol not in w.symbols:
-        raise HTTPException(status_code=400, detail=f"Unknown symbol '{symbol}'. Allowed: {', '.join(w.symbols)}")
-    report = await w.place_entry(symbol, side, qty)
+    sym = _normalize_symbol(symbol, w.symbols)
+    report = await w.place_entry(sym, side, qty)
     return {"ok": True, **report}
+
+
+@app.post("/control/flatten")
+@app.get("/control/flatten")
+async def control_flatten(
+    symbol: str = Query("BTCUSDT"),
+) -> Dict[str, Any]:
+    """
+    Форс-закрыть позицию (paper), сбросить FSM в FLAT. Удобно для повторных входов.
+    Поддерживаются и POST, и GET для удобства из браузера.
+    """
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    res = await w.flatten(sym)
+    return res
+
+@app.post("/control/flatten-all")
+@app.get("/control/flatten-all")
+async def control_flatten_all() -> Dict[str, Any]:
+    """
+    Форс-закрыть позиции по всем символам и сбросить FSM в FLAT.
+    Поддерживаются GET и POST (для удобства из браузера).
+    """
+    w = _worker_required()
+    results: Dict[str, Any] = {}
+    for sym in w.symbols:
+        try:
+            results[sym] = await w.flatten(sym)
+        except Exception as e:
+            results[sym] = {"ok": False, "error": str(e)}
+    return {
+        "ok": all(v.get("ok", False) for v in results.values()),
+        "results": results,
+    }
+
+
+@app.post("/control/set-timeout")
+async def control_set_timeout(
+    symbol: str = Query("BTCUSDT"),
+    timeout_ms: int = Query(20_000, ge=5_000, le=600_000),
+) -> Dict[str, Any]:
+    """
+    Изменить таймаут позиции для отладки (например, 20 000 мс).
+    """
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    return w.set_timeout_ms(sym, timeout_ms)
+
+# ------------------------------------------------------------------------------
+# Positions (snapshot)
+# ------------------------------------------------------------------------------
+
+@app.get("/positions")
+async def positions() -> Dict[str, Any]:
+    """
+    Снимок состояний позиций по всем символам.
+    Формат берём из w.diag()['positions'], чтобы совпадал с тем, что уже видишь в /debug/diag.
+    """
+    w = _worker_required()
+    d = w.diag()
+    positions = d.get("positions", {})
+    return {"symbols": list(w.symbols), "positions": positions}
+
+
+@app.get("/position")
+async def position(
+    symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT"),
+) -> Dict[str, Any]:
+    """
+    Снимок состояния позиции по одному символу.
+    """
+    w = _worker_required()
+    sym = _normalize_symbol(symbol, w.symbols)
+    d = w.diag()
+    pos = d.get("positions", {}).get(sym, None)
+    if pos is None:
+        # если почему-то нет ключа — отдадим FLAT по умолчанию
+        pos = {"state": "FLAT", "side": None, "qty": 0.0, "entry_px": 0.0, "sl_px": None, "tp_px": None,
+               "opened_ts_ms": 0, "timeout_ms": 180_000}
+    return {"symbol": sym, "position": pos}
