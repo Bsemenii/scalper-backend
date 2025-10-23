@@ -14,7 +14,7 @@ from bot.worker import Worker
 from features.microstructure import MicroFeatureEngine
 from features.indicators import IndiEngine
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 # ------------------------------------------------------------------------------
 # App init & CORS
@@ -26,7 +26,7 @@ app.state.worker: Optional[Worker] = None
 if os.getenv("ENABLE_CORS", "1") == "1":
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+        allow_origins=[o for o in os.getenv("CORS_ORIGINS", "*").split(",") if o],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -92,8 +92,11 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     w: Optional[Worker] = app.state.worker
     if w:
-        await w.stop()
-        app.state.worker = None
+        # мягкая остановка без исключений наружу
+        try:
+            await w.stop()
+        finally:
+            app.state.worker = None
 
 
 # ------------------------------------------------------------------------------
@@ -110,44 +113,96 @@ async def healthz() -> Dict[str, Any]:
     try:
         w = _worker_required()
         d = w.diag()
-        ws_msgs = d.get("ws_detail", {}).get("messages", 0)
-        emits = d.get("coal", {}).get("emit_count", 0)
+        ws_msgs = (d.get("ws_detail", {}) or {}).get("messages", 0)
+        emits = (d.get("coal", {}) or {}).get("emit_count", 0)
         return {"ok": (ws_msgs > 0 and emits > 0), "ws_messages": ws_msgs, "emits": emits}
     except Exception:
         return {"ok": False}
 
 
+# ------------------------------------------------------------------------------
+# Status (config + coalescer telemetry if available)
+# ------------------------------------------------------------------------------
+
 @app.get("/status")
 def status() -> Dict[str, Any]:
+    """
+    Конфиг + краткая телеметрия. Безопасно вызывать часто.
+    """
     s = get_settings()
+    w: Optional[Worker] = app.state.worker
+
+    coalescer_stats: Optional[Dict[str, Any]] = None
+    if w:
+        # 1) приоритет — агрегированная диагностика воркера
+        try:
+            d = w.diag()
+            coal = d.get("coal")
+            if isinstance(coal, dict) and coal:
+                coalescer_stats = coal
+        except Exception:
+            coalescer_stats = None
+        # 2) фолбэк — прямой вызов stats()
+        if coalescer_stats is None:
+            try:
+                st = w.coalescer.stats()  # property coalescer совместим с .stats()
+                if isinstance(st, dict) and st:
+                    coalescer_stats = st
+            except Exception:
+                coalescer_stats = None
+
     return {
-        "mode": s.mode,
-        "symbols": s.symbols,
-        "streams": {"coalesce_ms": s.streams.coalesce_ms},
+        "mode": getattr(s, "mode", "paper"),
+        "symbols": getattr(s, "symbols", []),
+        "streams": {
+            "coalesce_ms": getattr(getattr(s, "streams", object()), "coalesce_ms", 75),
+            "coalescer": coalescer_stats if coalescer_stats is not None else None,
+        },
         "risk": {
-            "risk_per_trade_pct": s.risk.risk_per_trade_pct,
-            "daily_stop_r": s.risk.daily_stop_r,
-            "daily_target_r": s.risk.daily_target_r,
-            "max_consec_losses": s.risk.max_consec_losses,
-            "cooldown_after_sl_s": s.risk.cooldown_after_sl_s,
+            "risk_per_trade_pct": getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.25),
+            "daily_stop_r": getattr(getattr(s, "risk", object()), "daily_stop_r", -10.0),
+            "daily_target_r": getattr(getattr(s, "risk", object()), "daily_target_r", 15.0),
+            "max_consec_losses": getattr(getattr(s, "risk", object()), "max_consec_losses", 3),
+            "cooldown_after_sl_s": getattr(getattr(s, "risk", object()), "cooldown_after_sl_s", 120),
+            "min_risk_usd_floor": getattr(getattr(s, "risk", object()), "min_risk_usd_floor", 0.25),
         },
         "safety": {
-            "max_spread_ticks": s.safety.max_spread_ticks,
-            "min_top5_liquidity_usd": s.safety.min_top5_liquidity_usd,
-            "skip_funding_minute": s.safety.skip_funding_minute,
-            "skip_minute_zero": s.safety.skip_minute_zero,
-            "min_liq_buffer_sl_mult": s.safety.min_liq_buffer_sl_mult,
+            "max_spread_ticks": getattr(getattr(s, "safety", object()), "max_spread_ticks", 3),
+            "min_top5_liquidity_usd": getattr(getattr(s, "safety", object()), "min_top5_liquidity_usd", 300000),
+            "skip_funding_minute": getattr(getattr(s, "safety", object()), "skip_funding_minute", True),
+            "skip_minute_zero": getattr(getattr(s, "safety", object()), "skip_minute_zero", True),
+            "min_liq_buffer_sl_mult": getattr(getattr(s, "safety", object()), "min_liq_buffer_sl_mult", 3.0),
+        },
+        "strategy": {
+            "regime": {
+                "vol_window_s": getattr(getattr(getattr(s, "strategy", object()), "regime", object()), "vol_window_s", 60),
+            },
+            "momentum": {
+                "obi_t": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "obi_t", 0.12),
+                "tp_r": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "tp_r", 1.6),
+                "stop_k_sigma": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "stop_k_sigma", 1.1),
+            },
+            "reversion": {
+                "bb_z": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "bb_z", 2.0),
+                "rsi": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "rsi", 70),
+                "tp_to_vwap": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "tp_to_vwap", True),
+                "tp_r": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "tp_r", 1.3),
+            },
         },
         "execution": {
-            "limit_offset_ticks": s.execution.limit_offset_ticks,
-            "limit_timeout_ms": s.execution.limit_timeout_ms,
-            "max_slippage_bp": s.execution.max_slippage_bp,
-            "time_in_force": getattr(s.execution, "time_in_force", "GTC"),
+            "limit_offset_ticks": getattr(getattr(s, "execution", object()), "limit_offset_ticks", 1),
+            "limit_timeout_ms": getattr(getattr(s, "execution", object()), "limit_timeout_ms", 500),
+            "max_slippage_bp": getattr(getattr(s, "execution", object()), "max_slippage_bp", 6),
+            "time_in_force": getattr(getattr(s, "execution", object()), "time_in_force", "GTC"),
+            "fee_bps_maker": getattr(getattr(s, "execution", object()), "fee_bps_maker", 1.0),
+            "fee_bps_taker": getattr(getattr(s, "execution", object()), "fee_bps_taker", 3.5),
+            "min_stop_ticks": getattr(getattr(s, "execution", object()), "min_stop_ticks", 2),
         },
         "ml": {
-            "enabled": s.ml.enabled,
-            "p_threshold_mom": s.ml.p_threshold_mom,
-            "p_threshold_rev": s.ml.p_threshold_rev,
+            "enabled": getattr(getattr(s, "ml", object()), "enabled", False),
+            "p_threshold_mom": getattr(getattr(s, "ml", object()), "p_threshold_mom", 0.55),
+            "p_threshold_rev": getattr(getattr(s, "ml", object()), "p_threshold_rev", 0.60),
+            "model_path": getattr(getattr(s, "ml", object()), "model_path", "./ml_artifacts/model.bin"),
         },
         "log_dir": getattr(s, "log_dir", "./logs"),
         "log_level": getattr(s, "log_level", "INFO"),
@@ -167,13 +222,13 @@ async def debug_diag() -> Dict[str, Any]:
     d = w.diag()
     return {
         "ws": {
-            "count": d.get("ws_detail", {}).get("messages", 0),
-            "last_rx_ts_ms": d.get("ws_detail", {}).get("last_rx_ms", 0),
+            "count": (d.get("ws_detail", {}) or {}).get("messages", 0),
+            "last_rx_ts_ms": (d.get("ws_detail", {}) or {}).get("last_rx_ms", 0),
         },
         "ws_detail": d.get("ws_detail", {}),
         "coal": d.get("coal", {}),
         "symbols": d.get("symbols", []),
-        "coalesce_ms": d.get("coal", {}).get("window_ms"),
+        "coalesce_ms": (d.get("coal", {}) or {}).get("window_ms"),
         "history_seconds": 600,  # совместимость с фронтом
         "best": d.get("best", {}),
         "exec_cfg": d.get("exec_cfg", {}),
@@ -209,7 +264,7 @@ async def best(
 
 def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Последний тик по символу. Если истории нет — соберём снимок из best bid/ask.
+    Последний тик по символу. Если истории нет — снимок из best bid/ask.
     """
     if hasattr(w, "latest_tick"):
         try:
@@ -237,7 +292,7 @@ def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
 
 def _worker_history_ticks(w: Worker, symbol: str, since_ms: int, limit: int) -> List[Dict[str, Any]]:
     """
-    История тиков с ts_ms >= since_ms, обрезанная хвостом до limit.
+    История тиков с ts_ms >= since_ms, обрезанная до limit.
     Если истории нет — вернём <=1 элемента (latest).
     """
     if hasattr(w, "history_ticks"):
@@ -271,7 +326,7 @@ async def ticks_peek(
     limit: int = Query(512, ge=1, le=4096, description="Максимум элементов в ответе"),
 ) -> Dict[str, Any]:
     """
-    История тик-снапшотов за последние `ms` (если воркер не хранит историю — вернём последний тик).
+    История тик-снапшотов за последние `ms`.
     """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
@@ -404,20 +459,18 @@ async def control_flatten(
     symbol: str = Query("BTCUSDT"),
 ) -> Dict[str, Any]:
     """
-    Форс-закрыть позицию (paper), сбросить FSM в FLAT. Удобно для повторных входов.
-    Поддерживаются и POST, и GET для удобства из браузера.
+    Форс-закрыть позицию (paper), сбросить FSM в FLAT. Поддерживаются POST и GET.
     """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
-    res = await w.flatten(sym)
-    return res
+    return await w.flatten(sym)
+
 
 @app.post("/control/flatten-all")
 @app.get("/control/flatten-all")
 async def control_flatten_all() -> Dict[str, Any]:
     """
-    Форс-закрыть позиции по всем символам и сбросить FSM в FLAT.
-    Поддерживаются GET и POST (для удобства из браузера).
+    Форс-закрыть позиции по всем символам и сбросить FSM в FLAT (POST/GET).
     """
     w = _worker_required()
     results: Dict[str, Any] = {}
@@ -444,6 +497,7 @@ async def control_set_timeout(
     sym = _normalize_symbol(symbol, w.symbols)
     return w.set_timeout_ms(sym, timeout_ms)
 
+
 # ------------------------------------------------------------------------------
 # Positions (snapshot)
 # ------------------------------------------------------------------------------
@@ -452,7 +506,7 @@ async def control_set_timeout(
 async def positions() -> Dict[str, Any]:
     """
     Снимок состояний позиций по всем символам.
-    Формат берём из w.diag()['positions'], чтобы совпадал с тем, что уже видишь в /debug/diag.
+    Формат берём из w.diag()['positions'] (совместимость с фронтом и /debug/diag).
     """
     w = _worker_required()
     d = w.diag()
@@ -470,9 +524,136 @@ async def position(
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     d = w.diag()
-    pos = d.get("positions", {}).get(sym, None)
+    pos = (d.get("positions", {}) or {}).get(sym)
     if pos is None:
-        # если почему-то нет ключа — отдадим FLAT по умолчанию
-        pos = {"state": "FLAT", "side": None, "qty": 0.0, "entry_px": 0.0, "sl_px": None, "tp_px": None,
-               "opened_ts_ms": 0, "timeout_ms": 180_000}
+        pos = {
+            "state": "FLAT", "side": None, "qty": 0.0, "entry_px": 0.0,
+            "sl_px": None, "tp_px": None, "opened_ts_ms": 0, "timeout_ms": 180_000
+        }
     return {"symbol": sym, "position": pos}
+
+
+# ------------------------------------------------------------------------------
+# Metrics (compact JSON)
+# ------------------------------------------------------------------------------
+
+@app.get("/metrics")
+async def metrics() -> Dict[str, Any]:
+    """
+    Компактные метрики для мониторинга/панели.
+    Источники: worker.diag()['ws_detail'], ['coal'], ['exec_counters'], ['pnl_day'].
+    Любые отсутствующие поля безопасно дефолтятся.
+    """
+    w = _worker_required()
+    d = w.diag()
+
+    ws = d.get("ws_detail", {}) or {}
+    coal = d.get("coal", {}) or {}
+    exec_counters = d.get("exec_counters", {}) or {}
+    pnl_day = d.get("pnl_day", {}) or {}
+
+    positions = d.get("positions", {}) or {}
+    open_positions = sum(1 for p in positions.values() if (p or {}).get("state") == "OPEN")
+
+    return {
+        "ws_messages": ws.get("messages", 0),
+        "ws_last_rx_ms": ws.get("last_rx_ms", 0),
+        "ws_reconnects": ws.get("reconnects", 0),
+
+        "coalesce_window_ms": coal.get("window_ms"),
+        "coalesce_emit_count": coal.get("emit_count", 0),
+        "coalesce_emits_per_sec": coal.get("emits_per_sec", 0.0),
+        "coalesce_queue_max": coal.get("max_queue_depth", 0),
+
+        "orders_limit_total": exec_counters.get("limit_total", 0),
+        "orders_market_total": exec_counters.get("market_total", 0),
+        "orders_cancel_total": exec_counters.get("cancel_total", 0),
+
+        "open_positions": open_positions,
+        "symbols": list(w.symbols),
+
+        "pnl_r_day": pnl_day.get("pnl_r", 0.0),
+        "pnl_usd_day": pnl_day.get("pnl_usd", 0.0),
+        "winrate_day": pnl_day.get("winrate"),
+        "trades_day": pnl_day.get("trades", 0),
+        "max_dd_r_day": pnl_day.get("max_dd_r"),
+    }
+
+
+# ------------------------------------------------------------------------------
+# Debug reasons (why entries were blocked)
+# ------------------------------------------------------------------------------
+
+@app.get("/debug/reasons")
+async def debug_reasons() -> Dict[str, Any]:
+    """
+    Агрегированные причины отказов во входы (если воркер их собирает).
+    Если нет — отдаём пустой словарь.
+    """
+    w = _worker_required()
+    d = w.diag()
+    reasons = d.get("block_reasons", {}) or d.get("reasons", {}) or {}
+    return {"reasons": reasons}
+
+
+# ------------------------------------------------------------------------------
+# Trades history (best-effort from worker.diag)
+# ------------------------------------------------------------------------------
+
+@app.get("/trades")
+async def trades(
+    symbol: Optional[str] = Query(None, description="Фильтр по символу, напр. BTCUSDT"),
+    limit: int = Query(50, ge=1, le=500),
+) -> Dict[str, Any]:
+    """
+    История сделок из воркера, если он её ведёт. Иначе возвращаем пусто.
+    Элемент: {symbol, side, opened_ts, closed_ts, qty, entry_px, exit_px, sl_px, tp_px, pnl_r, pnl_usd, fees}
+    """
+    w = _worker_required()
+    d = w.diag()
+    store = d.get("trades")  # может быть списком либо словарём {symbol: [..]}
+
+    items: List[Dict[str, Any]] = []
+    if isinstance(store, list):
+        items = [t for t in store if (not symbol or t.get("symbol") == symbol)]
+    elif isinstance(store, dict):
+        if symbol:
+            items = list(store.get(symbol.upper(), []))
+        else:
+            for arr in store.values():
+                items.extend(list(arr))
+    else:
+        items = []
+
+    items.sort(key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)), reverse=True)
+    if len(items) > limit:
+        items = items[:limit]
+
+    return {"items": items, "count": len(items)}
+
+
+# ------------------------------------------------------------------------------
+# Daily PnL (best-effort)
+# ------------------------------------------------------------------------------
+
+@app.get("/pnl/daily")
+async def pnl_daily() -> Dict[str, Any]:
+    """
+    Краткая дневная сводка из воркера (PnL в $, PnL в R, winrate, maxDD).
+    Всегда возвращает все поля, даже если данных мало.
+    """
+    s = get_settings()
+    w = _worker_required()
+    d = w.diag()
+    pnl_day = d.get("pnl_day", {}) or {}
+
+    return {
+        "day": pnl_day.get("day"),
+        "trades": pnl_day.get("trades", 0),
+        "winrate": pnl_day.get("winrate"),
+        "avg_r": pnl_day.get("avg_r"),
+        "pnl_r": pnl_day.get("pnl_r", 0.0),
+        "pnl_usd": pnl_day.get("pnl_usd", 0.0),
+        "max_dd_r": pnl_day.get("max_dd_r"),
+        "risk_per_trade_pct": getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.25),
+    }

@@ -1,56 +1,62 @@
 {
-    "mode": "paper",
-    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-  
-    "streams": {
-      "coalesce_ms": 75
+  "mode": "paper",
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+
+  "streams": {
+    "coalesce_ms": 75
+  },
+
+  "risk": {
+    "risk_per_trade_pct": 0.25,
+    "daily_stop_r": -10.0,
+    "daily_target_r": 15.0,
+    "max_consec_losses": 3,
+    "cooldown_after_sl_s": 120,
+    "min_risk_usd_floor": 0.25
+  },
+
+  "safety": {
+    "max_spread_ticks": 3,
+    "min_top5_liquidity_usd": 300000,
+    "skip_funding_minute": true,
+    "skip_minute_zero": true,
+    "min_liq_buffer_sl_mult": 3.0
+  },
+
+  "strategy": {
+    "regime": {
+      "vol_window_s": 60
     },
-  
-    "risk": {
-      "risk_per_trade_pct": 0.25,
-      "daily_stop_r": -10.0,
-      "daily_target_r": 15.0,
-      "max_consec_losses": 3,
-      "cooldown_after_sl_s": 120
+    "momentum": {
+      "obi_t": 0.12,
+      "tp_r": 1.6,
+      "stop_k_sigma": 1.1
     },
-  
-    "safety": {
-      "max_spread_ticks": 3,
-      "min_top5_liquidity_usd": 300000,
-      "skip_funding_minute": true,
-      "skip_minute_zero": true,
-      "min_liq_buffer_sl_mult": 3.0
-    },
-  
-    "strategy": {
-      "regime": {
-        "vol_window_s": 60
-      },
-      "momentum": {
-        "obi_t": 0.12,
-        "tp_r": 1.6,
-        "stop_k_sigma": 1.1
-      },
-      "reversion": {
-        "bb_z": 2.0,
-        "rsi": 70,
-        "tp_to_vwap": true,
-        "tp_r": 1.3
-      }
-    },
-  
-    "execution": {
-      "limit_offset_ticks": 1,
-      "limit_timeout_ms": 500,
-      "max_slippage_bp": 6,
-      "time_in_force": "GTC"
-    },
-  
-    "ml": {
-      "enabled": false,
-      "p_threshold_mom": 0.55,
-      "p_threshold_rev": 0.60,
-      "model_path": "./ml_artifacts/model.bin"
+    "reversion": {
+      "bb_z": 2.0,
+      "rsi": 70,
+      "tp_to_vwap": true,
+      "tp_r": 1.3
     }
-  }
-  
+  },
+
+  "execution": {
+    "limit_offset_ticks": 1,
+    "limit_timeout_ms": 500,
+    "max_slippage_bp": 6,
+    "time_in_force": "GTC",
+    "fee_bps_maker": 1.0,
+    "fee_bps_taker": 3.5,
+    "min_stop_ticks": 2
+  },
+
+  "ml": {
+    "enabled": false,
+    "p_threshold_mom": 0.55,
+    "p_threshold_rev": 0.60,
+    "model_path": "./ml_artifacts/model.bin"
+  },
+
+  "log_dir": "./logs",
+  "log_level": "INFO"
+}

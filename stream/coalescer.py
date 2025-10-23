@@ -43,8 +43,12 @@ class Coalescer:
         # Диагностика
         self._push_count: int = 0
         self._emit_count: int = 0
+        self._invalid_count: int = 0
+        self._empty_symbol_count: int = 0
         self._last_tick_ts_ms: int = 0
         self._start_monotonic: float = time.monotonic()
+        self._last_emit_monotonic: float = self._start_monotonic
+        self._max_queue_depth: int = 0
 
     # ---------- публичный API ----------
 
@@ -52,6 +56,9 @@ class Coalescer:
         """Положить raw-событие в очередь коалесцера."""
         await self._q.put(raw)
         self._push_count += 1
+        qsize = self._q.qsize()
+        if qsize > self._max_queue_depth:
+            self._max_queue_depth = qsize
 
     async def run(self, on_tick: Callable[[TickerTick], Awaitable[None]]) -> None:
         """
@@ -59,17 +66,22 @@ class Coalescer:
           — ждём новые события до конца ближайшего окна;
           — по таймауту окна эмитим по одному тіку на все «грязные» символы.
         """
-        try:
-            period = self._coalesce_ms / 1000.0
-            next_flush = time.monotonic() + period
+        period = self._coalesce_ms / 1000.0
+        next_flush = time.monotonic() + period
 
-            while not self._stop.is_set():
+        try:
+            while True:
+                if self._stop.is_set():
+                    # финальный flush перед выходом
+                    await self._flush_dirty(on_tick, final=True)
+                    break
+
                 timeout = max(0.0, next_flush - time.monotonic())
                 try:
                     # получаем одно событие с таймаутом до конца окна…
                     raw = await asyncio.wait_for(self._q.get(), timeout=timeout)
                     self._ingest_raw(raw)
-                    # …а затем сглатываем все, что уже накопилось без ожидания
+                    # …а затем сглатываем всё, что уже накопилось без ожидания
                     while True:
                         try:
                             raw2 = self._q.get_nowait()
@@ -78,28 +90,19 @@ class Coalescer:
                             break
                 except asyncio.TimeoutError:
                     # конец окна → эмитим «грязные» символы
-                    if self._dirty:
-                        for sym, fl in list(self._dirty.items()):
-                            if not fl:
-                                continue
-                            r = self._last_raw.get(sym)
-                            if not r:
-                                self._dirty[sym] = False
-                                continue
-                            tick = self._to_tick(r)
-                            if tick and self._spread_ok(tick):
-                                await on_tick(tick)
-                                self._emit_count += 1
-                                self._last_tick_ts_ms = int(tick.ts_ms)
-                            self._dirty[sym] = False
-                    # планируем следующее окно от «сейчас» (без дрейфа)
+                    await self._flush_dirty(on_tick)
+                    # окно считаем от текущего монотоника, чтобы не накапливать дрейф
                     next_flush = time.monotonic() + period
         except asyncio.CancelledError:
-            # мягкое завершение
-            pass
+            # мягкое завершение: финальный flush и выход
+            try:
+                await self._flush_dirty(on_tick, final=True)
+            except Exception:
+                # на закрытии ошибки игнорируем, чтобы не ронять процесс
+                pass
 
     async def close(self) -> None:
-        """Остановить коалесцер (завершит run-петлю)."""
+        """Остановить коалесцер (завершит run-петлю после финального flush)."""
         self._stop.set()
 
     def stats(self) -> Dict[str, Any]:
@@ -109,9 +112,12 @@ class Coalescer:
         return {
             "push_count": self._push_count,
             "emit_count": self._emit_count,
+            "invalid_count": self._invalid_count,
+            "empty_symbol_count": self._empty_symbol_count,
             "emits_per_sec": round(emits_per_sec, 3),
             "last_tick_ts_ms": self._last_tick_ts_ms,
             "window_ms": self._coalesce_ms,
+            "max_queue_depth": self._max_queue_depth,
         }
 
     # ---------- внутреннее ----------
@@ -120,6 +126,7 @@ class Coalescer:
         """Нормализуем и кладём последнее raw по символу, помечаем «грязно»."""
         sym = (d.get("symbol") or d.get("s") or "").upper()
         if not sym:
+            self._empty_symbol_count += 1
             return
 
         ts_ms = d.get("ts_ms") or d.get("E") or d.get("T")
@@ -146,11 +153,14 @@ class Coalescer:
             # combined
             if "bid" in d and "ask" in d:
                 symbol = (d.get("symbol") or d.get("s") or "").upper()
+                if not symbol:
+                    self._empty_symbol_count += 1
+                    return None
                 ts_ms = int(d.get("ts_ms") or int(time.time() * 1000))
                 bid = float(d["bid"])
                 ask = float(d["ask"])
-                bid_sz = float(d.get("bid_size", d.get("B", 0.0)))
-                ask_sz = float(d.get("ask_size", d.get("A", 0.0)))
+                bid_sz = float(d.get("bid_size", d.get("B", 0.0)) or 0.0)
+                ask_sz = float(d.get("ask_size", d.get("A", 0.0)) or 0.0)
                 price = float(d.get("price", (bid + ask) / 2.0))
                 mark = d.get("mark_price")
                 mark_price = float(mark) if mark is not None else None
@@ -159,15 +169,43 @@ class Coalescer:
             # сырой bookTicker
             if "b" in d and "a" in d:
                 symbol = (d.get("s") or d.get("symbol") or "").upper()
+                if not symbol:
+                    self._empty_symbol_count += 1
+                    return None
                 ts_ms = int(d.get("E") or d.get("T") or d.get("ts_ms") or int(time.time() * 1000))
                 bid = float(d["b"])
                 ask = float(d["a"])
-                bid_sz = float(d.get("B", 0.0))
-                ask_sz = float(d.get("A", 0.0))
+                bid_sz = float(d.get("B", 0.0) or 0.0)
+                ask_sz = float(d.get("A", 0.0) or 0.0)
                 price = (bid + ask) / 2.0
                 mark = d.get("mark_price")
                 mark_price = float(mark) if mark is not None else None
                 return TickerTick(symbol, ts_ms, price, bid, ask, bid_sz, ask_sz, mark_price)
         except Exception:
+            self._invalid_count += 1
             return None
         return None
+
+    async def _flush_dirty(self, on_tick: Callable[[TickerTick], Awaitable[None]], final: bool = False) -> None:
+        """
+        Эмитим по одному тіку для всех «грязных» символов.
+        Если final=True — игнорируем spread-фильтр и отдаём всё «как есть»
+        (на завершении важно не потерять последние значения).
+        """
+        if not self._dirty:
+            return
+        for sym, is_dirty in list(self._dirty.items()):
+            if not is_dirty:
+                continue
+            r = self._last_raw.get(sym)
+            if not r:
+                self._dirty[sym] = False
+                continue
+            tick = self._to_tick(r)
+            ok = bool(tick) and (self._spread_ok(tick) or final)
+            if ok and tick:
+                await on_tick(tick)
+                self._emit_count += 1
+                self._last_tick_ts_ms = int(tick.ts_ms)
+                self._last_emit_monotonic = time.monotonic()
+            self._dirty[sym] = False
