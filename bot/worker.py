@@ -15,6 +15,13 @@ from adapters.binance_rest import PaperAdapter
 from exec.executor import Executor, ExecCfg, ExecutionReport
 from exec.sltp import compute_sltp, SLTPPlan  # план цен SL/TP (paper)
 
+# риск-фильтры
+from risk.filters import (
+    SafetyCfg, RiskCfg,
+    MicroCtx, TimeCtx, PositionalCtx, DayState,
+    check_entry_safety, check_day_limits,
+)
+
 # мягкий импорт настроек — чтобы smoke работал без падений
 try:
     from bot.core.config import get_settings  # type: ignore
@@ -71,7 +78,8 @@ class Worker:
       - SL/TP план + watchdog (таймаут и защита),
       - учёт сделок и дневной PnL (best-effort),
       - счётчики исполнения (для /metrics),
-      - комиссии (maker/taker) в paper-режиме.
+      - комиссии (maker/taker) в paper-режиме,
+      - РИСК-ФИЛЬТРЫ (safety + дневные лимиты).
     """
 
     def __init__(
@@ -135,12 +143,18 @@ class Worker:
             "max_dd_r": None,
         }
         self._pnl_r_equity: float = 0.0  # для подсчёта max drawdown в R
+        self._consec_losses: int = 0     # подряд убыточные сделки (для лимита)
 
-        # причины блокировок входа (если будем наполнять позже)
+        # причины блокировок входа
         self._block_reasons: Dict[str, int] = {}
 
         # для оценки комиссий входа: сохраняем steps открытия
         self._entry_steps: Dict[str, List[str]] = {}
+
+        # конфиги риск-фильтров (инициализация из settings, если есть)
+        self._safety_cfg = self._load_safety_cfg()
+        self._risk_cfg = self._load_risk_cfg()
+        self._server_time_offset_ms: int = 0  # будущее место для sync с /time
 
         # таски жизненного цикла
         self._tasks: List[asyncio.Task] = []
@@ -273,13 +287,27 @@ class Worker:
 
     async def place_entry(self, symbol: str, side: Side, qty: float) -> Dict[str, Any]:
         """
-        Прямой тестовый вход (обходит стратегии) + постановка SL/TP (paper-план).
+        Прямой тестовый вход (обходит стратегии) + риск-фильтры + постановка SL/TP (paper-план).
         FSM: FLAT -> ENTERING -> OPEN; таймаут -> EXITING -> FLAT.
         Возвращает словарь с ключом "report" для совместимости с API.
         """
         symbol = symbol.upper()
         if symbol not in self.execs:
             raise ValueError(f"Unsupported symbol: {symbol}")
+
+        # === 0) дневные лимиты (до захвата мьютекса, это дёшево) ===
+        day_dec = check_day_limits(
+            DayState(
+                pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
+                consec_losses=int(self._consec_losses),
+                trading_disabled=False,
+            ),
+            self._risk_cfg,
+        )
+        if not day_dec.allow:
+            for r in day_dec.reasons:
+                self._inc_block_reason("day_" + r)
+            return {"ok": False, "reason": ",".join(["day_"+r for r in day_dec.reasons]), "symbol": symbol, "side": side, "qty": qty}
 
         lock = self._locks[symbol]
         async with lock:
@@ -288,10 +316,31 @@ class Worker:
                 self._inc_block_reason("busy_" + pos.state)
                 return {"ok": False, "reason": f"busy:{pos.state}", "symbol": symbol, "side": side, "qty": qty}
 
+            # === 1) быстрые safety-фильтры до входа (spread/liq/time) ===
+            bid, ask = self.hub.best_bid_ask(symbol)
+            spec = self.specs[symbol]
+            spread_ticks = 0.0
+            if bid > 0 and ask > 0 and spec.price_tick > 0:
+                spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+
+            micro = MicroCtx(
+                spread_ticks=spread_ticks,
+                # пока нет реального топ-5 лимита — используем большое число, чтобы фильтр пропускал;
+                # когда подключим features.microstructure — подставим сюда реальное значение
+                top5_liq_usd=1e12,
+            )
+            tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
+            pre_dec = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=self._safety_cfg)
+            if not pre_dec.allow:
+                for r in pre_dec.reasons:
+                    self._inc_block_reason(r)
+                return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side, "qty": qty}
+
             # ENTERING
             pos.state = "ENTERING"
             pos.side = side
 
+            # === 2) исполнение (limit→timeout→cancel→market) ===
             rep: ExecutionReport = await self.execs[symbol].place_entry(symbol, side, qty)
             self._accumulate_exec_counters(rep.steps)
 
@@ -316,29 +365,56 @@ class Worker:
                     },
                 }
 
-            # позиция открыта
+            # === 3) расчёт SL/TP и повторная safety-проверка (ликвидационный буфер) ===
             entry_px = float(rep.avg_px)
             qty_open = float(rep.filled_qty)
 
-            # оценка стоп-дистанции: минимум min_stop_ticks тиков или текущий спред в тиках
-            spec = self.specs[symbol]
-            bid, ask = self.hub.best_bid_ask(symbol)
-            spread_ticks = max(1.0, (ask - bid) / max(spec.price_tick, 1e-9))
+            # минимальная SL-дистанция: макс(мин.тики, текущий спред)
             min_stop_ticks = self._min_stop_ticks_default()  # по умолчанию 2 тика (как было)
-            sl_distance_px = max(min_stop_ticks * spec.price_tick, spread_ticks * spec.price_tick)
+            sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
 
-            # рассчитать SL/TP (paper-план)
             plan: SLTPPlan = compute_sltp(
                 side=side, entry_px=entry_px, qty=qty_open,
                 price_tick=spec.price_tick, sl_distance_px=sl_distance_px, rr=1.8
             )
 
-            # считаем защиту "поставленной" в состоянии (в live тут — REST reduceOnly)
+            # проверка ликвидационного буфера относительно SL
+            post_dec = check_entry_safety(
+                side,
+                micro=micro,
+                time_ctx=tctx,
+                pos_ctx=PositionalCtx(entry_px=entry_px, sl_px=plan.sl_px, leverage=15.0),
+                safety=self._safety_cfg,
+            )
+            if not post_dec.allow:
+                for r in post_dec.reasons:
+                    self._inc_block_reason(r)
+                # откат позиции (закрывать не нужно — мы ещё не записали OPEN)
+                self._pos[symbol] = PositionState(
+                    state="FLAT", side=None, qty=0.0, entry_px=0.0,
+                    sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
+                )
+                return {
+                    "ok": False,
+                    "reason": ",".join(post_dec.reasons),
+                    "symbol": symbol, "side": side, "qty": qty,
+                    "report": {
+                        "status": rep.status,
+                        "filled_qty": rep.filled_qty,
+                        "avg_px": rep.avg_px,
+                        "limit_oid": rep.limit_oid,
+                        "market_oid": rep.market_oid,
+                        "steps": rep.steps + ["blocked_after_plan:" + "|".join(post_dec.reasons)],
+                        "ts": rep.ts,
+                    },
+                }
+
+            # === 4) открываем позицию (защита «считается поставленной» в состоянии) ===
             self._pos[symbol] = PositionState(
                 state="OPEN", side=side, qty=qty_open, entry_px=entry_px,
                 sl_px=plan.sl_px, tp_px=plan.tp_px, opened_ts_ms=self._now_ms(), timeout_ms=pos.timeout_ms
             )
-            # сохраним шаги входа для расчёта комиссий при выходе
+            # шаги входа для комиссий при выходе
             self._entry_steps[symbol] = list(rep.steps)
 
             return {
@@ -464,7 +540,7 @@ class Worker:
         pnl_usd = pnl_usd_gross - fees_usd
 
         # защищаемся от микроскопического риска — нормализуем на пол
-        risk_usd = max(pnl_risk_usd, self._min_risk_usd_floor())
+        risk_usd = max(pnl_risk_usd, self._risk_cfg.min_risk_usd_floor)
         pnl_r = pnl_usd / risk_usd
 
         trade = {
@@ -497,10 +573,17 @@ class Worker:
             # новый день — сбрасываем статы
             self._pnl_day = {"day": day, "trades": 0, "winrate": None, "avg_r": None, "pnl_r": 0.0, "pnl_usd": 0.0, "max_dd_r": None}
             self._pnl_r_equity = 0.0
+            self._consec_losses = 0
 
         self._pnl_day["trades"] += 1
         self._pnl_day["pnl_usd"] += trade["pnl_usd"]
         self._pnl_day["pnl_r"] += trade["pnl_r"]
+
+        # последовательные лоссы
+        if trade["pnl_r"] > 0:
+            self._consec_losses = 0
+        else:
+            self._consec_losses += 1
 
         # winrate/avg_r
         wins = int(round((self._pnl_day.get("winrate_raw", 0.0) or 0.0) * max(self._pnl_day["trades"] - 1, 0)))
@@ -569,10 +652,27 @@ class Worker:
             },
             "trades": {s: list(self._trades.get(s, [])) for s in self.symbols},
             "block_reasons": dict(self._block_reasons),
+            # текущие риск-настройки
+            "risk_cfg": {
+                "risk_per_trade_pct": self._risk_cfg.risk_per_trade_pct,
+                "daily_stop_r": self._risk_cfg.daily_stop_r,
+                "daily_target_r": self._risk_cfg.daily_target_r,
+                "max_consec_losses": self._risk_cfg.max_consec_losses,
+                "cooldown_after_sl_s": self._risk_cfg.cooldown_after_sl_s,
+                "min_risk_usd_floor": self._risk_cfg.min_risk_usd_floor,
+            },
+            "safety_cfg": {
+                "max_spread_ticks": self._safety_cfg.max_spread_ticks,
+                "min_top5_liquidity_usd": self._safety_cfg.min_top5_liquidity_usd,
+                "skip_funding_minute": self._safety_cfg.skip_funding_minute,
+                "skip_minute_zero": self._safety_cfg.skip_minute_zero,
+                "min_liq_buffer_sl_mult": self._safety_cfg.min_liq_buffer_sl_mult,
+            },
+            "consec_losses": self._consec_losses,
         }
         return d
 
-    # ---------- utils ----------
+    # ---------- utils / config loaders ----------
 
     @staticmethod
     def _now_ms() -> int:
@@ -601,22 +701,6 @@ class Worker:
 
     def _inc_block_reason(self, key: str) -> None:
         self._block_reasons[key] = self._block_reasons.get(key, 0) + 1
-
-    def _min_risk_usd_floor(self) -> float:
-        """
-        Минимальный размер риска (в USD) для расчёта R, чтобы избегать аномальных R
-        при микроскопических стоп-дистанциях (paper). Берётся из settings.risk.min_risk_usd_floor, если есть.
-        """
-        default = 0.25
-        if get_settings:
-            try:
-                s = get_settings()
-                val = getattr(getattr(s, "risk", object()), "min_risk_usd_floor", None)
-                if isinstance(val, (int, float)) and val > 0:
-                    return float(val)
-            except Exception:
-                pass
-        return default
 
     def _min_stop_ticks_default(self) -> float:
         """
@@ -653,6 +737,39 @@ class Worker:
                 pass
         return taker_bps if taker_like else maker_bps
 
+    def _load_safety_cfg(self) -> SafetyCfg:
+        cfg = SafetyCfg()
+        if get_settings:
+            try:
+                s = get_settings()
+                cfg = SafetyCfg(
+                    max_spread_ticks=int(getattr(s.safety, "max_spread_ticks", cfg.max_spread_ticks)),
+                    min_top5_liquidity_usd=float(getattr(s.safety, "min_top5_liquidity_usd", cfg.min_top5_liquidity_usd)),
+                    skip_funding_minute=bool(getattr(s.safety, "skip_funding_minute", cfg.skip_funding_minute)),
+                    skip_minute_zero=bool(getattr(s.safety, "skip_minute_zero", cfg.skip_minute_zero)),
+                    min_liq_buffer_sl_mult=float(getattr(s.safety, "min_liq_buffer_sl_mult", cfg.min_liq_buffer_sl_mult)),
+                )
+            except Exception:
+                logger.debug("safety cfg: using defaults")
+        return cfg
+
+    def _load_risk_cfg(self) -> RiskCfg:
+        cfg = RiskCfg()
+        if get_settings:
+            try:
+                s = get_settings()
+                cfg = RiskCfg(
+                    risk_per_trade_pct=float(getattr(s.risk, "risk_per_trade_pct", cfg.risk_per_trade_pct)),
+                    daily_stop_r=float(getattr(s.risk, "daily_stop_r", cfg.daily_stop_r)),
+                    daily_target_r=float(getattr(s.risk, "daily_target_r", cfg.daily_target_r)),
+                    max_consec_losses=int(getattr(s.risk, "max_consec_losses", cfg.max_consec_losses)),
+                    cooldown_after_sl_s=int(getattr(s.risk, "cooldown_after_sl_s", cfg.cooldown_after_sl_s)),
+                    min_risk_usd_floor=float(getattr(getattr(s, "risk", object()), "min_risk_usd_floor", cfg.min_risk_usd_floor)),
+                )
+            except Exception:
+                logger.debug("risk cfg: using defaults")
+        return cfg
+
     # совместимость с /status фолбэком: чтобы app мог обратиться как worker.coalescer.stats()
     @property
     def coalescer(self) -> Coalescer:
@@ -676,7 +793,7 @@ async def _smoke() -> None:
         await asyncio.sleep(2.0)
 
     rep = await w.place_entry("BTCUSDT", "BUY", 0.001)
-    print("[smoke] EXEC REPORT:", rep["report"])
+    print("[smoke] EXEC REPORT]:", rep)
 
     # проверим flatten → запись трейда
     await w.flatten("BTCUSDT")

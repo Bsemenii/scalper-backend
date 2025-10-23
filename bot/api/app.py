@@ -14,7 +14,7 @@ from bot.worker import Worker
 from features.microstructure import MicroFeatureEngine
 from features.indicators import IndiEngine
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 
 # ------------------------------------------------------------------------------
 # App init & CORS
@@ -32,7 +32,6 @@ if os.getenv("ENABLE_CORS", "1") == "1":
         allow_headers=["*"],
     )
 
-
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -44,7 +43,6 @@ def _symbols_from_settings() -> List[str]:
     except Exception:
         return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-
 def _coalesce_from_settings() -> int:
     try:
         s = get_settings()
@@ -52,13 +50,11 @@ def _coalesce_from_settings() -> int:
     except Exception:
         return int(os.getenv("COALESCE_MS", "75"))
 
-
 def _worker_required() -> Worker:
     w: Optional[Worker] = app.state.worker
     if not w:
         raise HTTPException(status_code=503, detail="Worker is not started yet")
     return w
-
 
 def _normalize_symbol(symbol: str, allowed: Iterable[str]) -> str:
     sym = symbol.upper()
@@ -69,10 +65,8 @@ def _normalize_symbol(symbol: str, allowed: Iterable[str]) -> str:
         )
     return sym
 
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
 
 # ------------------------------------------------------------------------------
 # Lifecycle
@@ -82,22 +76,18 @@ def _now_ms() -> int:
 async def _startup() -> None:
     symbols = _symbols_from_settings()
     coalesce_ms = _coalesce_from_settings()
-
     w = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms, history_maxlen=4000)
     await w.start()
     app.state.worker = w
-
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     w: Optional[Worker] = app.state.worker
     if w:
-        # мягкая остановка без исключений наружу
         try:
             await w.stop()
         finally:
             app.state.worker = None
-
 
 # ------------------------------------------------------------------------------
 # Basic endpoints
@@ -106,7 +96,6 @@ async def _shutdown() -> None:
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {"ok": True, "app": "ai-scalping-backend", "version": APP_VERSION}
-
 
 @app.get("/healthz")
 async def healthz() -> Dict[str, Any]:
@@ -119,9 +108,8 @@ async def healthz() -> Dict[str, Any]:
     except Exception:
         return {"ok": False}
 
-
 # ------------------------------------------------------------------------------
-# Status (config + coalescer telemetry if available)
+# Status (config + coalescer telemetry)
 # ------------------------------------------------------------------------------
 
 @app.get("/status")
@@ -134,7 +122,7 @@ def status() -> Dict[str, Any]:
 
     coalescer_stats: Optional[Dict[str, Any]] = None
     if w:
-        # 1) приоритет — агрегированная диагностика воркера
+        # 1) взять аггрегированную диагностику
         try:
             d = w.diag()
             coal = d.get("coal")
@@ -145,7 +133,7 @@ def status() -> Dict[str, Any]:
         # 2) фолбэк — прямой вызов stats()
         if coalescer_stats is None:
             try:
-                st = w.coalescer.stats()  # property coalescer совместим с .stats()
+                st = w.coalescer.stats()
                 if isinstance(st, dict) and st:
                     coalescer_stats = st
             except Exception:
@@ -208,7 +196,6 @@ def status() -> Dict[str, Any]:
         "log_level": getattr(s, "log_level", "INFO"),
     }
 
-
 # ------------------------------------------------------------------------------
 # Diagnostics
 # ------------------------------------------------------------------------------
@@ -216,10 +203,12 @@ def status() -> Dict[str, Any]:
 @app.get("/debug/diag")
 async def debug_diag() -> Dict[str, Any]:
     """
-    Расширенная диагностика пайплайна (стабильная форма для фронта).
+    Расширенная диагностика пайплайна (стабильная форма для фронта) + явные risk/safety cfg.
     """
     w = _worker_required()
     d = w.diag()
+    s = get_settings()
+
     return {
         "ws": {
             "count": (d.get("ws_detail", {}) or {}).get("messages", 0),
@@ -229,43 +218,47 @@ async def debug_diag() -> Dict[str, Any]:
         "coal": d.get("coal", {}),
         "symbols": d.get("symbols", []),
         "coalesce_ms": (d.get("coal", {}) or {}).get("window_ms"),
-        "history_seconds": 600,  # совместимость с фронтом
+        "history_seconds": 600,
         "best": d.get("best", {}),
         "exec_cfg": d.get("exec_cfg", {}),
+        # чтобы фронт не видел null
+        "risk_cfg": {
+            "risk_per_trade_pct": getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.25),
+            "daily_stop_r": getattr(getattr(s, "risk", object()), "daily_stop_r", -10.0),
+            "daily_target_r": getattr(getattr(s, "risk", object()), "daily_target_r", 15.0),
+            "max_consec_losses": getattr(getattr(s, "risk", object()), "max_consec_losses", 3),
+            "cooldown_after_sl_s": getattr(getattr(s, "risk", object()), "cooldown_after_sl_s", 120),
+            "min_risk_usd_floor": getattr(getattr(s, "risk", object()), "min_risk_usd_floor", 0.25),
+        },
+        "safety_cfg": {
+            "max_spread_ticks": getattr(getattr(s, "safety", object()), "max_spread_ticks", 3),
+            "min_top5_liquidity_usd": getattr(getattr(s, "safety", object()), "min_top5_liquidity_usd", 300000),
+            "skip_funding_minute": getattr(getattr(s, "safety", object()), "skip_funding_minute", True),
+            "skip_minute_zero": getattr(getattr(s, "safety", object()), "skip_minute_zero", True),
+            "min_liq_buffer_sl_mult": getattr(getattr(s, "safety", object()), "min_liq_buffer_sl_mult", 3.0),
+        },
+        "consec_losses": d.get("consec_losses", None),
     }
-
 
 @app.get("/symbols")
 async def symbols_summary() -> Dict[str, Any]:
-    """
-    Сводка по лучшим ценам всех символов.
-    """
     w = _worker_required()
     out: Dict[str, Tuple[float, float]] = {s: w.best_bid_ask(s) for s in w.symbols}
     return {"symbols": list(w.symbols), "best": out}
 
-
 @app.get("/best")
-async def best(
-    symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT"),
-) -> Dict[str, Any]:
-    """
-    Последняя лучшая цена (bid/ask) по символу.
-    """
+async def best(symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT")) -> Dict[str, Any]:
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     bid, ask = w.best_bid_ask(sym)
     return {"symbol": sym, "bid": bid, "ask": ask}
-
 
 # ------------------------------------------------------------------------------
 # Ticks (latest / peek)
 # ------------------------------------------------------------------------------
 
 def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Последний тик по символу. Если истории нет — снимок из best bid/ask.
-    """
+    # последний тик; если истории нет — слепок из best bid/ask
     if hasattr(w, "latest_tick"):
         try:
             t = w.latest_tick(symbol)  # type: ignore[attr-defined]
@@ -273,7 +266,6 @@ def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
                 return dict(t)
         except Exception:
             pass
-
     bid, ask = w.best_bid_ask(symbol)
     if bid > 0 and ask > 0:
         mid = (bid + ask) / 2.0
@@ -289,35 +281,22 @@ def _worker_latest_tick(w: Worker, symbol: str) -> Optional[Dict[str, Any]]:
         }
     return None
 
-
 def _worker_history_ticks(w: Worker, symbol: str, since_ms: int, limit: int) -> List[Dict[str, Any]]:
-    """
-    История тиков с ts_ms >= since_ms, обрезанная до limit.
-    Если истории нет — вернём <=1 элемента (latest).
-    """
     if hasattr(w, "history_ticks"):
         try:
             items = w.history_ticks(symbol, since_ms, limit)  # type: ignore[attr-defined]
             return [dict(t) for t in items]
         except Exception:
             pass
-
     last = _worker_latest_tick(w, symbol)
     return [last] if last else []
 
-
 @app.get("/ticks/latest")
-async def ticks_latest(
-    symbol: str = Query("BTCUSDT", description="Напр. BTCUSDT"),
-) -> Dict[str, Any]:
-    """
-    Последний тик по символу (если истории нет — снимок из best bid/ask).
-    """
+async def ticks_latest(symbol: str = Query("BTCUSDT", description="Напр. BTCUSDT")) -> Dict[str, Any]:
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     item = _worker_latest_tick(w, sym)
     return {"symbol": sym, "item": item}
-
 
 @app.get("/ticks/peek")
 async def ticks_peek(
@@ -325,9 +304,6 @@ async def ticks_peek(
     ms: int = Query(1500, ge=1, le=60_000, description="Окно, миллисекунды"),
     limit: int = Query(512, ge=1, le=4096, description="Максимум элементов в ответе"),
 ) -> Dict[str, Any]:
-    """
-    История тик-снапшотов за последние `ms`.
-    """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     since = _now_ms() - ms
@@ -335,7 +311,6 @@ async def ticks_peek(
     if len(items) > limit:
         items = items[-limit:]
     return {"symbol": sym, "count": len(items), "items": items}
-
 
 # ------------------------------------------------------------------------------
 # Features debug (micro + indicators)
@@ -346,10 +321,6 @@ async def debug_features(
     symbol: str = Query("BTCUSDT", description="Символ, напр. BTCUSDT"),
     lookback_ms: int = Query(10_000, ge=100, le=120_000, description="Окно истории для индикаторов"),
 ) -> Dict[str, Any]:
-    """
-    Быстрый расчёт микроструктуры и индикаторов.
-    Если нет истории — считаем по последнему тіку и псевдо-ценам.
-    """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
 
@@ -357,7 +328,6 @@ async def debug_features(
     if not last:
         return {"symbol": sym, "micro": None, "indi": None, "reason": "no_tick"}
 
-    # Micro по последнему снапу
     micro = MicroFeatureEngine(tick_size=0.1, lot_usd=10_000.0).update(
         price=last["price"],
         bid=last["bid"],
@@ -366,7 +336,6 @@ async def debug_features(
         ask_sz=last.get("ask_size", 0.0),
     )
 
-    # Indicators по истории (если есть); иначе — псевдо-ряд из последней цены
     since = _now_ms() - lookback_ms
     hist = _worker_history_ticks(w, sym, since_ms=since, limit=2048)
     prices: List[float] = [float(t.get("price", last["price"])) for t in hist] or [last["price"]] * 10
@@ -411,7 +380,6 @@ async def debug_features(
         "risk": risk,
     }
 
-
 # ------------------------------------------------------------------------------
 # Control (paper executor)
 # ------------------------------------------------------------------------------
@@ -420,7 +388,6 @@ class EntryReq(BaseModel):
     symbol: str
     side: Literal["BUY", "SELL"]
     qty: float
-
     def normalize(self, allowed: List[str]) -> None:
         s = self.symbol.upper()
         if s not in allowed:
@@ -428,7 +395,6 @@ class EntryReq(BaseModel):
         self.symbol = s
         if not (self.qty > 0):
             raise ValueError("qty must be > 0")
-
 
 @app.post("/control/test-entry")
 async def control_test_entry(req: EntryReq) -> Dict[str, Any]:
@@ -439,7 +405,6 @@ async def control_test_entry(req: EntryReq) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     report = await w.place_entry(req.symbol, req.side, req.qty)
     return {"ok": True, **report}
-
 
 @app.get("/control/test-entry")
 async def control_test_entry_get(
@@ -452,26 +417,16 @@ async def control_test_entry_get(
     report = await w.place_entry(sym, side, qty)
     return {"ok": True, **report}
 
-
 @app.post("/control/flatten")
 @app.get("/control/flatten")
-async def control_flatten(
-    symbol: str = Query("BTCUSDT"),
-) -> Dict[str, Any]:
-    """
-    Форс-закрыть позицию (paper), сбросить FSM в FLAT. Поддерживаются POST и GET.
-    """
+async def control_flatten(symbol: str = Query("BTCUSDT")) -> Dict[str, Any]:
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     return await w.flatten(sym)
 
-
 @app.post("/control/flatten-all")
 @app.get("/control/flatten-all")
 async def control_flatten_all() -> Dict[str, Any]:
-    """
-    Форс-закрыть позиции по всем символам и сбросить FSM в FLAT (POST/GET).
-    """
     w = _worker_required()
     results: Dict[str, Any] = {}
     for sym in w.symbols:
@@ -484,19 +439,14 @@ async def control_flatten_all() -> Dict[str, Any]:
         "results": results,
     }
 
-
 @app.post("/control/set-timeout")
 async def control_set_timeout(
     symbol: str = Query("BTCUSDT"),
     timeout_ms: int = Query(20_000, ge=5_000, le=600_000),
 ) -> Dict[str, Any]:
-    """
-    Изменить таймаут позиции для отладки (например, 20 000 мс).
-    """
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     return w.set_timeout_ms(sym, timeout_ms)
-
 
 # ------------------------------------------------------------------------------
 # Positions (snapshot)
@@ -504,23 +454,13 @@ async def control_set_timeout(
 
 @app.get("/positions")
 async def positions() -> Dict[str, Any]:
-    """
-    Снимок состояний позиций по всем символам.
-    Формат берём из w.diag()['positions'] (совместимость с фронтом и /debug/diag).
-    """
     w = _worker_required()
     d = w.diag()
     positions = d.get("positions", {})
     return {"symbols": list(w.symbols), "positions": positions}
 
-
 @app.get("/position")
-async def position(
-    symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT"),
-) -> Dict[str, Any]:
-    """
-    Снимок состояния позиции по одному символу.
-    """
+async def position(symbol: str = Query("BTCUSDT", description="Символ, например BTCUSDT")) -> Dict[str, Any]:
     w = _worker_required()
     sym = _normalize_symbol(symbol, w.symbols)
     d = w.diag()
@@ -532,7 +472,6 @@ async def position(
         }
     return {"symbol": sym, "position": pos}
 
-
 # ------------------------------------------------------------------------------
 # Metrics (compact JSON)
 # ------------------------------------------------------------------------------
@@ -542,7 +481,6 @@ async def metrics() -> Dict[str, Any]:
     """
     Компактные метрики для мониторинга/панели.
     Источники: worker.diag()['ws_detail'], ['coal'], ['exec_counters'], ['pnl_day'].
-    Любые отсутствующие поля безопасно дефолтятся.
     """
     w = _worker_required()
     d = w.diag()
@@ -579,25 +517,19 @@ async def metrics() -> Dict[str, Any]:
         "max_dd_r_day": pnl_day.get("max_dd_r"),
     }
 
-
 # ------------------------------------------------------------------------------
 # Debug reasons (why entries were blocked)
 # ------------------------------------------------------------------------------
 
 @app.get("/debug/reasons")
 async def debug_reasons() -> Dict[str, Any]:
-    """
-    Агрегированные причины отказов во входы (если воркер их собирает).
-    Если нет — отдаём пустой словарь.
-    """
     w = _worker_required()
     d = w.diag()
     reasons = d.get("block_reasons", {}) or d.get("reasons", {}) or {}
     return {"reasons": reasons}
 
-
 # ------------------------------------------------------------------------------
-# Trades history (best-effort from worker.diag)
+# Trades history (best-effort)
 # ------------------------------------------------------------------------------
 
 @app.get("/trades")
@@ -605,13 +537,9 @@ async def trades(
     symbol: Optional[str] = Query(None, description="Фильтр по символу, напр. BTCUSDT"),
     limit: int = Query(50, ge=1, le=500),
 ) -> Dict[str, Any]:
-    """
-    История сделок из воркера, если он её ведёт. Иначе возвращаем пусто.
-    Элемент: {symbol, side, opened_ts, closed_ts, qty, entry_px, exit_px, sl_px, tp_px, pnl_r, pnl_usd, fees}
-    """
     w = _worker_required()
     d = w.diag()
-    store = d.get("trades")  # может быть списком либо словарём {symbol: [..]}
+    store = d.get("trades")
 
     items: List[Dict[str, Any]] = []
     if isinstance(store, list):
@@ -622,15 +550,11 @@ async def trades(
         else:
             for arr in store.values():
                 items.extend(list(arr))
-    else:
-        items = []
 
     items.sort(key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)), reverse=True)
     if len(items) > limit:
         items = items[:limit]
-
     return {"items": items, "count": len(items)}
-
 
 # ------------------------------------------------------------------------------
 # Daily PnL (best-effort)
@@ -638,15 +562,10 @@ async def trades(
 
 @app.get("/pnl/daily")
 async def pnl_daily() -> Dict[str, Any]:
-    """
-    Краткая дневная сводка из воркера (PnL в $, PnL в R, winrate, maxDD).
-    Всегда возвращает все поля, даже если данных мало.
-    """
     s = get_settings()
     w = _worker_required()
     d = w.diag()
     pnl_day = d.get("pnl_day", {}) or {}
-
     return {
         "day": pnl_day.get("day"),
         "trades": pnl_day.get("trades", 0),
