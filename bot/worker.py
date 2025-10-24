@@ -53,6 +53,7 @@ class MarketHub:
             self._best[t.symbol] = (t.bid, t.ask)
 
     def best_bid_ask(self, symbol: str) -> Tuple[float, float]:
+        # чтение без лока — приемлемо, т.к. обновление атомарно заменяет кортеж
         return self._best.get(symbol, (0.0, 0.0))
 
 
@@ -79,7 +80,8 @@ class Worker:
       - учёт сделок и дневной PnL (best-effort),
       - счётчики исполнения (для /metrics),
       - комиссии (maker/taker) в paper-режиме,
-      - РИСК-ФИЛЬТРЫ (safety + дневные лимиты).
+      - риск-фильтры (safety + дневные лимиты),
+      - авто-сайзинг позиции от процента риска.
     """
 
     def __init__(
@@ -88,7 +90,7 @@ class Worker:
         *,
         futures: bool = True,
         coalesce_ms: int = 75,
-        history_maxlen: int = 4000,  # ~ несколько минут при активном рынке
+        history_maxlen: int = 4000,
     ) -> None:
         self.symbols = [s.upper() for s in symbols]
         self.ws = BinanceWS(self.symbols, futures=futures, mark_interval_1s=True)
@@ -110,7 +112,7 @@ class Worker:
             if s not in self.specs:
                 self.specs[s] = SymbolSpec(s, price_tick=0.01, qty_step=0.001)
 
-        # per-symbol executors
+        # executors per symbol
         self.execs: Dict[str, Executor] = {}
 
         # FSM + мьютексы
@@ -134,7 +136,7 @@ class Worker:
         # Учёт сделок (in-memory) и дневная сводка (best-effort)
         self._trades: Dict[str, Deque[Dict[str, Any]]] = {s: deque(maxlen=1000) for s in self.symbols}
         self._pnl_day: Dict[str, Any] = {
-            "day": self._day_str(),   # сразу инициализируем текущим днём
+            "day": self._day_str(),
             "trades": 0,
             "winrate": None,
             "avg_r": None,
@@ -142,8 +144,8 @@ class Worker:
             "pnl_usd": 0.0,
             "max_dd_r": None,
         }
-        self._pnl_r_equity: float = 0.0  # для подсчёта max drawdown в R
-        self._consec_losses: int = 0     # подряд убыточные сделки (для лимита)
+        self._pnl_r_equity: float = 0.0
+        self._consec_losses: int = 0
 
         # причины блокировок входа
         self._block_reasons: Dict[str, int] = {}
@@ -151,10 +153,15 @@ class Worker:
         # для оценки комиссий входа: сохраняем steps открытия
         self._entry_steps: Dict[str, List[str]] = {}
 
-        # конфиги риск-фильтров (инициализация из settings, если есть)
+        # риск-конфиги
         self._safety_cfg = self._load_safety_cfg()
         self._risk_cfg = self._load_risk_cfg()
-        self._server_time_offset_ms: int = 0  # будущее место для sync с /time
+        self._server_time_offset_ms: int = 0
+
+        # account-конфиги (для авто-сайзинга)
+        self._starting_equity_usd = self._load_starting_equity_usd()
+        self._leverage = self._load_leverage()
+        self._min_notional_usd = self._load_min_notional_usd()
 
         # таски жизненного цикла
         self._tasks: List[asyncio.Task] = []
@@ -171,12 +178,14 @@ class Worker:
         def _best(sym: str) -> Tuple[float, float]:
             return self.hub.best_bid_ask(sym)
 
-        # конфиг экзекьютора из settings (если есть)
+        # дефолты (если нет settings)
         limit_offset_ticks = 1
         limit_timeout_ms = 500
         time_in_force = "GTC"
         max_slippage_bp = 6.0
+        poll_ms = 50
 
+        # подтягиваем (опционально) из settings.json
         if get_settings:
             try:
                 s = get_settings()
@@ -184,9 +193,11 @@ class Worker:
                 limit_timeout_ms = int(getattr(s.execution, "limit_timeout_ms", limit_timeout_ms))
                 max_slippage_bp = float(getattr(s.execution, "max_slippage_bp", max_slippage_bp))
                 time_in_force = str(getattr(s.execution, "time_in_force", time_in_force))
+                poll_ms = int(getattr(s.execution, "poll_ms", poll_ms))
             except Exception:
                 logger.debug("settings not available, use defaults")
 
+        # инициализируем executors
         for sym in self.symbols:
             spec = self.specs[sym]
             cfg = ExecCfg(
@@ -195,6 +206,7 @@ class Worker:
                 limit_offset_ticks=limit_offset_ticks,
                 limit_timeout_ms=limit_timeout_ms,
                 time_in_force=time_in_force,
+                poll_ms=poll_ms,
             )
             adapter = PaperAdapter(_best, max_slippage_bp=max_slippage_bp)
             self.execs[sym] = Executor(adapter=adapter, cfg=cfg, get_best=_best)
@@ -265,17 +277,12 @@ class Worker:
         return self.hub.best_bid_ask(symbol)
 
     def latest_tick(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Последний тик из истории; если истории нет — None (пусть API сделает фолбэк)."""
         dq = self._hist.get(symbol.upper())
         if not dq:
             return None
         return dq[-1] if len(dq) > 0 else None
 
     def history_ticks(self, symbol: str, since_ms: int, limit: int) -> List[Dict[str, Any]]:
-        """
-        Возвращает тики с ts_ms >= since_ms, обрезанные до 'limit' последних.
-        Работает быстро (deque), без копирования сверх необходимого.
-        """
         sym = symbol.upper()
         dq = self._hist.get(sym)
         if not dq:
@@ -284,6 +291,65 @@ class Worker:
         if len(result) > limit:
             result = result[-limit:]
         return result
+
+    # --- ВХОДЫ ---
+
+    async def place_entry_auto(self, symbol: str, side: Side) -> Dict[str, Any]:
+        """
+        Авто-сайзинг по risk_per_trade_pct и текущей SL-дистанции.
+        Условия и SL/TP — как в place_entry().
+        """
+        symbol = symbol.upper()
+        if symbol not in self.execs:
+            raise ValueError(f"Unsupported symbol: {symbol}")
+
+        # быстрый чек дневных лимитов (до локов)
+        day_dec = check_day_limits(
+            DayState(
+                pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
+                consec_losses=int(self._consec_losses),
+                trading_disabled=False,
+            ),
+            self._risk_cfg,
+        )
+        if not day_dec.allow:
+            for r in day_dec.reasons:
+                self._inc_block_reason("day_" + r)
+            return {"ok": False, "reason": ",".join(["day_"+r for r in day_dec.reasons]), "symbol": symbol, "side": side}
+
+        lock = self._locks[symbol]
+        async with lock:
+            pos = self._pos[symbol]
+            if pos.state != "FLAT":
+                self._inc_block_reason("busy_" + pos.state)
+                return {"ok": False, "reason": f"busy:{pos.state}", "symbol": symbol, "side": side}
+
+            # safety pre-check
+            bid, ask = self.hub.best_bid_ask(symbol)
+            spec = self.specs[symbol]
+            spread_ticks = 0.0
+            if bid > 0 and ask > 0 and spec.price_tick > 0:
+                spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+
+            micro = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
+            tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
+            pre_dec = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=self._safety_cfg)
+            if not pre_dec.allow:
+                for r in pre_dec.reasons:
+                    self._inc_block_reason(r)
+                return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side}
+
+            # оценим SL-дистанцию как в обычном входе
+            min_stop_ticks = self._min_stop_ticks_default()
+            sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
+
+            qty = self._compute_auto_qty(symbol, side, sl_distance_px)
+            if qty <= 0.0:
+                self._inc_block_reason("qty_too_small")
+                return {"ok": False, "reason": "qty_too_small", "symbol": symbol, "side": side}
+
+        # ВНИМАНИЕ: выходим из локов и используем стандартный путь входа
+        return await self.place_entry(symbol, side, qty)
 
     async def place_entry(self, symbol: str, side: Side, qty: float) -> Dict[str, Any]:
         """
@@ -295,7 +361,7 @@ class Worker:
         if symbol not in self.execs:
             raise ValueError(f"Unsupported symbol: {symbol}")
 
-        # === 0) дневные лимиты (до захвата мьютекса, это дёшево) ===
+        # === 0) дневные лимиты (до захвата мьютекса) ===
         day_dec = check_day_limits(
             DayState(
                 pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
@@ -316,19 +382,14 @@ class Worker:
                 self._inc_block_reason("busy_" + pos.state)
                 return {"ok": False, "reason": f"busy:{pos.state}", "symbol": symbol, "side": side, "qty": qty}
 
-            # === 1) быстрые safety-фильтры до входа (spread/liq/time) ===
+            # === 1) safety-фильтры до входа ===
             bid, ask = self.hub.best_bid_ask(symbol)
             spec = self.specs[symbol]
             spread_ticks = 0.0
             if bid > 0 and ask > 0 and spec.price_tick > 0:
                 spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
-            micro = MicroCtx(
-                spread_ticks=spread_ticks,
-                # пока нет реального топ-5 лимита — используем большое число, чтобы фильтр пропускал;
-                # когда подключим features.microstructure — подставим сюда реальное значение
-                top5_liq_usd=1e12,
-            )
+            micro = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
             tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
             pre_dec = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=self._safety_cfg)
             if not pre_dec.allow:
@@ -340,7 +401,7 @@ class Worker:
             pos.state = "ENTERING"
             pos.side = side
 
-            # === 2) исполнение (limit→timeout→cancel→market) ===
+            # === 2) исполнение ===
             rep: ExecutionReport = await self.execs[symbol].place_entry(symbol, side, qty)
             self._accumulate_exec_counters(rep.steps)
 
@@ -365,12 +426,11 @@ class Worker:
                     },
                 }
 
-            # === 3) расчёт SL/TP и повторная safety-проверка (ликвидационный буфер) ===
+            # === 3) расчёт SL/TP и post safety-проверка ===
             entry_px = float(rep.avg_px)
             qty_open = float(rep.filled_qty)
 
-            # минимальная SL-дистанция: макс(мин.тики, текущий спред)
-            min_stop_ticks = self._min_stop_ticks_default()  # по умолчанию 2 тика (как было)
+            min_stop_ticks = self._min_stop_ticks_default()
             sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
 
             plan: SLTPPlan = compute_sltp(
@@ -378,18 +438,16 @@ class Worker:
                 price_tick=spec.price_tick, sl_distance_px=sl_distance_px, rr=1.8
             )
 
-            # проверка ликвидационного буфера относительно SL
             post_dec = check_entry_safety(
                 side,
                 micro=micro,
                 time_ctx=tctx,
-                pos_ctx=PositionalCtx(entry_px=entry_px, sl_px=plan.sl_px, leverage=15.0),
+                pos_ctx=PositionalCtx(entry_px=entry_px, sl_px=plan.sl_px, leverage=self._leverage),
                 safety=self._safety_cfg,
             )
             if not post_dec.allow:
                 for r in post_dec.reasons:
                     self._inc_block_reason(r)
-                # откат позиции (закрывать не нужно — мы ещё не записали OPEN)
                 self._pos[symbol] = PositionState(
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
@@ -409,12 +467,11 @@ class Worker:
                     },
                 }
 
-            # === 4) открываем позицию (защита «считается поставленной» в состоянии) ===
+            # === 4) открываем позицию ===
             self._pos[symbol] = PositionState(
                 state="OPEN", side=side, qty=qty_open, entry_px=entry_px,
                 sl_px=plan.sl_px, tp_px=plan.tp_px, opened_ts_ms=self._now_ms(), timeout_ms=pos.timeout_ms
             )
-            # шаги входа для комиссий при выходе
             self._entry_steps[symbol] = list(rep.steps)
 
             return {
@@ -435,10 +492,6 @@ class Worker:
     # ---------- watchdog / closing / trades ----------
 
     async def _watchdog_loop(self) -> None:
-        """
-        Каждые 250мс: гарантировать, что открытая позиция имеет SL/TP;
-        по таймауту закрывать позицию market (paper).
-        """
         try:
             while True:
                 await asyncio.sleep(0.25)
@@ -448,11 +501,9 @@ class Worker:
                     async with lock:
                         pos = self._pos[sym]
                         if pos.state == "OPEN":
-                            # Таймаут позиции
                             if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
                                 await self._paper_close(sym, pos, reason="timeout")
                                 continue
-                            # Контроль защит (в paper — просто проверка, что они записаны)
                             if pos.sl_px is None or pos.tp_px is None:
                                 await self._paper_close(sym, pos, reason="no_protection")
         except asyncio.CancelledError:
@@ -461,13 +512,11 @@ class Worker:
             logger.exception("watchdog loop error")
 
     async def flatten(self, symbol: str) -> Dict[str, Any]:
-        """Форс-закрыть позицию (paper), сбросить FSM в FLAT."""
         symbol = symbol.upper()
         lock = self._locks[symbol]
         async with lock:
             pos = self._pos[symbol]
             if pos.state != "OPEN":
-                # уже FLAT
                 self._pos[symbol] = PositionState(
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
@@ -477,17 +526,15 @@ class Worker:
             return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "flatten_forced"}
 
     def set_timeout_ms(self, symbol: str, timeout_ms: int) -> Dict[str, Any]:
-        """Поменять таймаут позиции для отладки (например, 20_000 мс)."""
         symbol = symbol.upper()
         self._pos[symbol].timeout_ms = max(5_000, int(timeout_ms))
         return {"ok": True, "symbol": symbol, "timeout_ms": self._pos[symbol].timeout_ms}
 
     async def _paper_close(self, sym: str, pos: PositionState, *, reason: str) -> None:
-        """Закрытие позиции в paper: маркетом через executor (эмулируется в адаптере)."""
         close_side: Side = "SELL" if pos.side == "BUY" else "BUY"
         try:
             ex = self.execs[sym]
-            rep: ExecutionReport = await ex.place_entry(sym, close_side, pos.qty)  # market эмулируется внутри executor/adapter
+            rep: ExecutionReport = await ex.place_entry(sym, close_side, pos.qty)
             self._accumulate_exec_counters(rep.steps)
 
             exit_px = rep.avg_px
@@ -499,12 +546,10 @@ class Worker:
                 )
                 self._register_trade(trade)
         finally:
-            # Сброс позиции в FLAT
             self._pos[sym] = PositionState(
                 state="FLAT", side=None, qty=0.0, entry_px=0.0,
                 sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
             )
-            # очищаем запомненные шаги входа
             self._entry_steps.pop(sym, None)
 
     # ---------- учёт/PNL ----------
@@ -523,7 +568,6 @@ class Worker:
         qty = float(pos.qty)
         entry = float(pos.entry_px)
 
-        # PnL USD (USDT-перпы: pnl = (exit - entry) * qty для LONG; обратный знак для SHORT)
         if side == "BUY":
             pnl_usd_gross = (exit_px - entry) * qty
             pnl_risk_usd = max(1e-9, (entry - float(pos.sl_px or entry)) * qty)
@@ -531,19 +575,15 @@ class Worker:
             pnl_usd_gross = (entry - exit_px) * qty
             pnl_risk_usd = max(1e-9, (float(pos.sl_px or entry) - entry) * qty)
 
-        # Комиссии (на вход и выход) — в USD
         entry_bps = self._fee_bps_for_steps(entry_steps or [])
         exit_bps  = self._fee_bps_for_steps(exit_steps or [])
         fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
 
-        # Итоговый PnL после комиссий
         pnl_usd = pnl_usd_gross - fees_usd
-
-        # защищаемся от микроскопического риска — нормализуем на пол
         risk_usd = max(pnl_risk_usd, self._risk_cfg.min_risk_usd_floor)
         pnl_r = pnl_usd / risk_usd
 
-        trade = {
+        return {
             "symbol": sym,
             "side": side,
             "opened_ts": pos.opened_ts_ms,
@@ -558,19 +598,16 @@ class Worker:
             "reason": reason,
             "fees": round(fees_usd, 6),
         }
-        return trade
 
     def _register_trade(self, trade: Dict[str, Any]) -> None:
         sym = trade["symbol"]
         dq = self._trades.get(sym)
         if dq is None:
             dq = self._trades[sym] = deque(maxlen=1000)
-        dq.appendleft(trade)  # свежие впереди
+        dq.appendleft(trade)
 
-        # Обновление дневной сводки
         day = self._day_str()
         if self._pnl_day["day"] != day:
-            # новый день — сбрасываем статы
             self._pnl_day = {"day": day, "trades": 0, "winrate": None, "avg_r": None, "pnl_r": 0.0, "pnl_usd": 0.0, "max_dd_r": None}
             self._pnl_r_equity = 0.0
             self._consec_losses = 0
@@ -579,13 +616,11 @@ class Worker:
         self._pnl_day["pnl_usd"] += trade["pnl_usd"]
         self._pnl_day["pnl_r"] += trade["pnl_r"]
 
-        # последовательные лоссы
         if trade["pnl_r"] > 0:
             self._consec_losses = 0
         else:
             self._consec_losses += 1
 
-        # winrate/avg_r
         wins = int(round((self._pnl_day.get("winrate_raw", 0.0) or 0.0) * max(self._pnl_day["trades"] - 1, 0)))
         if trade["pnl_r"] > 0:
             wins += 1
@@ -593,7 +628,6 @@ class Worker:
         self._pnl_day["winrate"] = round(self._pnl_day["winrate_raw"], 4)
         self._pnl_day["avg_r"] = round(self._pnl_day["pnl_r"] / max(self._pnl_day["trades"], 1), 6)
 
-        # max drawdown по equity в R
         self._pnl_r_equity += trade["pnl_r"]
         peak = self._pnl_day.get("peak_r", 0.0)
         trough = self._pnl_day.get("trough_r", 0.0)
@@ -620,6 +654,7 @@ class Worker:
                     "limit_offset_ticks": self.execs[s].c.limit_offset_ticks,
                     "limit_timeout_ms": self.execs[s].c.limit_timeout_ms,
                     "time_in_force": self.execs[s].c.time_in_force,
+                    "poll_ms": self.execs[s].c.poll_ms,
                 }
                 for s in self.symbols
             },
@@ -644,7 +679,6 @@ class Worker:
                 }
                 for s in self.symbols
             },
-            # новые блоки для API:
             "exec_counters": dict(self._exec_counters),
             "pnl_day": {
                 k: (round(v, 6) if isinstance(v, float) else v)
@@ -652,7 +686,6 @@ class Worker:
             },
             "trades": {s: list(self._trades.get(s, [])) for s in self.symbols},
             "block_reasons": dict(self._block_reasons),
-            # текущие риск-настройки
             "risk_cfg": {
                 "risk_per_trade_pct": self._risk_cfg.risk_per_trade_pct,
                 "daily_stop_r": self._risk_cfg.daily_stop_r,
@@ -669,10 +702,16 @@ class Worker:
                 "min_liq_buffer_sl_mult": self._safety_cfg.min_liq_buffer_sl_mult,
             },
             "consec_losses": self._consec_losses,
+            "account_cfg": {
+                "starting_equity_usd": self._starting_equity_usd,
+                "leverage": self._leverage,
+                "min_notional_usd": self._min_notional_usd,
+                "equity_now_usd": round(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0), 6),
+            },
         }
         return d
 
-    # ---------- utils / config loaders ----------
+    # ---------- utils / sizing / config loaders ----------
 
     @staticmethod
     def _now_ms() -> int:
@@ -686,7 +725,6 @@ class Worker:
             return None
 
     def _accumulate_exec_counters(self, steps: Optional[List[str]]) -> None:
-        """Парсинг steps из отчёта исполнения для счётчиков."""
         if not steps:
             return
         for s in steps:
@@ -703,10 +741,6 @@ class Worker:
         self._block_reasons[key] = self._block_reasons.get(key, 0) + 1
 
     def _min_stop_ticks_default(self) -> float:
-        """
-        Минимум тиков для SL-дистанции при расчёте защиты. По умолчанию 2 тика (как было).
-        Можно задать settings.execution.min_stop_ticks.
-        """
         default = 2.0
         if get_settings:
             try:
@@ -719,15 +753,9 @@ class Worker:
         return default
 
     def _fee_bps_for_steps(self, steps: List[str]) -> float:
-        """
-        Определяем maker/taker по шагам:
-          - есть 'market_' ИЛИ 'limit_filled_immediate' → taker
-          - иначе → maker
-        Возвращаем ставку в bps, из settings.execution или дефолты.
-        """
         taker_like = any(s.startswith("market_") or s.startswith("limit_filled_immediate") for s in steps)
-        maker_bps = 1.0   # 0.01%
-        taker_bps = 3.5   # 0.035%
+        maker_bps = 1.0
+        taker_bps = 3.5
         if get_settings:
             try:
                 s = get_settings()
@@ -736,6 +764,52 @@ class Worker:
             except Exception:
                 pass
         return taker_bps if taker_like else maker_bps
+
+    # --- sizing helpers ---
+
+    def _compute_auto_qty(self, symbol: str, side: Side, sl_distance_px: float) -> float:
+        """Размер позиции от процента риска и SL-дистанции. Учёт шага лота, плеча, минимальной нотионали."""
+        spec = self.specs[symbol]
+        risk_pct = float(self._risk_cfg.risk_per_trade_pct)  # трактуем как процент
+        equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
+        risk_usd_target = max(self._risk_cfg.min_risk_usd_floor, equity * (risk_pct / 100.0))
+
+        if sl_distance_px <= 0:
+            return 0.0
+
+        qty_raw = risk_usd_target / sl_distance_px
+
+        # ограничение по плечу (max notional)
+        bid, ask = self.hub.best_bid_ask(symbol)
+        px = ask if side == "BUY" else bid
+        if px <= 0:
+            return 0.0
+
+        max_notional = equity * max(self._leverage, 1.0)
+        max_qty_by_lev = max_notional / px
+        qty = min(qty_raw, max_qty_by_lev)
+
+        # минимальная нотиональ
+        min_qty_by_notional = self._min_notional_usd / px
+
+        # привести к шагу лота (вниз)
+        step = max(spec.qty_step, 1e-12)
+
+        def floor_to_step(x: float, st: float) -> float:
+            return (int(x / st)) * st
+
+        qty = max(min_qty_by_notional, qty)
+        qty = floor_to_step(qty, step)
+
+        # если после округления получилось 0 — попробуем хотя бы шаг, если укладывается в лимиты
+        if qty <= 0:
+            qty = step
+            if qty * px < self._min_notional_usd or qty > max_qty_by_lev:
+                return 0.0
+
+        return float(qty)
+
+    # --- cfg loaders ---
 
     def _load_safety_cfg(self) -> SafetyCfg:
         cfg = SafetyCfg()
@@ -770,7 +844,40 @@ class Worker:
                 logger.debug("risk cfg: using defaults")
         return cfg
 
-    # совместимость с /status фолбэком: чтобы app мог обратиться как worker.coalescer.stats()
+    def _load_starting_equity_usd(self) -> float:
+        default = 1000.0
+        if get_settings:
+            try:
+                s = get_settings()
+                val = getattr(getattr(s, "account", object()), "starting_equity_usd", default)
+                return float(val)
+            except Exception:
+                pass
+        return default
+
+    def _load_leverage(self) -> float:
+        default = 15.0
+        if get_settings:
+            try:
+                s = get_settings()
+                val = getattr(getattr(s, "account", object()), "leverage", default)
+                return max(1.0, float(val))
+            except Exception:
+                pass
+        return default
+
+    def _load_min_notional_usd(self) -> float:
+        default = 5.0  # для тестов/бумаги; в бою подставим реальные минимумы по символам
+        if get_settings:
+            try:
+                s = get_settings()
+                val = getattr(getattr(s, "account", object()), "min_notional_usd", default)
+                return max(0.0, float(val))
+            except Exception:
+                pass
+        return default
+
+    # совместимость с /status фолбэком
     @property
     def coalescer(self) -> Coalescer:
         return self.coal
@@ -787,25 +894,21 @@ async def _smoke() -> None:
 
     bid, ask = w.best_bid_ask("BTCUSDT")
     print(f"[smoke] BTC best bid/ask = {bid} / {ask}")
-
     if bid == 0.0 or ask == 0.0:
         print("[smoke] no best price yet, wait a bit more...")
         await asyncio.sleep(2.0)
 
-    rep = await w.place_entry("BTCUSDT", "BUY", 0.001)
-    print("[smoke] EXEC REPORT]:", rep)
+    rep = await w.place_entry_auto("BTCUSDT", "BUY")
+    print("[smoke] AUTO EXEC:", rep)
 
-    # проверим flatten → запись трейда
     await w.flatten("BTCUSDT")
     diag = w.diag()
     print("[smoke] trades recorded:", len(diag.get("trades", {}).get("BTCUSDT", [])))
     print("[smoke] pnl_day:", diag.get("pnl_day"))
 
-    # проверим историю
     hist = w.history_ticks("BTCUSDT", since_ms=0, limit=5)
     print("[smoke] last ticks:", len(hist), "example:", hist[-1] if hist else None)
 
-    print("[smoke] diag keys:", list(diag.keys()))
     await w.stop()
 
 

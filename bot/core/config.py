@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import json
 import os
-from functools import lru_cache
-from typing import List, Optional
+import threading
+from pathlib import Path
+from typing import Optional
 
-from pydantic import BaseModel, BaseSettings, Field, validator
+from pydantic import BaseModel, Field
 
 
 class StreamsCfg(BaseModel):
@@ -12,15 +15,16 @@ class StreamsCfg(BaseModel):
 
 class RiskCfg(BaseModel):
     risk_per_trade_pct: float = 0.25
-    daily_stop_r: float = -2.0
-    daily_target_r: float = 4.0
+    daily_stop_r: float = -10.0
+    daily_target_r: float = 15.0
     max_consec_losses: int = 3
     cooldown_after_sl_s: int = 120
+    min_risk_usd_floor: float = 0.25
 
 
 class SafetyCfg(BaseModel):
     max_spread_ticks: int = 3
-    min_top5_liquidity_usd: int = 300_000
+    min_top5_liquidity_usd: float = 300_000.0
     skip_funding_minute: bool = True
     skip_minute_zero: bool = True
     min_liq_buffer_sl_mult: float = 3.0
@@ -31,15 +35,16 @@ class RegimeCfg(BaseModel):
 
 
 class MomentumCfg(BaseModel):
-    obi_t: float = 0.10
-    tp_r: float = 1.8
-    stop_k_sigma: float = 1.0
+    obi_t: float = 0.12
+    tp_r: float = 1.6
+    stop_k_sigma: float = 1.1
 
 
 class ReversionCfg(BaseModel):
     bb_z: float = 2.0
     rsi: int = 70
     tp_to_vwap: bool = True
+    tp_r: float = 1.3
 
 
 class StrategyCfg(BaseModel):
@@ -51,7 +56,11 @@ class StrategyCfg(BaseModel):
 class ExecutionCfg(BaseModel):
     limit_offset_ticks: int = 1
     limit_timeout_ms: int = 500
-    max_slippage_bp: int = 6
+    max_slippage_bp: float = 6
+    time_in_force: str = "GTC"
+    fee_bps_maker: float = 1.0
+    fee_bps_taker: float = 3.5
+    min_stop_ticks: int = 2
 
 
 class MLCfg(BaseModel):
@@ -61,88 +70,74 @@ class MLCfg(BaseModel):
     model_path: str = "./ml_artifacts/model.bin"
 
 
-class SettingsFile(BaseModel):
-    mode: str = "paper"                 # paper|live
-    symbols: List[str] = ["BTCUSDT"]
+class AccountCfg(BaseModel):
+    starting_equity_usd: float = 1000.0
+    leverage: float = 15.0
+    min_notional_usd: float = 5.0
+
+
+class Settings(BaseModel):
+    mode: str = "paper"
+    symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
     streams: StreamsCfg = StreamsCfg()
     risk: RiskCfg = RiskCfg()
     safety: SafetyCfg = SafetyCfg()
     strategy: StrategyCfg = StrategyCfg()
     execution: ExecutionCfg = ExecutionCfg()
     ml: MLCfg = MLCfg()
-
-    @validator("mode")
-    def _mode(cls, v):
-        v = (v or "").lower()
-        if v not in ("paper", "live"):
-            raise ValueError("mode must be 'paper' or 'live'")
-        return v
-
-    @validator("symbols")
-    def _symbols(cls, v):
-        if not v:
-            raise ValueError("symbols must not be empty")
-        return v
-
-
-class EnvSettings(BaseSettings):
-    # env overrides
-    MODE: Optional[str] = Field(None, env="MODE")
-    BINANCE_API_KEY: Optional[str] = None
-    BINANCE_API_SECRET: Optional[str] = None
-    LOG_DIR: str = "./logs"
-    LOG_LEVEL: str = "INFO"
-
-    class Config:
-        case_sensitive = False
-
-
-class Settings(BaseModel):
-    # merged settings.json + env
-    mode: str
-    symbols: List[str]
-    streams: StreamsCfg
-    risk: RiskCfg
-    safety: SafetyCfg
-    strategy: StrategyCfg
-    execution: ExecutionCfg
-    ml: MLCfg
-
-    # env-exposed
-    binance_api_key: Optional[str] = None
-    binance_api_secret: Optional[str] = None
+    account: AccountCfg = AccountCfg()
     log_dir: str = "./logs"
     log_level: str = "INFO"
 
+    source_path: Optional[str] = None
+    source_mtime: Optional[float] = None
 
-def _load_json_settings(path: str) -> SettingsFile:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"settings.json not found at {path}")
-    with open(path, "r", encoding="utf-8") as f:
+
+_LOCK = threading.RLock()
+_SETTINGS: Optional[Settings] = None
+
+
+def _candidate_paths() -> list[Path]:
+    env_path = os.getenv("SETTINGS_PATH")
+    paths: list[Path] = []
+    if env_path:
+        paths.append(Path(env_path).expanduser().resolve())
+    cwd = Path.cwd()
+    paths.append((cwd / "settings.json").resolve())
+    paths.append((cwd / "config" / "settings.json").resolve())
+    return paths
+
+
+def _load_from_path(p: Path) -> Settings:
+    with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return SettingsFile(**data)
+    s = Settings(**data)
+    s.source_path = str(p)
+    try:
+        s.source_mtime = p.stat().st_mtime
+    except Exception:
+        s.source_mtime = None
+    return s
 
 
-@lru_cache(maxsize=1)
+def reload_settings() -> Settings:
+    with _LOCK:
+        for p in _candidate_paths():
+            if p.exists():
+                cfg = _load_from_path(p)
+                globals()["_SETTINGS"] = cfg
+                return cfg
+        # ни один файл не найден — вернём дефолты, но явно укажем источник
+        cfg = Settings()
+        cfg.source_path = None
+        cfg.source_mtime = None
+        globals()["_SETTINGS"] = cfg
+        return cfg
+
+
 def get_settings() -> Settings:
-    cfg_path = os.environ.get("SETTINGS_PATH", "./config/settings.json")
-    file_cfg = _load_json_settings(cfg_path)
-    env = EnvSettings()
-
-    # env MODE overrides file mode if provided
-    mode = (env.MODE or file_cfg.mode).lower()
-    merged = Settings(
-        mode=mode,
-        symbols=file_cfg.symbols,
-        streams=file_cfg.streams,
-        risk=file_cfg.risk,
-        safety=file_cfg.safety,
-        strategy=file_cfg.strategy,
-        execution=file_cfg.execution,
-        ml=file_cfg.ml,
-        binance_api_key=env.BINANCE_API_KEY,
-        binance_api_secret=env.BINANCE_API_SECRET,
-        log_dir=env.LOG_DIR,
-        log_level=env.LOG_LEVEL,
-    )
-    return merged
+    with _LOCK:
+        global _SETTINGS
+        if _SETTINGS is None:
+            _SETTINGS = reload_settings()
+        return _SETTINGS
