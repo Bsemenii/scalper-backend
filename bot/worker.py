@@ -22,6 +22,9 @@ from risk.filters import (
     check_entry_safety, check_day_limits,
 )
 
+# кандидаты (лёгкая стратегия)
+from strategy.candidates import CandidateEngine, Decision
+
 # мягкий импорт настроек — чтобы smoke работал без падений
 try:
     from bot.core.config import get_settings  # type: ignore
@@ -81,7 +84,8 @@ class Worker:
       - счётчики исполнения (для /metrics),
       - комиссии (maker/taker) в paper-режиме,
       - риск-фильтры (safety + дневные лимиты),
-      - авто-сайзинг позиции от процента риска.
+      - авто-сайзинг позиции от процента риска,
+      - лёгкие авто-сигналы (кандидаты) с анти-спамом.
     """
 
     def __init__(
@@ -163,9 +167,25 @@ class Worker:
         self._leverage = self._load_leverage()
         self._min_notional_usd = self._load_min_notional_usd()
 
+        # --- strategy / auto-signal runtime (driven by settings.json) ---
+        self._auto_enabled: bool = False
+        self._auto_cooldown_ms: int = 2000   # пауза между авто-входами (ms)
+        self._auto_min_flat_ms: int = 750    # минимум FLAT до нового входа (ms)
+
+        # пер-символьные таймштампы для анти-спама сигналов
+        self._last_signal_ms: Dict[str, int] = {s: 0 for s in self.symbols}
+        self._last_flat_ms: Dict[str, int] = {s: 0 for s in self.symbols}
+
+        # движок кандидатов (если используешь)
+        self._cand: Dict[str, CandidateEngine] = {}
+
+        # подгрузка начальных значений из settings.strategy
+        self._load_strategy_cfg()
+
         # таски жизненного цикла
         self._tasks: List[asyncio.Task] = []
         self._wd_task: Optional[asyncio.Task] = None
+        self._strat_task: Optional[asyncio.Task] = None
         self._started = False
 
     # ---------- lifecycle ----------
@@ -194,6 +214,11 @@ class Worker:
                 max_slippage_bp = float(getattr(s.execution, "max_slippage_bp", max_slippage_bp))
                 time_in_force = str(getattr(s.execution, "time_in_force", time_in_force))
                 poll_ms = int(getattr(s.execution, "poll_ms", poll_ms))
+
+                # авто-сигналы
+                self._auto_enabled = bool(getattr(getattr(s, "strategy", object()), "auto_signal_enabled", False))
+                self._auto_cooldown_ms = int(getattr(getattr(s, "strategy", object()), "auto_cooldown_ms", self._auto_cooldown_ms))
+                self._auto_min_flat_ms = int(getattr(getattr(s, "strategy", object()), "auto_min_flat_ms", self._auto_min_flat_ms))
             except Exception:
                 logger.debug("settings not available, use defaults")
 
@@ -211,17 +236,29 @@ class Worker:
             adapter = PaperAdapter(_best, max_slippage_bp=max_slippage_bp)
             self.execs[sym] = Executor(adapter=adapter, cfg=cfg, get_best=_best)
 
+            # init candidate engine (лёгкая стратегия) под каждый символ
+            self._cand[sym] = CandidateEngine(price_tick=spec.price_tick)
+
         # WS → Coalescer
         await self.ws.connect(self._on_ws_raw)
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
 
         # watchdog
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
+        # стратегия (если флаг включён — начнёт работать; иначе цикл idle)
+        self._strat_task = asyncio.create_task(self._strategy_loop(), name="strategy")
 
     async def stop(self) -> None:
         if not self._started:
             return
         self._started = False
+
+        # Остановить стратегию
+        if self._strat_task:
+            self._strat_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._strat_task
+            self._strat_task = None
 
         # Остановить watchdog
         if self._wd_task:
@@ -269,7 +306,111 @@ class Worker:
             else:
                 self._hist[tick.symbol] = deque([item], maxlen=self._history_maxlen)
 
-        # здесь позже появится Risk/Strategy → Candidate → Sizing → Executor.place_entry()
+        # фиксируем время последнего FLAT — нужно для анти-спама стратегии
+        pos = self._pos[tick.symbol]
+        if pos.state == "FLAT":
+            self._last_flat_ms[tick.symbol] = tick.ts_ms
+
+        # (здесь позже может быть enrichment для фич, если потребуется)
+
+    # ---------- strategy loop (авто-сигналы) ----------
+
+    async def _strategy_loop(self) -> None:
+        """
+        Лёгкий цикл принятия решений.
+        Условия входа:
+          - auto_enabled
+          - по символу: FLAT
+          - cooldown от последнего входа соблюдён
+          - минимум FLAT-времени после предыдущей сделки
+          - кандидат от движка + safety/day-limits
+        """
+        try:
+            while True:
+                await asyncio.sleep(0.12)  # ~8 Гц
+                if not self._auto_enabled:
+                    continue
+
+                now = self._now_ms()
+
+                for sym in self.symbols:
+                    # быстро: если заняты — пропускаем
+                    pos = self._pos[sym]
+                    if pos.state != "FLAT":
+                        continue
+
+                    # кулдаун и минимальное FLAT-время
+                    if now - self._last_signal_ms[sym] < self._auto_cooldown_ms:
+                        continue
+                    if now - self._last_flat_ms[sym] < self._auto_min_flat_ms:
+                        continue
+
+                    last = self.latest_tick(sym)
+                    if not last:
+                        continue
+
+                    # кандидат
+                    ce = self._cand.get(sym)
+                    if not ce:
+                        continue
+
+                    dec: Decision = ce.update(
+                        price=float(last["price"]),
+                        bid=float(last["bid"]),
+                        ask=float(last["ask"]),
+                        bid_sz=float(last.get("bid_size", 0.0)),
+                        ask_sz=float(last.get("ask_size", 0.0)),
+                    )
+                    if not dec.side:
+                        # агрегируем причины skip, чтобы видеть «почему нет сделок»
+                        self._inc_block_reason(dec.reason)
+                        continue
+
+                    side: Side = "BUY" if dec.side == "BUY" else "SELL"
+
+                    # дневные лимиты перед входом
+                    day_dec = check_day_limits(
+                        DayState(
+                            pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
+                            consec_losses=int(self._consec_losses),
+                            trading_disabled=False,
+                        ),
+                        self._risk_cfg,
+                    )
+                    if not day_dec.allow:
+                        for r in day_dec.reasons:
+                            self._inc_block_reason("day_" + r)
+                        continue
+
+                    # safety-чек перед входом (спред и т.п.)
+                    bid, ask = self.hub.best_bid_ask(sym)
+                    spec = self.specs[sym]
+                    spread_ticks = 0.0
+                    if bid > 0 and ask > 0 and spec.price_tick > 0:
+                        spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+
+                    pre_dec = check_entry_safety(
+                        side,
+                        micro=MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12),
+                        time_ctx=TimeCtx(ts_ms=now, server_time_offset_ms=self._server_time_offset_ms),
+                        pos_ctx=None,
+                        safety=self._safety_cfg,
+                    )
+                    if not pre_dec.allow:
+                        for r in pre_dec.reasons:
+                            self._inc_block_reason(r)
+                        continue
+
+                    # авто-сайзинг + вход (вся проверка/SLTP/откат внутри place_entry/auto)
+                    rep = await self.place_entry_auto(sym, side)
+                    if not rep.get("ok", True):
+                        self._inc_block_reason(rep.get("reason", "auto_entry_fail"))
+
+                    self._last_signal_ms[sym] = now
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("strategy loop error")
 
     # ---------- public ops ----------
 
@@ -709,6 +850,12 @@ class Worker:
                 "equity_now_usd": round(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0), 6),
             },
         }
+        # авто-сигналы (новые поля)
+        d["auto_signal_enabled"] = self._auto_enabled
+        d["strategy_cfg"] = {
+            "cooldown_ms": self._auto_cooldown_ms,
+            "min_flat_ms": self._auto_min_flat_ms,
+        }
         return d
 
     # ---------- utils / sizing / config loaders ----------
@@ -764,6 +911,28 @@ class Worker:
             except Exception:
                 pass
         return taker_bps if taker_like else maker_bps
+    
+        # --- strategy runtime api ---
+    @property
+    def auto_signal_enabled(self) -> bool:
+        return self._auto_signal_enabled
+
+    @property
+    def strategy_cfg(self) -> Dict[str, int]:
+        return dict(self._strategy_cfg)
+
+    def set_strategy(self, *, enabled: bool, cooldown_ms: int, min_flat_ms: int) -> Dict[str, Any]:
+        self._auto_enabled = bool(enabled)
+        self._auto_cooldown_ms = max(0, int(cooldown_ms))
+        self._auto_min_flat_ms = max(0, int(min_flat_ms))
+        return {
+        "auto_signal_enabled": self._auto_enabled,
+        "strategy_cfg": {
+            "cooldown_ms": self._auto_cooldown_ms,
+            "min_flat_ms": self._auto_min_flat_ms,
+        },
+    }
+
 
     # --- sizing helpers ---
 
@@ -876,6 +1045,90 @@ class Worker:
             except Exception:
                 pass
         return default
+
+        # --- strategy cfg loader (robust: pydantic OR raw JSON fallback) ---
+    def _load_strategy_cfg(self) -> None:
+        """
+        Читает strategy.auto_* из get_settings(), а если модель их не знает — парсит raw JSON по source_path.
+        Поля:
+          - auto_signal_enabled (bool)
+          - auto_cooldown_ms (int)
+          - auto_min_flat_ms (int)
+        Также понимает fallback-ключи: autoSignalEnabled, autoCooldownMs, autoMinFlatMs.
+        """
+        auto_enabled = self._auto_enabled
+        auto_cd = self._auto_cooldown_ms
+        auto_minflat = self._auto_min_flat_ms
+
+        def _apply_from_dict(d: Dict[str, Any]) -> None:
+            nonlocal auto_enabled, auto_cd, auto_minflat
+            # нормализация ключей
+            keys = {k: k for k in d.keys()}
+            # camelCase -> snake_case map
+            if "autoSignalEnabled" in d: keys["autoSignalEnabled"] = "auto_signal_enabled"
+            if "autoCooldownMs" in d: keys["autoCooldownMs"] = "auto_cooldown_ms"
+            if "autoMinFlatMs" in d: keys["autoMinFlatMs"] = "auto_min_flat_ms"
+
+            auto_enabled = bool(d.get("auto_signal_enabled", d.get("autoSignalEnabled", auto_enabled)))
+            auto_cd = int(d.get("auto_cooldown_ms", d.get("autoCooldownMs", auto_cd)))
+            auto_minflat = int(d.get("auto_min_flat_ms", d.get("autoMinFlatMs", auto_minflat)))
+
+        # 1) пробуем через get_settings()
+        s = None
+        if get_settings:
+            try:
+                s = get_settings()
+                strat = getattr(s, "strategy", None)
+                if strat is not None:
+                    if isinstance(strat, dict):
+                        _apply_from_dict(strat)
+                    else:
+                        # pydantic-модель или объект с атрибутами
+                        try:
+                            if hasattr(strat, "dict"):
+                                _apply_from_dict(strat.dict())
+                            else:
+                                _apply_from_dict({
+                                    "auto_signal_enabled": getattr(strat, "auto_signal_enabled", auto_enabled),
+                                    "auto_cooldown_ms": getattr(strat, "auto_cooldown_ms", auto_cd),
+                                    "auto_min_flat_ms": getattr(strat, "auto_min_flat_ms", auto_minflat),
+                                })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 2) если не удалось — читаем raw JSON по source_path
+        try:
+            import json, os
+            source_path = getattr(s, "source_path", None) if s else None
+            if source_path and os.path.exists(source_path):
+                with open(source_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    strat_raw = raw.get("strategy") or {}
+                    if isinstance(strat_raw, dict):
+                        _apply_from_dict(strat_raw)
+        except Exception:
+            # тихо: не ломаем старт
+            pass
+
+        # зафиксировать
+        self._auto_enabled = bool(auto_enabled)
+        self._auto_cooldown_ms = int(auto_cd)
+        self._auto_min_flat_ms = int(auto_minflat)
+
+    def reload_strategy_cfg(self) -> Dict[str, Any]:
+        """Горячая перечитка только strategy.* без перезапуска воркера."""
+        self._load_strategy_cfg()
+        return {
+            "ok": True,
+            "auto_signal_enabled": self._auto_enabled,
+            "strategy_cfg": {
+                "cooldown_ms": self._auto_cooldown_ms,
+                "min_flat_ms": self._auto_min_flat_ms,
+            },
+        }
+
 
     # совместимость с /status фолбэком
     @property

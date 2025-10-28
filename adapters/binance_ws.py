@@ -6,10 +6,12 @@ import contextlib
 import json
 import logging
 import random
+import ssl
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -21,18 +23,19 @@ def _now_ms() -> int:
 class BinanceWS:
     """
     Тонкий WS-адаптер Binance (spot/futures) для комбинированных потоков:
-      - подписка на {symbol}@bookTicker и {symbol}@markPrice(@1s)
-      - хранит последние book/mark по каждому символу
-      - при любом апдейте эмитит ОДНО объединённое событие:
-        {
-          "symbol": "BTCUSDT",
-          "ts_ms": 1739820000000, "ts": 1739820000,
-          "price": mid,
-          "bid": ..., "ask": ..., "bid_size": ..., "ask_size": ...,
-          "mark_price":  ... (опционально)
-        }
-      - отдаёт raw dict через внешний on_message(raw: dict) -> Awaitable[None]
-      - устойчивые переподключения: экспоненциальный backoff с джиттером и cap
+      • подписка на {symbol}@bookTicker и {symbol}@markPrice(@1s)
+      • хранит последние book/mark по каждому символу
+      • при любом апдейте эмитит ОДНО объединённое событие:
+            {
+              "symbol": "BTCUSDT",
+              "ts_ms": 1739820000000, "ts": 1739820000,
+              "price": mid,
+              "bid": ..., "ask": ..., "bid_size": ..., "ask_size": ...,
+              "mark_price":  ... (опционально)
+            }
+      • отдаёт raw dict через внешний on_message(raw: dict) -> Awaitable[None]
+      • устойчивые переподключения: экспоненциальный backoff с джиттером и cap
+      • SSL настроен через certifi (решает CERTIFICATE_VERIFY_FAILED на macOS)
     """
 
     # ------------- lifecycle -------------
@@ -47,6 +50,7 @@ class BinanceWS:
         reconnect_max_delay_s: float = 30.0,
         http_timeout_s: float = 20.0,
         heartbeat_s: int = 20,
+        verify_ssl: bool = True,
     ) -> None:
         self._symbols = [s.upper() for s in symbols]
         self._futures = futures
@@ -55,6 +59,13 @@ class BinanceWS:
         self._reconnect_max = max(self._reconnect_min, float(reconnect_max_delay_s))
         self._http_timeout_s = float(http_timeout_s)
         self._heartbeat_s = int(heartbeat_s)
+        self._verify_ssl = bool(verify_ssl)
+
+        # SSL-контекст через certifi (или отключаем проверку, если verify_ssl=False)
+        if self._verify_ssl:
+            self._ssl_ctx: ssl.SSLContext | bool = ssl.create_default_context(cafile=certifi.where())
+        else:
+            self._ssl_ctx = False  # aiohttp позволит ws_connect(ssl=False)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -62,8 +73,10 @@ class BinanceWS:
         self._stop = asyncio.Event()
 
         # кэш последних значений для мерджа
-        self._book: Dict[str, Dict[str, float]] = {}  # {sym: {"bid":..., "ask":..., "bid_size":..., "ask_size":...}}
-        self._mark: Dict[str, float] = {}             # {sym: mark_price}
+        # {sym: {"bid":..., "ask":..., "bid_size":..., "ask_size":...}}
+        self._book: Dict[str, Dict[str, float]] = {}
+        # {sym: mark_price}
+        self._mark: Dict[str, float] = {}
         self._lock = asyncio.Lock()
 
         # внешний колбэк
@@ -82,52 +95,56 @@ class BinanceWS:
             "url": "",
             "symbols": list(self._symbols),
             "last_error": "",
+            "verify_ssl": self._verify_ssl,
         }
 
     async def connect(self, on_message: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """
         Старт фонового процесса с авто-переподключением.
-        Совместимо с имеющимся кодом (вызывает внутренний runner).
         """
         self._on_message = on_message
         self._stop.clear()
+
         if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._http_timeout_s))
+            # trust_env=True — уважает https_proxy/no_proxy и т.п. (полезно за прокси)
+            connector = aiohttp.TCPConnector(
+                ssl=self._ssl_ctx, ttl_dns_cache=300, limit=0, use_dns_cache=True
+            )
+            timeout = aiohttp.ClientTimeout(total=self._http_timeout_s)
+            self._session = aiohttp.ClientSession(
+                connector=connector, timeout=timeout, trust_env=True
+            )
+
         if self._runner_task is None or self._runner_task.done():
             self._runner_task = asyncio.create_task(self._runner(), name="binance-ws-runner")
 
     async def close(self) -> None:
         """Остановка и закрытие WS/HTTP."""
         self._stop.set()
+
         if self._runner_task:
             self._runner_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._runner_task
-            except asyncio.CancelledError:
-                pass
             self._runner_task = None
+
         await self._close_ws()
-        # ВАЖНО: закрываем и HTTP-сессию
+
         if self._session:
-            try:
+            with contextlib.suppress(Exception):
                 await self._session.close()
-            except Exception:
-                pass
             self._session = None
 
     async def _close_ws(self) -> None:
-        # Корректно закрываем только вебсокет; сессию — в close()
         if self._ws and not self._ws.closed:
             with contextlib.suppress(Exception):
                 await self._ws.close()
         self._ws = None
 
-
     # ------------- helpers -------------
 
     def diag(self) -> Dict[str, Any]:
         """Снимок диагностической информации (для /status|/debug/diag)."""
-        # без мьютекса: только копия простых значений
         d = dict(self._diag)
         d["symbols"] = list(self._symbols)
         return d
@@ -142,6 +159,9 @@ class BinanceWS:
     # ------------- internal -------------
 
     def _build_url(self) -> str:
+        """
+        Binance combined streams endpoint.
+        """
         base = "wss://fstream.binance.com/stream" if self._futures else "wss://stream.binance.com:9443/stream"
         parts: List[str] = []
         for s in self._symbols:
@@ -159,19 +179,21 @@ class BinanceWS:
             url = self._build_url()
             self._diag["url"] = url
             try:
-                async with self._session.ws_connect(url, heartbeat=self._heartbeat_s) as ws:
+                async with await self._connect_ws(url) as ws:
                     self._ws = ws
                     self._diag["connects"] += 1
                     backoff = self._reconnect_min  # сброс после успешного коннекта
+
                     async for msg in ws:
                         if self._stop.is_set():
                             break
                         self._diag["last_rx_ms"] = _now_ms()
+
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             self._diag["messages"] += 1
                             await self._handle_ws_text(msg.data)
                         elif msg.type == aiohttp.WSMsgType.BINARY:
-                            # крайне редко — на всякий случай поддержим и бинарный текст
+                            # крайне редко — поддержим и бинарный текст
                             try:
                                 payload = msg.data.decode("utf-8", errors="ignore")
                                 self._diag["messages"] += 1
@@ -182,12 +204,13 @@ class BinanceWS:
                                 logger.exception("WS binary decode failed")
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 # мягкий бэкофф с джиттером, cap по максимуму
                 self._diag["errors"] += 1
-                self._diag["last_error"] = f"WS loop: {type(e).__name__}"
+                self._diag["last_error"] = f"WS loop: {type(e).__name__}: {e}"
                 logger.exception("WS loop error")
                 sleep_base = min(backoff, self._reconnect_max)
                 jitter = random.uniform(0.0, sleep_base * 0.3)
@@ -196,15 +219,20 @@ class BinanceWS:
             finally:
                 await self._close_ws()
 
-    async def _close_ws(self) -> None:
-        if self._ws and not self._ws.closed:
-            with contextlib.suppress(Exception):
-                await self._ws.close()
-        self._ws = None
-        if self._session:
-            # не закрываем сессию каждый цикл — она шарится;
-            # закрытие делаем в close() или при остановке runner'а в finally
-            pass
+    async def _connect_ws(self, url: str) -> aiohttp.ClientWebSocketResponse:
+        """
+        Отдельный метод, чтобы явно проставить SSL-контекст, heartbeat и таймауты.
+        """
+        assert self._session is not None
+        return await self._session.ws_connect(
+            url,
+            ssl=self._ssl_ctx,
+            heartbeat=self._heartbeat_s,
+            autoping=True,
+            compress=0,
+            timeout=aiohttp.ClientTimeout(total=30),
+            max_msg_size=2**22,
+        )
 
     async def _handle_ws_text(self, text: str) -> None:
         """
@@ -232,8 +260,9 @@ class BinanceWS:
         if ev == "markPriceUpdate" or self._looks_like_mark_price(data):
             await self._on_mark_price(data)
             return
-
         # прочие события игнорируем
+
+    # ---------- heuristics ----------
 
     @staticmethod
     def _looks_like_book_ticker(d: Dict[str, Any]) -> bool:
@@ -277,6 +306,7 @@ class BinanceWS:
                 "ask_size": ask_sz,
             }
             self._diag["book_updates"] += 1
+
         await self._emit_merged(symbol, ts_ms=int(d.get("E") or _now_ms()))
 
     async def _on_mark_price(self, d: Dict[str, Any]) -> None:
@@ -327,7 +357,7 @@ class BinanceWS:
         raw = {
             "symbol": symbol,
             "ts_ms": ts_ms,
-            "ts": ts_ms // 1000,   # для совместимости
+            "ts": ts_ms // 1000,  # для совместимости
             "price": mid,
             "bid": bid,
             "ask": ask,

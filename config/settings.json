@@ -17,24 +17,27 @@
     "min_risk_usd_floor": 1.0
   },
   "safety": {
-    "max_spread_ticks": 3,
+    "max_spread_ticks": 8,
     "min_top5_liquidity_usd": 300000.0,
     "skip_funding_minute": true,
     "skip_minute_zero": true,
     "min_liq_buffer_sl_mult": 3.0
   },
   "strategy": {
+    "auto_signal_enabled": true,
+    "auto_cooldown_ms": 500,
+    "auto_min_flat_ms": 200,
     "regime": {
       "vol_window_s": 60
     },
     "momentum": {
-      "obi_t": 0.12,
+      "obi_t": 0.003,
       "tp_r": 1.6,
       "stop_k_sigma": 1.1
     },
     "reversion": {
-      "bb_z": 2.0,
-      "rsi": 70,
+      "bb_z": 0.9,
+      "rsi": 62,
       "tp_to_vwap": true,
       "tp_r": 1.3
     }
