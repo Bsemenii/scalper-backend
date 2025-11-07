@@ -63,6 +63,22 @@ def _normalize_symbol(symbol: str, allowed: Iterable[str]) -> str:
         )
     return sym
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        return int(v)
+    except Exception:
+        return default
+
 
 def _symbols_from_settings() -> List[str]:
     try:
@@ -78,6 +94,7 @@ def _coalesce_from_settings() -> int:
         return int(getattr(getattr(s, "streams", object()), "coalesce_ms", 75))
     except Exception:
         return int(os.getenv("COALESCE_MS", "75"))
+
 
 
 # --- risk & sizing helpers ----------------------------------------------------
@@ -248,22 +265,54 @@ async def _shutdown() -> None:
 
 @app.get("/config/active")
 def config_active() -> dict:
-    s = get_settings()
-    strat = getattr(s, "strategy", None)
+    """
+    Активный конфиг в стабильном виде для фронта.
+    Поддерживает Pydantic v1/v2, dataclass и dict.
+    Ничего не падает, если части конфига отсутствуют.
+    """
 
-    def _asdict(obj):
-        try:
-            return obj.dict() if hasattr(obj, "dict") else dict(obj)
-        except Exception:
+    s = get_settings()
+
+    def _dump(obj: Any) -> Optional[Dict[str, Any]]:
+        if obj is None:
             return None
 
+        # Pydantic v2
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump()
+            except Exception:
+                pass
+
+        # Pydantic v1
+        if hasattr(obj, "dict"):
+            try:
+                return obj.dict()
+            except Exception:
+                pass
+
+        # Уже dict
+        if isinstance(obj, dict):
+            return obj
+
+        # Dataclass / generic object
+        if hasattr(obj, "__dict__"):
+            try:
+                return dict(obj.__dict__)
+            except Exception:
+                pass
+
+        return None
+
     return {
-        "source_path": s.source_path,
-        "source_mtime": s.source_mtime,
-        "risk": s.risk.dict(),
-        "execution": s.execution.dict(),
-        "strategy": _asdict(strat),  # может быть None, ок
+        "source_path": getattr(s, "source_path", None),
+        "source_mtime": getattr(s, "source_mtime", None),
+        "risk": _dump(getattr(s, "risk", None)),
+        "execution": _dump(getattr(s, "execution", None)),
+        "strategy": _dump(getattr(s, "strategy", None)),
     }
+
+
 
 
 @app.post("/control/reload-settings")

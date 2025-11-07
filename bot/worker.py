@@ -7,7 +7,8 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
-from collections import deque, deque as Deque
+from collections import deque
+from typing import Deque
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
@@ -201,36 +202,55 @@ class Worker:
             return
         self._started = True
 
-        def _best(sym: str) -> Tuple[float, float]:
+        def _best(sym: str) -> tuple[float, float]:
             return self.hub.best_bid_ask(sym)
 
-        # дефолты (если нет settings)
+        # базовые дефолты
         limit_offset_ticks = 1
         limit_timeout_ms = 500
         time_in_force = "GTC"
         max_slippage_bp = 6.0
         poll_ms = 50
+        fee_bps_maker = 2.0
+        fee_bps_taker = 4.0
+        prefer_maker = False
 
-        # подтягиваем (опционально) из settings.json
+        # один раз читаем settings (если есть)
+        s = None
         if get_settings:
             try:
                 s = get_settings()
-                limit_offset_ticks = int(getattr(s.execution, "limit_offset_ticks", limit_offset_ticks))
-                limit_timeout_ms = int(getattr(s.execution, "limit_timeout_ms", limit_timeout_ms))
-                max_slippage_bp = float(getattr(s.execution, "max_slippage_bp", max_slippage_bp))
-                time_in_force = str(getattr(s.execution, "time_in_force", time_in_force))
-                poll_ms = int(getattr(s.execution, "poll_ms", poll_ms))
-
-                # авто-сигналы
-                self._auto_enabled = bool(getattr(getattr(s, "strategy", object()), "auto_signal_enabled", False))
-                self._auto_cooldown_ms = int(getattr(getattr(s, "strategy", object()), "auto_cooldown_ms", self._auto_cooldown_ms))
-                self._auto_min_flat_ms = int(getattr(getattr(s, "strategy", object()), "auto_min_flat_ms", self._auto_min_flat_ms))
             except Exception:
-                logger.debug("settings not available, use defaults")
+                s = None
 
-        # инициализируем executors
+        if s is not None:
+            exec_cfg = getattr(s, "execution", None)
+            if exec_cfg is not None:
+                limit_offset_ticks = int(getattr(exec_cfg, "limit_offset_ticks", limit_offset_ticks))
+                limit_timeout_ms = int(getattr(exec_cfg, "limit_timeout_ms", limit_timeout_ms))
+                max_slippage_bp = float(getattr(exec_cfg, "max_slippage_bp", max_slippage_bp))
+                time_in_force = str(getattr(exec_cfg, "time_in_force", time_in_force))
+                poll_ms = int(getattr(exec_cfg, "poll_ms", poll_ms))
+                fee_bps_maker = float(getattr(exec_cfg, "fee_bps_maker", fee_bps_maker))
+                fee_bps_taker = float(getattr(exec_cfg, "fee_bps_taker", fee_bps_taker))
+                prefer_maker = bool(getattr(exec_cfg, "prefer_maker", prefer_maker))
+
+            # авто-сигналы — для обратной совместимости
+            strat_cfg = getattr(s, "strategy", None)
+            if strat_cfg is not None:
+                self._auto_enabled = bool(getattr(strat_cfg, "auto_signal_enabled", self._auto_enabled))
+                self._auto_cooldown_ms = int(getattr(strat_cfg, "auto_cooldown_ms", self._auto_cooldown_ms))
+                self._auto_min_flat_ms = int(getattr(strat_cfg, "auto_min_flat_ms", self._auto_min_flat_ms))
+
+        # если TIF пост-онли — включаем prefer_maker
+        tif_upper = (time_in_force or "").upper()
+        if tif_upper in ("GTX", "PO", "POST_ONLY"):
+            prefer_maker = True
+
+        # инициализируем executors + кандидаты по всем символам
         for sym in self.symbols:
             spec = self.specs[sym]
+
             cfg = ExecCfg(
                 price_tick=spec.price_tick,
                 qty_step=spec.qty_step,
@@ -238,20 +258,22 @@ class Worker:
                 limit_timeout_ms=limit_timeout_ms,
                 time_in_force=time_in_force,
                 poll_ms=poll_ms,
+                prefer_maker=prefer_maker,
+                fee_bps_maker=fee_bps_maker,
+                fee_bps_taker=fee_bps_taker,
             )
+
             adapter = PaperAdapter(_best, max_slippage_bp=max_slippage_bp)
             self.execs[sym] = Executor(adapter=adapter, cfg=cfg, get_best=_best)
 
-            # init candidate engine (лёгкая стратегия) под каждый символ
             self._cand[sym] = CandidateEngine(price_tick=spec.price_tick)
 
-        # WS → Coalescer
+        # запускаем потоки
         await self.ws.connect(self._on_ws_raw)
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
 
-        # watchdog
+        # фоновые циклы
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
-        # стратегия (если флаг включён — начнёт работать; иначе цикл idle)
         self._strat_task = asyncio.create_task(self._strategy_loop(), name="strategy")
 
     async def stop(self) -> None:
@@ -500,15 +522,21 @@ class Worker:
 
     async def place_entry(self, symbol: str, side: Side, qty: float) -> Dict[str, Any]:
         """
-        Прямой тестовый вход (обходит стратегии) + риск-фильтры + постановка SL/TP (paper-план).
-        FSM: FLAT -> ENTERING -> OPEN; таймаут/флаттен -> EXITING -> FLAT.
-        Возвращает словарь с ключом "report" для совместимости с API.
+        Унифицированный вход (ручной / авто):
+
+          - дневные лимиты,
+          - только из FLAT,
+          - pre-safety,
+          - исполнение через Executor,
+          - расчёт SL/TP (paper),
+          - post-safety,
+          - обновление FSM и in-memory позиции.
         """
         symbol = symbol.upper()
         if symbol not in self.execs:
             raise ValueError(f"Unsupported symbol: {symbol}")
 
-        # === 0) дневные лимиты (до захвата мьютекса) ===
+        # --- 0) дневные лимиты до локов ---
         day_dec = check_day_limits(
             DayState(
                 pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
@@ -518,71 +546,117 @@ class Worker:
             self._risk_cfg,
         )
         if not day_dec.allow:
-            for r in day_dec.reasons:
-                self._inc_block_reason("day_" + r)
-            return {"ok": False, "reason": ",".join(["day_" + r for r in day_dec.reasons]), "symbol": symbol, "side": side, "qty": qty}
+            reasons = [f"day_{r}" for r in day_dec.reasons]
+            for r in reasons:
+                self._inc_block_reason(r)
+            return {
+                "ok": False,
+                "reason": ",".join(reasons),
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+            }
 
         lock = self._locks[symbol]
         async with lock:
             pos = self._pos[symbol]
             if pos.state != "FLAT":
+                reason = f"busy:{pos.state}"
                 self._inc_block_reason("busy_" + pos.state)
-                return {"ok": False, "reason": f"busy:{pos.state}", "symbol": symbol, "side": side, "qty": qty}
+                return {
+                    "ok": False,
+                    "reason": reason,
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                }
 
-            # === 1) safety-фильтры до входа ===
+            # --- 1) pre-safety ---
             bid, ask = self.hub.best_bid_ask(symbol)
             spec = self.specs[symbol]
+
             spread_ticks = 0.0
             if bid > 0 and ask > 0 and spec.price_tick > 0:
                 spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
             micro = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
             tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
-            pre_dec = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=self._safety_cfg)
+
+            pre_dec = check_entry_safety(
+                side,
+                micro=micro,
+                time_ctx=tctx,
+                pos_ctx=None,
+                safety=self._safety_cfg,
+            )
             if not pre_dec.allow:
                 for r in pre_dec.reasons:
                     self._inc_block_reason(r)
-                return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side, "qty": qty}
+                return {
+                    "ok": False,
+                    "reason": ",".join(pre_dec.reasons),
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                }
 
-            # --- FSM: ENTERING ---
+            # --- 2) FSM → ENTERING ---
             with contextlib.suppress(Exception):
                 await self._fsm[symbol].on_entering()
             pos.state = "ENTERING"
             pos.side = side
 
-            # === 2) исполнение ===
-            rep: ExecutionReport = await self.execs[symbol].place_entry(symbol, side, qty)
+            # --- 3) исполнение через Executor ---
+            ex = self.execs[symbol]
+            rep: ExecutionReport = await ex.place_entry(symbol, side, qty)
             self._accumulate_exec_counters(rep.steps)
 
             if rep.status not in ("FILLED", "PARTIAL") or rep.filled_qty <= 0.0 or rep.avg_px is None:
-                # не вошли — откат в FLAT
+                # нет fill → откат к FLAT
                 self._pos[symbol] = PositionState(
-                    state="FLAT", side=None, qty=0.0, entry_px=0.0,
-                    sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
+                    state="FLAT",
+                    side=None,
+                    qty=0.0,
+                    entry_px=0.0,
+                    sl_px=None,
+                    tp_px=None,
+                    opened_ts_ms=0,
+                    timeout_ms=pos.timeout_ms,
                 )
                 with contextlib.suppress(Exception):
                     await self._fsm[symbol].on_flat()
+
                 return {
+                    "ok": False,
                     "symbol": symbol,
                     "side": side,
-                    "qty": qty,
+                    "qty": float(qty),
                     "report": {
                         "status": rep.status,
-                        "filled_qty": rep.filled_qty,
+                        "filled_qty": float(rep.filled_qty),
                         "avg_px": rep.avg_px,
                         "limit_oid": rep.limit_oid,
                         "market_oid": rep.market_oid,
-                        "steps": rep.steps,
+                        "steps": list(rep.steps or []),
                         "ts": rep.ts,
                     },
                 }
 
-            # === 3) расчёт SL/TP и post safety-проверка ===
+            # --- 4) SL/TP + post-safety ---
             entry_px = float(rep.avg_px)
             qty_open = float(rep.filled_qty)
 
+            # пересчёт спреда уже после входа
+            bid, ask = self.hub.best_bid_ask(symbol)
+            spread_ticks = 0.0
+            if bid > 0 and ask > 0 and spec.price_tick > 0:
+                spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+
             min_stop_ticks = self._min_stop_ticks_default()
-            sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
+            sl_distance_px = max(
+                min_stop_ticks * spec.price_tick,
+                max(spread_ticks, 1.0) * spec.price_tick,
+            )
 
             plan: SLTPPlan = compute_sltp(
                 side=side,
@@ -597,36 +671,51 @@ class Worker:
                 side,
                 micro=micro,
                 time_ctx=tctx,
-                pos_ctx=PositionalCtx(entry_px=entry_px, sl_px=plan.sl_px, leverage=self._leverage),
+                pos_ctx=PositionalCtx(
+                    entry_px=entry_px,
+                    sl_px=plan.sl_px,
+                    leverage=self._leverage,
+                ),
                 safety=self._safety_cfg,
             )
+
             if not post_dec.allow:
                 for r in post_dec.reasons:
                     self._inc_block_reason(r)
+
+                # откат к FLAT, позицию не держим
                 self._pos[symbol] = PositionState(
-                    state="FLAT", side=None, qty=0.0, entry_px=0.0,
-                    sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
+                    state="FLAT",
+                    side=None,
+                    qty=0.0,
+                    entry_px=0.0,
+                    sl_px=None,
+                    tp_px=None,
+                    opened_ts_ms=0,
+                    timeout_ms=pos.timeout_ms,
                 )
                 with contextlib.suppress(Exception):
                     await self._fsm[symbol].on_flat()
+
                 return {
                     "ok": False,
                     "reason": ",".join(post_dec.reasons),
                     "symbol": symbol,
                     "side": side,
-                    "qty": qty,
+                    "qty": float(qty),
                     "report": {
                         "status": rep.status,
-                        "filled_qty": rep.filled_qty,
-                        "avg_px": rep.avg_px,
+                        "filled_qty": float(qty_open),
+                        "avg_px": entry_px,
                         "limit_oid": rep.limit_oid,
                         "market_oid": rep.market_oid,
-                        "steps": rep.steps + ["blocked_after_plan:" + "|".join(post_dec.reasons)],
+                        "steps": list(rep.steps or [])
+                        + [f"blocked_after_plan:{'|'.join(post_dec.reasons)}"],
                         "ts": rep.ts,
                     },
                 }
 
-            # === 4) открываем позицию ===
+            # --- 5) фиксация открытой позиции ---
             opened_ts_ms = self._now_ms()
             self._pos[symbol] = PositionState(
                 state="OPEN",
@@ -638,9 +727,8 @@ class Worker:
                 opened_ts_ms=opened_ts_ms,
                 timeout_ms=pos.timeout_ms,
             )
-            self._entry_steps[symbol] = list(rep.steps)
+            self._entry_steps[symbol] = list(rep.steps or [])
 
-            # --- FSM: OPEN (снапшот в БД через on_open) ---
             with contextlib.suppress(Exception):
                 await self._fsm[symbol].on_open(
                     entry_px=entry_px,
@@ -652,16 +740,18 @@ class Worker:
                 )
 
             return {
+                "ok": True,
                 "symbol": symbol,
                 "side": side,
-                "qty": qty,
+                "qty": float(qty_open),
                 "report": {
                     "status": rep.status,
-                    "filled_qty": qty_open,
+                    "filled_qty": float(qty_open),
                     "avg_px": entry_px,
                     "limit_oid": rep.limit_oid,
                     "market_oid": rep.market_oid,
-                    "steps": rep.steps + [f"protection_set:SL@{plan.sl_px} TP@{plan.tp_px}"],
+                    "steps": list(rep.steps or [])
+                    + [f"protection_set:SL@{plan.sl_px} TP@{plan.tp_px}"],
                     "ts": self._now_ms(),
                 },
             }
@@ -669,20 +759,73 @@ class Worker:
     # ---------- watchdog / closing / trades ----------
 
     async def _watchdog_loop(self) -> None:
+        """
+        Watchdog:
+          - следим за таймаутом позиции,
+          - гарантируем наличие защиты,
+          - исполняем SL/TP по последней цене (paper-режим),
+          - не роняем цикл при единичных ошибках.
+        """
         try:
             while True:
                 await asyncio.sleep(0.25)
                 now = self._now_ms()
+
                 for sym in self.symbols:
                     lock = self._locks[sym]
                     async with lock:
                         pos = self._pos[sym]
-                        if pos.state == "OPEN":
-                            if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
-                                await self._paper_close(sym, pos, reason="timeout")
+
+                        if pos.state != "OPEN":
+                            continue
+
+                        # 1) Таймаут позиции
+                        if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
+                            await self._paper_close(sym, pos, reason="timeout")
+                            continue
+
+                        # 2) Если вообще нет защитных уровней — закрываем (fail-safe)
+                        if pos.sl_px is None and pos.tp_px is None:
+                            await self._paper_close(sym, pos, reason="no_protection")
+                            continue
+
+                        # 3) Проверка SL/TP по последнему тику (paper-логика)
+                        last = self.latest_tick(sym)
+                        if not last:
+                            continue
+
+                        px = 0.0
+                        try:
+                            # предпочитаем mark_price, если есть; иначе trade price
+                            mp = float(last.get("mark_price") or 0.0)
+                            p = float(last.get("price") or 0.0)
+                            px = mp if mp > 0 else p
+                        except Exception:
+                            px = 0.0
+
+                        if px <= 0.0:
+                            continue
+
+                        side = pos.side or "BUY"
+
+                        # BUY (long): SL ниже, TP выше
+                        if side == "BUY":
+                            if pos.sl_px is not None and px <= pos.sl_px:
+                                await self._paper_close(sym, pos, reason="sl_hit")
                                 continue
-                            if pos.sl_px is None or pos.tp_px is None:
-                                await self._paper_close(sym, pos, reason="no_protection")
+                            if pos.tp_px is not None and px >= pos.tp_px:
+                                await self._paper_close(sym, pos, reason="tp_hit")
+                                continue
+
+                        # SELL (short): SL выше, TP ниже
+                        elif side == "SELL":
+                            if pos.sl_px is not None and px >= pos.sl_px:
+                                await self._paper_close(sym, pos, reason="sl_hit")
+                                continue
+                            if pos.tp_px is not None and px <= pos.tp_px:
+                                await self._paper_close(sym, pos, reason="tp_hit")
+                                continue
+
         except asyncio.CancelledError:
             return
         except Exception:
@@ -710,27 +853,79 @@ class Worker:
         return {"ok": True, "symbol": symbol, "timeout_ms": self._pos[symbol].timeout_ms}
 
     async def _paper_close(self, sym: str, pos: PositionState, *, reason: str) -> None:
-        close_side: Side = "SELL" if (pos.side or "BUY") == "BUY" else "BUY"
+        """
+    Безопасное закрытие позиции в paper-режиме:
+      - выходим через Executor.place_exit (reduce_only),
+      - если fill нет — берём консервативную цену,
+      - регистрируем сделку (in-memory),
+      - фоново пересобираем trades в БД,
+      - приводим состояние к FLAT в любом случае.
+        """
+    # Если состояние уже пустое — просто флаттим
+        if pos.qty <= 0.0 or not pos.side:
+            self._pos[sym] = PositionState(
+                state="FLAT",
+                side=None,
+                qty=0.0,
+                entry_px=0.0,
+                sl_px=None,
+                tp_px=None,
+                opened_ts_ms=0,
+                timeout_ms=pos.timeout_ms,
+            )
+            self._entry_steps.pop(sym, None)
+            with contextlib.suppress(Exception):
+                await self._fsm[sym].on_flat()
+            return
+
+        close_side: Side = "SELL" if pos.side == "BUY" else "BUY"
+
         try:
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_exiting()
 
             ex = self.execs[sym]
-            rep: ExecutionReport = await ex.place_entry(sym, close_side, pos.qty)
+
+            # 1) Пытаемся выйти ордером reduce_only (лимит→таймаут→маркет)
+            rep: ExecutionReport = await ex.place_exit(sym, close_side, pos.qty)
             self._accumulate_exec_counters(rep.steps)
 
             exit_px = rep.avg_px
-            if exit_px is not None:
+            filled_qty = float(rep.filled_qty or 0.0)
+
+        # 2) Если фактического fill нет — используем консервативную цену
+            if exit_px is None or filled_qty <= 0.0:
+                exit_px = self._exit_price_conservative(sym, close_side, pos.entry_px)
+
+        # 3) Если есть валидная цена — регистрируем трейд (in-memory)
+            if exit_px and exit_px > 0.0:
                 entry_steps = self._entry_steps.get(sym, [])
+                exit_steps = list(rep.steps) if getattr(rep, "steps", None) else None
+
                 trade = self._build_trade_record(
-                    sym, pos, float(exit_px),
-                    reason=reason, entry_steps=entry_steps, exit_steps=list(rep.steps),
+                    sym,
+                    pos,
+                    float(exit_px),
+                    reason=reason,
+                    entry_steps=entry_steps,
+                    exit_steps=exit_steps,
                 )
                 self._register_trade(trade)
+
+        # 4) Фоновая пересборка trades в БД (если модуль доступен)
+            asyncio.create_task(self._rebuild_trades_safe())
+
         finally:
+        # Всегда приводим к FLAT
             self._pos[sym] = PositionState(
-                state="FLAT", side=None, qty=0.0, entry_px=0.0,
-                sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
+                state="FLAT",
+                side=None,
+                qty=0.0,
+                entry_px=0.0,
+                sl_px=None,
+                tp_px=None,
+                opened_ts_ms=0,
+                timeout_ms=pos.timeout_ms,
             )
             self._entry_steps.pop(sym, None)
             with contextlib.suppress(Exception):
@@ -764,7 +959,10 @@ class Worker:
         fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
 
         pnl_usd = pnl_usd_gross - fees_usd
-        risk_usd = max(pnl_risk_usd, self._risk_cfg.min_risk_usd_floor)
+
+        min_floor = float(getattr(self._risk_cfg, "min_risk_usd_floor", 0.0) or 0.0)
+        risk_usd = max(pnl_risk_usd, min_floor, 1e-9)
+
         pnl_r = pnl_usd / risk_usd
 
         return {
@@ -831,18 +1029,20 @@ class Worker:
         self._pnl_day["trough_r"] = trough
         self._pnl_day["max_dd_r"] = round(peak - trough if peak - trough > 0 else 0.0, 6)
 
-    # ---------- diag ----------
+        # ---------- diag ----------
 
     def _unrealized_snapshot(self) -> Dict[str, Any]:
         """
-        Быстрый uPnL-снапшот (как в /pnl/now): по выходной стороне стакана и с вычетом taker-комиссии.
+        Быстрый uPnL-снапшот:
+        - считаем по консервативной цене выхода (_exit_price_conservative),
+        - учитываем только taker-комиссию на выход,
+        - возвращаем total_usd, per_symbol и число открытых позиций.
         """
-    # подтянем bps аккуратно и дешево
         taker_bps = 4.0
         if get_settings:
             try:
                 s = get_settings()
-                taker_bps = float(getattr(s.execution, "fee_bps_taker", taker_bps))
+                taker_bps = float(getattr(getattr(s, "execution", object()), "fee_bps_taker", taker_bps))
             except Exception:
                 pass
 
@@ -853,7 +1053,7 @@ class Worker:
         for sym, p in self.diag_positions().items():
             if p.get("state") != "OPEN":
                 continue
-            open_positions += 1
+
             side = p.get("side")
             qty = float(p.get("qty") or 0.0)
             entry = float(p.get("entry_px") or 0.0)
@@ -872,14 +1072,18 @@ class Worker:
 
             fee = exit_px * qty * (taker_bps / 10_000.0)
             u = float(round(pnl_gross - fee, 6))
+
             per_symbol[sym] = u
             total += u
-        return {
-        "total_usd": float(round(total, 6)),
-        "per_symbol": per_symbol or None,
-        "open_positions": open_positions,}
+            open_positions += 1
 
-# Вспомогательное: отдаём positions как dict (без лишней математики)
+        return {
+            "total_usd": float(round(total, 6)),
+            "per_symbol": per_symbol or None,
+            "open_positions": open_positions,
+        }
+
+    # Вспомогательное: отдаём positions как dict (без лишней математики)
     def diag_positions(self) -> Dict[str, Dict[str, Any]]:
         return {
             s: {
@@ -891,60 +1095,62 @@ class Worker:
                 "tp_px": self._pos[s].tp_px,
                 "opened_ts_ms": self._pos[s].opened_ts_ms,
                 "timeout_ms": self._pos[s].timeout_ms,
-        }
+            }
             for s in self.symbols
-    }
-
+        }
 
     def diag(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
-            "symbols": list(self.symbols),
-            "ws_detail": self.ws.diag(),
-            "coal": self.coal.stats(),
-            "best": {s: self.hub.best_bid_ask(s) for s in self.symbols},
-            "exec_cfg": {
-                s: {
-                    "price_tick": self.execs[s].c.price_tick,
-                    "qty_step": self.execs[s].c.qty_step,
-                    "limit_offset_ticks": self.execs[s].c.limit_offset_ticks,
-                    "limit_timeout_ms": self.execs[s].c.limit_timeout_ms,
-                    "time_in_force": self.execs[s].c.time_in_force,
-                    "poll_ms": self.execs[s].c.poll_ms,
-                }
-                for s in self.symbols
-            },
-            "history": {
-                s: {
-                    "len": len(self._hist.get(s, [])),
-                    "maxlen": self._history_maxlen,
-                    "latest_ts_ms": (
-                        self._hist[s][-1]["ts_ms"] if self._hist.get(s) and len(self._hist[s]) > 0 else 0
-                    ),
-                }
-                for s in self.symbols
-            },
-            "positions": {
-                s: {
-                    "state": self._pos[s].state,
-                    "side": self._pos[s].side,
-                    "qty": self._pos[s].qty,
-                    "entry_px": self._pos[s].entry_px,
-                    "sl_px": self._pos[s].sl_px,
-                    "tp_px": self._pos[s].tp_px,
-                    "opened_ts_ms": self._pos[s].opened_ts_ms,
-                    "timeout_ms": self._pos[s].timeout_ms,
-                    "positions": self.diag_positions(),
-                    "unrealized": self._unrealized_snapshot(),
-                }
-                for s in self.symbols
-            },
+        symbols = list(self.symbols)
+
+        ws_detail = self.ws.diag()
+        coal_stats = self.coal.stats()
+        best = {s: self.hub.best_bid_ask(s) for s in symbols}
+        positions = self.diag_positions()
+        unrealized = self._unrealized_snapshot()
+
+        exec_cfg = {
+            s: {
+                "price_tick": self.execs[s].c.price_tick,
+                "qty_step": self.execs[s].c.qty_step,
+                "limit_offset_ticks": self.execs[s].c.limit_offset_ticks,
+                "limit_timeout_ms": self.execs[s].c.limit_timeout_ms,
+                "time_in_force": self.execs[s].c.time_in_force,
+                "poll_ms": self.execs[s].c.poll_ms,
+            }
+            for s in symbols
+        }
+
+        history = {
+            s: {
+                "len": len(self._hist.get(s, [])),
+                "maxlen": self._history_maxlen,
+                "latest_ts_ms": (
+                    self._hist[s][-1]["ts_ms"]
+                    if self._hist.get(s) and len(self._hist[s]) > 0
+                    else 0
+                ),
+            }
+            for s in symbols
+        }
+
+        pnl_day_clean = {
+            k: (round(v, 6) if isinstance(v, float) else v)
+            for k, v in self._pnl_day.items()
+            if not k.endswith("_raw")
+        }
+
+        return {
+            "symbols": symbols,
+            "ws_detail": ws_detail,
+            "coal": coal_stats,
+            "best": best,
+            "exec_cfg": exec_cfg,
+            "history": history,
+            "positions": positions,
+            "unrealized": unrealized,
             "exec_counters": dict(self._exec_counters),
-            "pnl_day": {
-                k: (round(v, 6) if isinstance(v, float) else v)
-                for k, v in self._pnl_day.items()
-                if not k.endswith("_raw")
-            },
-            "trades": {s: list(self._trades.get(s, [])) for s in self.symbols},
+            "pnl_day": pnl_day_clean,
+            "trades": {s: list(self._trades.get(s, [])) for s in symbols},
             "block_reasons": dict(self._block_reasons),
             "risk_cfg": {
                 "risk_per_trade_pct": self._risk_cfg.risk_per_trade_pct,
@@ -952,7 +1158,12 @@ class Worker:
                 "daily_target_r": self._risk_cfg.daily_target_r,
                 "max_consec_losses": self._risk_cfg.max_consec_losses,
                 "cooldown_after_sl_s": self._risk_cfg.cooldown_after_sl_s,
-                "min_risk_usd_floor": self._risk_cfg.min_risk_usd_floor,
+                "min_risk_usd_floor": getattr(self._risk_cfg, "min_risk_usd_floor", 0.0),
+            },
+            "protection_cfg": {
+                "daily_stop_r": self._risk_cfg.daily_stop_r,
+                "daily_target_r": self._risk_cfg.daily_target_r,
+                "max_consec_losses": self._risk_cfg.max_consec_losses,
             },
             "safety_cfg": {
                 "max_spread_ticks": self._safety_cfg.max_spread_ticks,
@@ -966,7 +1177,11 @@ class Worker:
                 "starting_equity_usd": self._starting_equity_usd,
                 "leverage": self._leverage,
                 "min_notional_usd": self._min_notional_usd,
-                "equity_now_usd": round(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0), 6),
+                "equity_now_usd": round(
+                    self._starting_equity_usd
+                    + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0),
+                    6,
+                ),
             },
             "auto_signal_enabled": self._auto_enabled,
             "strategy_cfg": {
@@ -974,7 +1189,6 @@ class Worker:
                 "min_flat_ms": self._auto_min_flat_ms,
             },
         }
-        return d
 
     # ---------- utils / sizing / config loaders ----------
 
@@ -989,6 +1203,24 @@ class Worker:
         except Exception:
             return None
 
+    async def _rebuild_trades_safe(self) -> None:
+        """
+        Пересобирает таблицу сделок из orders/fills (если доступно).
+        Делается фоном, чтобы не блокировать watchdog/UI.
+        """
+        try:
+            from storage.repo import rebuild_trades  # type: ignore
+        except ModuleNotFoundError:
+            return
+        except Exception:
+            return
+
+        try:
+            # rebuild_trades — синхронный, унесём в thread-пул
+            await asyncio.to_thread(rebuild_trades)
+        except Exception as e:
+            logger.warning("rebuild_trades failed: %s", e)
+    
     def _accumulate_exec_counters(self, steps: Optional[List[str]]) -> None:
         if not steps:
             return
@@ -1215,65 +1447,104 @@ class Worker:
 
     def _load_strategy_cfg(self) -> None:
         """
-        Читает strategy.auto_* из get_settings(), а если модель их не знает — парсит raw JSON по source_path.
-        Поля:
-          - auto_signal_enabled (bool)
-          - auto_cooldown_ms (int)
-          - auto_min_flat_ms (int)
-        Также понимает fallback-ключи: autoSignalEnabled, autoCooldownMs, autoMinFlatMs.
+        Загружает strategy.auto_* из настроек.
+
+        Поддерживает:
+          - Pydantic v2: .model_dump()
+          - Pydantic v1: .dict()
+          - Обычный объект с атрибутами
+          - raw JSON из source_path
+
+        Понимает ключи:
+          - auto_signal_enabled / autoSignalEnabled
+          - auto_cooldown_ms  / autoCooldownMs
+          - auto_min_flat_ms  / autoMinFlatMs
         """
-        auto_enabled = self._auto_enabled
-        auto_cd = self._auto_cooldown_ms
-        auto_minflat = self._auto_min_flat_ms
+        auto_enabled = bool(self._auto_enabled)
+        auto_cd = int(self._auto_cooldown_ms)
+        auto_minflat = int(self._auto_min_flat_ms)
 
         def _apply_from_dict(d: Dict[str, Any]) -> None:
             nonlocal auto_enabled, auto_cd, auto_minflat
-            auto_enabled = bool(d.get("auto_signal_enabled", d.get("autoSignalEnabled", auto_enabled)))
-            auto_cd = int(d.get("auto_cooldown_ms", d.get("autoCooldownMs", auto_cd)))
-            auto_minflat = int(d.get("auto_min_flat_ms", d.get("autoMinFlatMs", auto_minflat)))
+            if not isinstance(d, dict):
+                return
 
-        # 1) пробуем через get_settings()
+            if "auto_signal_enabled" in d or "autoSignalEnabled" in d:
+                auto_enabled = bool(
+                    d.get("auto_signal_enabled", d.get("autoSignalEnabled", auto_enabled))
+                )
+
+            if "auto_cooldown_ms" in d or "autoCooldownMs" in d:
+                try:
+                    auto_cd = int(
+                        d.get("auto_cooldown_ms", d.get("autoCooldownMs", auto_cd))
+                    )
+                except Exception:
+                    pass
+
+            if "auto_min_flat_ms" in d or "autoMinFlatMs" in d:
+                try:
+                    auto_minflat = int(
+                        d.get("auto_min_flat_ms", d.get("autoMinFlatMs", auto_minflat))
+                    )
+                except Exception:
+                    pass
+
+        # 1) Пытаемся прочитать из get_settings()
         s = None
         if get_settings:
             try:
                 s = get_settings()
-                strat = getattr(s, "strategy", None)
-                if strat is not None:
-                    if isinstance(strat, dict):
-                        _apply_from_dict(strat)
-                    else:
-                        try:
-                            if hasattr(strat, "dict"):
-                                _apply_from_dict(strat.dict())
-                            else:
-                                _apply_from_dict({
-                                    "auto_signal_enabled": getattr(strat, "auto_signal_enabled", auto_enabled),
-                                    "auto_cooldown_ms": getattr(strat, "auto_cooldown_ms", auto_cd),
-                                    "auto_min_flat_ms": getattr(strat, "auto_min_flat_ms", auto_minflat),
-                                })
-                        except Exception:
-                            pass
             except Exception:
-                pass
+                s = None
 
-        # 2) если не удалось — читаем raw JSON по source_path
-        try:
-            import json, os
-            source_path = getattr(s, "source_path", None) if s else None
-            if source_path and os.path.exists(source_path):
-                with open(source_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
+        if s is not None:
+            strat = getattr(s, "strategy", None)
+            if strat is not None:
+                # Pydantic v2
+                if hasattr(strat, "model_dump"):
+                    try:
+                        _apply_from_dict(strat.model_dump())
+                    except Exception:
+                        pass
+                # Pydantic v1
+                elif hasattr(strat, "dict"):
+                    try:
+                        _apply_from_dict(strat.dict())
+                    except Exception:
+                        pass
+                # уже dict
+                elif isinstance(strat, dict):
+                    _apply_from_dict(strat)
+                # generic-объект
+                else:
+                    _apply_from_dict({
+                        "auto_signal_enabled": getattr(strat, "auto_signal_enabled", auto_enabled),
+                        "auto_cooldown_ms": getattr(strat, "auto_cooldown_ms", auto_cd),
+                        "auto_min_flat_ms": getattr(strat, "auto_min_flat_ms", auto_minflat),
+                    })
+
+        # 2) Fallback: читаем raw JSON, если есть source_path
+        if s is not None:
+            try:
+                import json
+                import os
+
+                source_path = getattr(s, "source_path", None)
+                if source_path and os.path.exists(source_path):
+                    with open(source_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
                     strat_raw = raw.get("strategy") or {}
                     if isinstance(strat_raw, dict):
                         _apply_from_dict(strat_raw)
-        except Exception:
-            # тихо: не ломаем старт
-            pass
+            except Exception:
+                # тихо: не ломаем старт
+                pass
 
-        # зафиксировать
+        # 3) Фиксируем значения (с защитой от мусора)
         self._auto_enabled = bool(auto_enabled)
-        self._auto_cooldown_ms = int(auto_cd)
-        self._auto_min_flat_ms = int(auto_minflat)
+        self._auto_cooldown_ms = max(0, int(auto_cd))
+        self._auto_min_flat_ms = max(0, int(auto_minflat))
 
     def reload_strategy_cfg(self) -> Dict[str, Any]:
         """Горячая перечитка только strategy.* без перезапуска воркера."""
