@@ -854,15 +854,24 @@ class Worker:
 
     async def _paper_close(self, sym: str, pos: PositionState, *, reason: str) -> None:
         """
-    Безопасное закрытие позиции в paper-режиме:
-      - выходим через Executor.place_exit (reduce_only),
-      - если fill нет — берём консервативную цену,
-      - регистрируем сделку (in-memory),
-      - фоново пересобираем trades в БД,
-      - приводим состояние к FLAT в любом случае.
+        Безопасное закрытие позиции в paper-режиме.
+
+        Правила:
+        - Для sl_hit / tp_hit выходим по уровню SL/TP (строго, без переоценки в -30R).
+        - Для flatten/timeout/no_protection — по консервативной рыночной цене.
+        - Executor.place_exit используем только для получения steps/аудита, но не даём ему ломать цену SL/TP.
+        - В любом случае в конце приводим состояние к FLAT.
         """
-    # Если состояние уже пустое — просто флаттим
-        if pos.qty <= 0.0 or not pos.side:
+        side = pos.side
+        qty = float(pos.qty or 0.0)
+        entry_px = float(pos.entry_px or 0.0)
+        sl_px = float(pos.sl_px) if pos.sl_px is not None else None
+        tp_px = float(pos.tp_px) if pos.tp_px is not None else None
+        opened_ts_ms = int(pos.opened_ts_ms or 0)
+        timeout_ms = int(pos.timeout_ms or 180_000)
+
+        # Если по факту позиции нет — просто FLAT
+        if qty <= 0.0 or not side or entry_px <= 0.0:
             self._pos[sym] = PositionState(
                 state="FLAT",
                 side=None,
@@ -871,37 +880,52 @@ class Worker:
                 sl_px=None,
                 tp_px=None,
                 opened_ts_ms=0,
-                timeout_ms=pos.timeout_ms,
+                timeout_ms=timeout_ms,
             )
             self._entry_steps.pop(sym, None)
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_flat()
             return
 
-        close_side: Side = "SELL" if pos.side == "BUY" else "BUY"
+        close_side: Side = "SELL" if side == "BUY" else "BUY"
+
+        # Целевой уровень для SL/TP
+        level_px: Optional[float] = None
+        if reason == "sl_hit" and sl_px is not None:
+            level_px = sl_px
+        elif reason == "tp_hit" and tp_px is not None:
+            level_px = tp_px
+
+        exit_px: Optional[float] = None
+        exit_steps: Optional[list[str]] = None
 
         try:
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_exiting()
 
-            ex = self.execs[sym]
+            ex = self.execs.get(sym)
 
-            # 1) Пытаемся выйти ордером reduce_only (лимит→таймаут→маркет)
-            rep: ExecutionReport = await ex.place_exit(sym, close_side, pos.qty)
-            self._accumulate_exec_counters(rep.steps)
+            # --- 1) Попробуем формально вызвать Executor (reduce_only), чтобы получить steps ---
+            if ex is not None:
+                try:
+                    rep: ExecutionReport = await ex.place_exit(sym, close_side, qty)
+                    self._accumulate_exec_counters(rep.steps)
+                    exit_steps = list(rep.steps or [])
+                except Exception:
+                    # не роняем закрытие, просто падаем в fallback
+                    exit_steps = ["exec_exit_error"]
 
-            exit_px = rep.avg_px
-            filled_qty = float(rep.filled_qty or 0.0)
+            # --- 2) Определяем финальную цену выхода ---
+            if level_px is not None:
+                # Для sl_hit / tp_hit в paper-режиме ЖЁСТКО закрываем по плановому уровню.
+                exit_px = float(level_px)
+            else:
+                # Для остальных причин берём честную консервативную цену.
+                exit_px = self._exit_price_conservative(sym, close_side, entry_px)
 
-        # 2) Если фактического fill нет — используем консервативную цену
-            if exit_px is None or filled_qty <= 0.0:
-                exit_px = self._exit_price_conservative(sym, close_side, pos.entry_px)
-
-        # 3) Если есть валидная цена — регистрируем трейд (in-memory)
+            # --- 3) Регистрируем трейд, если цена вменяемая ---
             if exit_px and exit_px > 0.0:
                 entry_steps = self._entry_steps.get(sym, [])
-                exit_steps = list(rep.steps) if getattr(rep, "steps", None) else None
-
                 trade = self._build_trade_record(
                     sym,
                     pos,
@@ -911,12 +935,10 @@ class Worker:
                     exit_steps=exit_steps,
                 )
                 self._register_trade(trade)
-
-        # 4) Фоновая пересборка trades в БД (если модуль доступен)
-            asyncio.create_task(self._rebuild_trades_safe())
+                asyncio.create_task(self._rebuild_trades_safe())
 
         finally:
-        # Всегда приводим к FLAT
+            # --- 4) Всегда приводим к FLAT ---
             self._pos[sym] = PositionState(
                 state="FLAT",
                 side=None,
@@ -925,7 +947,7 @@ class Worker:
                 sl_px=None,
                 tp_px=None,
                 opened_ts_ms=0,
-                timeout_ms=pos.timeout_ms,
+                timeout_ms=timeout_ms,
             )
             self._entry_steps.pop(sym, None)
             with contextlib.suppress(Exception):
@@ -943,38 +965,63 @@ class Worker:
         entry_steps: Optional[List[str]] = None,
         exit_steps: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        side = pos.side or "BUY"
-        qty = float(pos.qty)
-        entry = float(pos.entry_px)
+        side = (pos.side or "BUY")
+        qty = float(pos.qty or 0.0)
+        entry = float(pos.entry_px or 0.0)
+        sl_px = float(pos.sl_px) if pos.sl_px is not None else None
+        tp_px = float(pos.tp_px) if pos.tp_px is not None else None
 
+        if qty <= 0.0 or entry <= 0.0:
+            # защита от мусора, не должно сюда доходить
+            return {
+                "symbol": sym,
+                "side": side,
+                "opened_ts": int(pos.opened_ts_ms or 0),
+                "closed_ts": self._now_ms(),
+                "qty": qty,
+                "entry_px": entry,
+                "exit_px": float(exit_px),
+                "sl_px": sl_px,
+                "tp_px": tp_px,
+                "pnl_usd": 0.0,
+                "pnl_r": 0.0,
+                "reason": f"{reason}|invalid_pos",
+                "fees": 0.0,
+            }
+
+        # ----- PnL -----
         if side == "BUY":
             pnl_usd_gross = (exit_px - entry) * qty
-            pnl_risk_usd = max(1e-9, (entry - float(pos.sl_px or entry)) * qty)
-        else:
+            sl_ref = sl_px if sl_px is not None and sl_px < entry else entry
+            pnl_risk_usd = abs(entry - sl_ref) * qty
+        else:  # SELL (short)
             pnl_usd_gross = (entry - exit_px) * qty
-            pnl_risk_usd = max(1e-9, (float(pos.sl_px or entry) - entry) * qty)
+            sl_ref = sl_px if sl_px is not None and sl_px > entry else entry
+            pnl_risk_usd = abs(sl_ref - entry) * qty
 
+        # ----- комиссии по steps (paper-аудит) -----
         entry_bps = self._fee_bps_for_steps(entry_steps or [])
         exit_bps = self._fee_bps_for_steps(exit_steps or [])
         fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
 
         pnl_usd = pnl_usd_gross - fees_usd
 
+        # ----- корректный R -----
         min_floor = float(getattr(self._risk_cfg, "min_risk_usd_floor", 0.0) or 0.0)
-        risk_usd = max(pnl_risk_usd, min_floor, 1e-9)
-
+        # Если SL не задан или слишком близко — всё равно не даём risk_usd стать микроскопическим
+        risk_usd = max(pnl_risk_usd, min_floor, 1e-6)
         pnl_r = pnl_usd / risk_usd
 
         return {
             "symbol": sym,
             "side": side,
-            "opened_ts": pos.opened_ts_ms,
+            "opened_ts": int(pos.opened_ts_ms or 0),
             "closed_ts": self._now_ms(),
             "qty": qty,
             "entry_px": entry,
             "exit_px": float(exit_px),
-            "sl_px": pos.sl_px,
-            "tp_px": pos.tp_px,
+            "sl_px": sl_px,
+            "tp_px": tp_px,
             "pnl_usd": round(pnl_usd, 6),
             "pnl_r": round(pnl_r, 6),
             "reason": reason,
