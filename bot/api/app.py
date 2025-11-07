@@ -455,31 +455,59 @@ def status() -> Dict[str, Any]:
 
 @app.get("/debug/diag")
 async def debug_diag() -> Dict[str, Any]:
-    """Расширенная диагностика пайплайна (стабильная форма для фронта)."""
+    """
+    Расширенная диагностика пайплайна в стабильном формате.
+
+    Источник истины — Worker.diag():
+      - никаких прямых обращений к приватным полям;
+      - только чтение и лёгкая нормализация.
+    """
     w = _worker_required()
-    d = w.diag()
+    try:
+        d = w.diag() or {}
+    except Exception:
+        d = {}
+
+    ws_detail = d.get("ws_detail") or {}
+    coal = d.get("coal") or {}
+
     return {
-        "ws": {
-            "count": (d.get("ws_detail", {}) or {}).get("messages", 0),
-            "last_rx_ts_ms": (d.get("ws_detail", {}) or {}).get("last_rx_ms", 0),
-        },
-        "ws_detail": d.get("ws_detail", {}),
-        "coal": d.get("coal", {}),
         "symbols": d.get("symbols", []),
-        "coalesce_ms": (d.get("coal", {}) or {}).get("window_ms"),
-        "history_seconds": 600,
+
+        # WS / streams
+        "ws": {
+            "count": int((ws_detail or {}).get("messages", 0)),
+            "last_rx_ts_ms": int((ws_detail or {}).get("last_rx_ms", 0)),
+        },
+        "ws_detail": ws_detail,
+        "coal": coal,
+        "coalesce_ms": coal.get("window_ms"),
+        "history": d.get("history", {}),
+        "history_seconds": 600,  # для фронта как ориентир окна
+
+        # Рынок / позиции / сделки
         "best": d.get("best", {}),
-        "exec_cfg": d.get("exec_cfg", {}),
-        "risk_cfg": d.get("risk_cfg"),
-        "safety_cfg": d.get("safety_cfg"),
-        "consec_losses": d.get("consec_losses"),
         "positions": d.get("positions", {}),
+        "unrealized": d.get("unrealized", {}),
         "trades": d.get("trades", {}),
+
+        # Риск / защита / безопасность
         "pnl_day": d.get("pnl_day", {}),
-        "block_reasons": d.get("block_reasons", {}),
+        "risk_cfg": d.get("risk_cfg", {}),
         "protection_cfg": d.get("protection_cfg", {}),
-        "auto_signal_enabled": d.get("auto_signal_enabled", False),
-        "strategy_cfg": d.get("strategy_cfg", None),
+        "safety_cfg": d.get("safety_cfg", {}),
+        "day_limits": d.get("day_limits", {}),
+        "consec_losses": d.get("consec_losses", 0),
+
+        # Аккаунт / исполнение
+        "account_cfg": d.get("account_cfg", {}),
+        "exec_cfg": d.get("exec_cfg", {}),
+        "exec_counters": d.get("exec_counters", {}),
+        "block_reasons": d.get("block_reasons", {}),
+
+        # Стратегия / авто
+        "auto_signal_enabled": bool(d.get("auto_signal_enabled", False)),
+        "strategy_cfg": d.get("strategy_cfg", {}),
     }
 
 
@@ -501,14 +529,31 @@ async def best(
 
 @app.get("/demo/digest")
 async def demo_digest() -> Dict[str, Any]:
+    """
+    Компактный дайджест для дашборда:
+    - текущий день, pnl
+    - uPnL
+    - последние трейды по каждому символу
+    - позиции (компактно)
+    - статус авто и дневных лимитов
+    - топ причин блокировок
+    """
     w = _worker_required()
-    d = w.diag() or {}
-    best = d.get("best", {}) or {}
-    pnl = d.get("pnl_day", {}) or {}
+    try:
+        d = w.diag() or {}
+    except Exception:
+        d = {}
+
+    symbols = d.get("symbols", []) or []
+    pnl_day = d.get("pnl_day", {}) or {}
+    unrealized = d.get("unrealized", {}) or {}
     positions = d.get("positions", {}) or {}
-    reasons = (d.get("block_reasons", {}) or {})
-    # топ-5 причин блокировок
-    top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    trades = d.get("trades", {}) or {}
+    day_limits = d.get("day_limits", {}) or {}
+    block_reasons = d.get("block_reasons", {}) or {}
+    auto_enabled = bool(d.get("auto_signal_enabled", False))
+    strat_cfg = d.get("strategy_cfg", {}) or {}
+
     # компакт по позициям
     pos_compact = {
         sym: {
@@ -522,26 +567,47 @@ async def demo_digest() -> Dict[str, Any]:
         }
         for sym, p in (positions or {}).items()
     }
+
+    # по одному последнему трейду на символ
+    trades_last: Dict[str, Dict[str, Any]] = {}
+    if isinstance(trades, dict):
+        for sym, arr in trades.items():
+            if not arr:
+                continue
+            last = max(arr, key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)))
+            trades_last[sym] = {
+                "symbol": last.get("symbol"),
+                "side": last.get("side"),
+                "qty": last.get("qty"),
+                "entry_px": last.get("entry_px"),
+                "exit_px": last.get("exit_px"),
+                "pnl_usd": last.get("pnl_usd"),
+                "pnl_r": last.get("pnl_r"),
+                "reason": last.get("reason"),
+                "opened_ts": last.get("opened_ts"),
+                "closed_ts": last.get("closed_ts"),
+            }
+
+    # топ-5 причин блокировок
+    reasons_sorted = sorted(
+        (block_reasons or {}).items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:5]
+
     return {
         "ts_ms": int(time.time() * 1000),
-        "symbols": d.get("symbols", []),
-        "best": best,
-        "pnl_day": {
-            "day": pnl.get("day"),
-            "trades": pnl.get("trades"),
-            "winrate": pnl.get("winrate"),
-            "avg_r": pnl.get("avg_r"),
-            "pnl_r": pnl.get("pnl_r"),
-            "pnl_usd": pnl.get("pnl_usd"),
-            "max_dd_r": pnl.get("max_dd_r"),
-        },
+        "symbols": symbols,
+        "pnl_day": pnl_day,
+        "unrealized": unrealized,
         "positions": pos_compact,
-        "exec_counters": d.get("exec_counters", {}),
+        "trades_last": trades_last,
         "auto": {
-            "enabled": bool(d.get("auto_signal_enabled", False)),
-            "cfg": d.get("strategy_cfg", {}),
+            "enabled": auto_enabled,
+            "cfg": strat_cfg,
         },
-        "reasons_top": top_reasons,
+        "day_limits": day_limits,
+        "reasons_top": reasons_sorted,
     }
 
 
@@ -997,34 +1063,51 @@ async def position(symbol: str = Query("BTCUSDT", description="Символ, н�
 
 @app.get("/metrics")
 async def metrics() -> Dict[str, Any]:
+    """
+    Лёгкие метрики для health/графиков:
+    - ws / coalescer counters
+    - exec counters
+    - количество открытых позиций
+    - дневной PnL
+    """
     w = _worker_required()
-    d = w.diag()
+    try:
+        d = w.diag() or {}
+    except Exception:
+        d = {}
 
     ws = d.get("ws_detail", {}) or {}
     coal = d.get("coal", {}) or {}
     exec_counters = d.get("exec_counters", {}) or {}
     pnl_day = d.get("pnl_day", {}) or {}
+    unrealized = d.get("unrealized", {}) or {}
     positions = d.get("positions", {}) or {}
-    open_positions = sum(1 for p in positions.values() if (p or {}).get("state") == "OPEN")
+
+    open_positions = sum(
+        1 for p in (positions or {}).values()
+        if (p or {}).get("state") == "OPEN"
+    )
 
     return {
-        "ws_messages": ws.get("messages", 0),
-        "ws_last_rx_ms": ws.get("last_rx_ms", 0),
-        "ws_reconnects": ws.get("reconnects", 0),
+        "ws_messages": int(ws.get("messages", 0)),
+        "ws_last_rx_ms": int(ws.get("last_rx_ms", 0)),
+        "ws_reconnects": int(ws.get("reconnects", 0)),
         "coalesce_window_ms": coal.get("window_ms"),
-        "coalesce_emit_count": coal.get("emit_count", 0),
-        "coalesce_emits_per_sec": coal.get("emits_per_sec", 0.0),
-        "coalesce_queue_max": coal.get("max_queue_depth", 0),
-        "orders_limit_total": exec_counters.get("limit_total", 0),
-        "orders_market_total": exec_counters.get("market_total", 0),
-        "orders_cancel_total": exec_counters.get("cancel_total", 0),
+        "coalesce_emit_count": int(coal.get("emit_count", 0)),
+        "coalesce_emits_per_sec": float(coal.get("emits_per_sec", 0.0)),
+        "coalesce_queue_max": int(coal.get("max_queue_depth", 0)),
+        "orders_limit_total": int(exec_counters.get("limit_total", 0)),
+        "orders_market_total": int(exec_counters.get("market_total", 0)),
+        "orders_cancel_total": int(exec_counters.get("cancel_total", 0)),
+        "orders_reject_total": int(exec_counters.get("reject_total", 0)),
         "open_positions": open_positions,
-        "symbols": list(w.symbols),
-        "pnl_r_day": pnl_day.get("pnl_r", 0.0),
-        "pnl_usd_day": pnl_day.get("pnl_usd", 0.0),
+        "symbols": d.get("symbols", []),
+        "pnl_r_day": float(pnl_day.get("pnl_r", 0.0) or 0.0),
+        "pnl_usd_day": float(pnl_day.get("pnl_usd", 0.0) or 0.0),
         "winrate_day": pnl_day.get("winrate"),
-        "trades_day": pnl_day.get("trades", 0),
+        "trades_day": int(pnl_day.get("trades", 0) or 0),
         "max_dd_r_day": pnl_day.get("max_dd_r"),
+        "unrealized_total_usd": float(unrealized.get("total_usd", 0.0) or 0.0),
     }
 
 
@@ -1202,57 +1285,82 @@ async def pnl_now():
 @app.get("/stream/sse")
 async def stream_sse():
     """
-    Server-Sent Events: 1 раз/сек отдаём компактный снапшот:
-    pnl_day, positions, best, по одному последнему трейду на символ.
-    Добавлены: graceful shutdown (CancelledError), heartbeat, retry hint,
-    заголовки против буферизации (nginx/proxies).
+    Server-Sent Events:
+    1 раз/сек отдаём компактный снапшот на основе Worker.diag():
+      - pnl_day
+      - unrealized
+      - positions
+      - best
+      - по одному последнему трейду на символ
+      - auto_signal_enabled, day_limits, block_reasons (для UI)
     """
     w = _worker_required()
 
     async def eventgen():
-        # Подскажем клиенту интервал авто-реconnect
+        # hint для клиента по reconnect
         yield "retry: 2000\n\n"
         try:
             while True:
                 try:
                     d = w.diag() or {}
-                    payload: Dict[str, Any] = {
-                        "ts_ms": _now_ms(),
-                        "pnl_day": d.get("pnl_day", {}) or {},
-                        "positions": d.get("positions", {}) or {},
-                        "best": d.get("best", {}) or {},
-                        "trades_last": {},
+                    symbols = d.get("symbols", []) or []
+                    trades = d.get("trades", {}) or {}
+
+                    trades_last: Dict[str, Any] = {}
+                    if isinstance(trades, dict):
+                        for sym, arr in trades.items():
+                            if not arr:
+                                continue
+                            last = max(
+                                arr,
+                                key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)),
+                            )
+                            trades_last[sym] = {
+                                "symbol": last.get("symbol"),
+                                "side": last.get("side"),
+                                "qty": last.get("qty"),
+                                "entry_px": last.get("entry_px"),
+                                "exit_px": last.get("exit_px"),
+                                "pnl_usd": last.get("pnl_usd"),
+                                "pnl_r": last.get("pnl_r"),
+                                "reason": last.get("reason"),
+                                "opened_ts": last.get("opened_ts"),
+                                "closed_ts": last.get("closed_ts"),
+                            }
+
+                    payload = {
+                        "ts_ms": int(time.time() * 1000),
+                        "symbols": symbols,
+                        "pnl_day": d.get("pnl_day", {}),
+                        "unrealized": d.get("unrealized", {}),
+                        "positions": d.get("positions", {}),
+                        "best": d.get("best", {}),
+                        "trades_last": trades_last,
+                        "auto_signal_enabled": bool(d.get("auto_signal_enabled", False)),
+                        "day_limits": d.get("day_limits", {}),
+                        "block_reasons": d.get("block_reasons", {}),
                     }
 
-                    store = d.get("trades")
-                    if isinstance(store, dict):
-                        for sym, arr in store.items():
-                            if arr:
-                                last = max(arr, key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)))
-                                payload["trades_last"][sym] = {
-                                    k: last.get(k)
-                                    for k in (
-                                        "symbol", "side", "qty",
-                                        "entry_px", "exit_px",
-                                        "pnl_usd", "pnl_r", "reason",
-                                        "opened_ts", "closed_ts",
-                                    )
-                                }
-
-                    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+                    data = json.dumps(
+                        payload,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
                     yield f"event: tick\ndata: {data}\n\n"
 
                 except Exception as e:
-                    # единичная ошибка в сборке снапшота — не рвём поток
-                    err = json.dumps({"error": str(e)}, separators=(",", ":"), ensure_ascii=False)
+                    err = json.dumps(
+                        {"error": str(e)},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
                     yield f"event: error\ndata: {err}\n\n"
 
-                # heartbeat против idle-таймаутов прокси
+                # heartbeat
                 yield ":keep-alive\n\n"
                 await asyncio.sleep(1.0)
 
         except asyncio.CancelledError:
-            # клиент отключился или сервер гасится — выходим тихо
             return
 
     return StreamingResponse(
@@ -1261,6 +1369,6 @@ async def stream_sse():
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # для nginx
+            "X-Accel-Buffering": "no",
         },
     )

@@ -345,97 +345,143 @@ class Worker:
 
     async def _strategy_loop(self) -> None:
         """
-        Лёгкий цикл принятия решений.
-        Условия входа:
-          - auto_enabled
-          - по символу: FLAT
-          - cooldown от последнего входа соблюдён
-          - минимум FLAT-времени после предыдущей сделки
-          - кандидат от движка + safety/day-limits
+        Лёгкий авто-ордеринг поверх CandidateEngine.
+
+        Принципы:
+        - работаем ТОЛЬКО если _auto_enabled = True;
+        - дневные лимиты проверяем один раз на цикл;
+        - по символу входим только из FLAT;
+        - соблюдаем cooldown и min_flat;
+        - используем только свежие тики;
+        - кандидат → check_entry_safety → place_entry_auto (единый пайплайн);
+        - все фейлы логируем в _block_reasons (для /debug/diag);
+        - не роняем цикл ни при каких исключениях.
         """
+        tick_stale_ms = 2500  # максимум "возраст" тика для авто-входа (ms)
+
         try:
             while True:
-                await asyncio.sleep(0.12)  # ~8 Гц
+                await asyncio.sleep(0.12)  # ~8 Гц опроса
+
                 if not self._auto_enabled:
                     continue
 
                 now = self._now_ms()
 
+                # ---- 1) Дневные лимиты (общие) ----
+                day_dec = None
+                try:
+                    day_state = DayState(
+                        pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
+                        consec_losses=int(self._consec_losses),
+                        trading_disabled=False,
+                    )
+                    day_dec = check_day_limits(day_state, self._risk_cfg)
+                except Exception:
+                    # если фильтр сломался — не блокируем торговлю целиком, но помечаем
+                    self._inc_block_reason("day_limits_error")
+
+                if day_dec is not None and not day_dec.allow:
+                    for r in (day_dec.reasons or []):
+                        self._inc_block_reason("day_" + str(r))
+                    # дневной стоп: выходим из цикла итерации, ждём следующего тика/дня
+                    continue
+
+                # ---- 2) Перебор символов ----
                 for sym in self.symbols:
-                    # быстро: если заняты — пропускаем
                     pos = self._pos[sym]
+
+                    # 2.1. Только из FLAT
                     if pos.state != "FLAT":
                         continue
 
-                    # кулдаун и минимальное FLAT-время
-                    if now - self._last_signal_ms[sym] < self._auto_cooldown_ms:
-                        continue
-                    if now - self._last_flat_ms[sym] < self._auto_min_flat_ms:
+                    # 2.2. Anti-spam: cooldown между сигналами
+                    last_sig = int(self._last_signal_ms.get(sym, 0))
+                    if now - last_sig < int(self._auto_cooldown_ms):
                         continue
 
+                    # 2.3. Минимальное FLAT-время после предыдущей позиции
+                    last_flat = int(self._last_flat_ms.get(sym, 0))
+                    if now - last_flat < int(self._auto_min_flat_ms):
+                        continue
+
+                    # 2.4. Свежий тик
                     last = self.latest_tick(sym)
                     if not last:
+                        self._inc_block_reason(f"{sym}:no_tick")
                         continue
 
-                    # кандидат
+                    ts_ms = int(last.get("ts_ms") or 0)
+                    if ts_ms > 0 and now - ts_ms > tick_stale_ms:
+                        self._inc_block_reason(f"{sym}:stale_tick")
+                        continue
+
+                    # 2.5. Кандидат от стратегии
                     ce = self._cand.get(sym)
                     if not ce:
+                        self._inc_block_reason(f"{sym}:no_candidate_engine")
                         continue
 
-                    dec: Decision = ce.update(
-                        price=float(last["price"]),
-                        bid=float(last["bid"]),
-                        ask=float(last["ask"]),
-                        bid_sz=float(last.get("bid_size", 0.0)),
-                        ask_sz=float(last.get("ask_size", 0.0)),
-                    )
-                    if not dec.side:
-                        # агрегируем причины skip, чтобы видеть «почему нет сделок»
-                        self._inc_block_reason(dec.reason)
+                    try:
+                        dec: Decision = ce.update(
+                            price=float(last.get("price") or 0.0),
+                            bid=float(last.get("bid") or 0.0),
+                            ask=float(last.get("ask") or 0.0),
+                            bid_sz=float(last.get("bid_size") or 0.0),
+                            ask_sz=float(last.get("ask_size") or 0.0),
+                        )
+                    except Exception:
+                        self._inc_block_reason(f"{sym}:cand_error")
                         continue
 
-                    side: Side = "BUY" if dec.side == "BUY" else "SELL"
-
-                    # дневные лимиты перед входом
-                    day_dec = check_day_limits(
-                        DayState(
-                            pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
-                            consec_losses=int(self._consec_losses),
-                            trading_disabled=False,
-                        ),
-                        self._risk_cfg,
-                    )
-                    if not day_dec.allow:
-                        for r in day_dec.reasons:
-                            self._inc_block_reason("day_" + r)
+                    side_raw = (getattr(dec, "side", None) or "").upper()
+                    if side_raw not in ("BUY", "SELL"):
+                        reason = getattr(dec, "reason", None) or "no_side"
+                        self._inc_block_reason(f"{sym}:skip_{reason}")
                         continue
 
-                    # safety-чек перед входом (спред и т.п.)
+                    side: Side = "BUY" if side_raw == "BUY" else "SELL"
+
+                    # 2.6. Safety перед входом (спред, время, базовые фильтры)
                     bid, ask = self.hub.best_bid_ask(sym)
-                    spec = self.specs[sym]
+                    spec = self.specs.get(sym)
                     spread_ticks = 0.0
-                    if bid > 0 and ask > 0 and spec.price_tick > 0:
+                    if spec and bid > 0 and ask > 0 and spec.price_tick > 0:
                         spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+
+                    micro = MicroCtx(
+                        spread_ticks=spread_ticks,
+                        top5_liq_usd=1e12,  # для paper MVP считаем ликвидность достаточной
+                    )
+                    tctx = TimeCtx(
+                        ts_ms=now,
+                        server_time_offset_ms=self._server_time_offset_ms,
+                    )
 
                     pre_dec = check_entry_safety(
                         side,
-                        micro=MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12),
-                        time_ctx=TimeCtx(ts_ms=now, server_time_offset_ms=self._server_time_offset_ms),
+                        micro=micro,
+                        time_ctx=tctx,
                         pos_ctx=None,
                         safety=self._safety_cfg,
                     )
                     if not pre_dec.allow:
-                        for r in pre_dec.reasons:
-                            self._inc_block_reason(r)
+                        for r in (pre_dec.reasons or []):
+                            self._inc_block_reason(f"{sym}:{r}")
                         continue
 
-                    # авто-сайзинг + вход (вся проверка/SLTP/откат внутри place_entry/auto)
+                    # 2.7. Унифицированный авто-вход (risk sizing + SL/TP внутри)
                     rep = await self.place_entry_auto(sym, side)
-                    if not rep.get("ok", True):
-                        self._inc_block_reason(rep.get("reason", "auto_entry_fail"))
 
+                    if not rep.get("ok", True):
+                        reason = rep.get("reason", "auto_entry_fail")
+                        self._inc_block_reason(f"{sym}:{reason}")
+
+                    # Даже если вход не удался — не спамим сигналами чаще cooldown.
                     self._last_signal_ms[sym] = now
+
         except asyncio.CancelledError:
+            # штатное завершение при остановке воркера
             return
         except Exception:
             logger.exception("strategy loop error")
@@ -1147,43 +1193,199 @@ class Worker:
         }
 
     def diag(self) -> Dict[str, Any]:
+        """
+        Стабильный снапшот состояния для API/фронта.
+
+        Без выброса исключений наружу:
+        - ws/stream статус
+        - best bid/ask
+        - история тиков по символам (meta)
+        - позиции и uPnL
+        - сделки и дневной PnL
+        - риск, безопасники, дневные лимиты
+        - авто-сигналы/стратегия
+        """
         symbols = list(self.symbols)
 
-        ws_detail = self.ws.diag()
-        coal_stats = self.coal.stats()
-        best = {s: self.hub.best_bid_ask(s) for s in symbols}
-        positions = self.diag_positions()
-        unrealized = self._unrealized_snapshot()
+        # --- WS / coalescer ---
+        try:
+            ws_detail = self.ws.diag()
+        except Exception:
+            ws_detail = {}
 
-        exec_cfg = {
-            s: {
-                "price_tick": self.execs[s].c.price_tick,
-                "qty_step": self.execs[s].c.qty_step,
-                "limit_offset_ticks": self.execs[s].c.limit_offset_ticks,
-                "limit_timeout_ms": self.execs[s].c.limit_timeout_ms,
-                "time_in_force": self.execs[s].c.time_in_force,
-                "poll_ms": self.execs[s].c.poll_ms,
-            }
-            for s in symbols
-        }
+        try:
+            coal_stats = self.coal.stats()
+        except Exception:
+            coal_stats = {}
 
-        history = {
-            s: {
-                "len": len(self._hist.get(s, [])),
+        # --- best bid/ask ---
+        best: Dict[str, Tuple[float, float]] = {}
+        for s in symbols:
+            try:
+                bid, ask = self.hub.best_bid_ask(s)
+            except Exception:
+                bid, ask = 0.0, 0.0
+            best[s] = (float(bid), float(ask))
+
+        # --- history meta ---
+        history: Dict[str, Dict[str, Any]] = {}
+        for s in symbols:
+            dq = self._hist.get(s) or []
+            latest_ts = 0
+            if dq:
+                try:
+                    latest_ts = int(dq[-1].get("ts_ms", 0))
+                except Exception:
+                    latest_ts = 0
+            history[s] = {
+                "len": len(dq),
                 "maxlen": self._history_maxlen,
-                "latest_ts_ms": (
-                    self._hist[s][-1]["ts_ms"]
-                    if self._hist.get(s) and len(self._hist[s]) > 0
-                    else 0
-                ),
+                "latest_ts_ms": latest_ts,
             }
-            for s in symbols
+
+        # --- positions snapshot ---
+        positions = self.diag_positions()
+
+        # --- unrealized snapshot ---
+        try:
+            unrealized = self._unrealized_snapshot()
+        except Exception:
+            unrealized = {
+                "total_usd": 0.0,
+                "per_symbol": None,
+                "open_positions": 0,
+            }
+
+        # --- pnl_day (safe/rounded) ---
+        try:
+            pnl_raw = dict(self._pnl_day or {})
+        except Exception:
+            pnl_raw = {}
+
+        pnl_day: Dict[str, Any] = {}
+        if not pnl_raw:
+            pnl_day = {
+                "day": self._day_str(),
+                "trades": 0,
+                "winrate": None,
+                "avg_r": None,
+                "pnl_r": 0.0,
+                "pnl_usd": 0.0,
+                "max_dd_r": None,
+            }
+        else:
+            for k, v in pnl_raw.items():
+                if k.endswith("_raw"):
+                    continue
+                if isinstance(v, float):
+                    pnl_day[k] = round(v, 6)
+                else:
+                    pnl_day[k] = v
+
+        # --- trades snapshot ---
+        trades: Dict[str, Any] = {}
+        for s in symbols:
+            try:
+                trades[s] = list(self._trades.get(s, []))
+            except Exception:
+                trades[s] = []
+
+        # --- risk cfg ---
+        try:
+            risk_cfg = {
+                "risk_per_trade_pct": float(self._risk_cfg.risk_per_trade_pct),
+                "daily_stop_r": float(self._risk_cfg.daily_stop_r),
+                "daily_target_r": float(self._risk_cfg.daily_target_r),
+                "max_consec_losses": int(self._risk_cfg.max_consec_losses),
+                "cooldown_after_sl_s": int(self._risk_cfg.cooldown_after_sl_s),
+                "min_risk_usd_floor": float(getattr(self._risk_cfg, "min_risk_usd_floor", 0.0)),
+            }
+        except Exception:
+            risk_cfg = {}
+
+        # --- protection cfg (subset risk) ---
+        try:
+            protection_cfg = {
+                "daily_stop_r": float(self._risk_cfg.daily_stop_r),
+                "daily_target_r": float(self._risk_cfg.daily_target_r),
+                "max_consec_losses": int(self._risk_cfg.max_consec_losses),
+            }
+        except Exception:
+            protection_cfg = {}
+
+        # --- safety cfg ---
+        try:
+            safety_cfg = {
+                "max_spread_ticks": int(self._safety_cfg.max_spread_ticks),
+                "min_top5_liquidity_usd": float(self._safety_cfg.min_top5_liquidity_usd),
+                "skip_funding_minute": bool(self._safety_cfg.skip_funding_minute),
+                "skip_minute_zero": bool(self._safety_cfg.skip_minute_zero),
+                "min_liq_buffer_sl_mult": float(self._safety_cfg.min_liq_buffer_sl_mult),
+            }
+        except Exception:
+            safety_cfg = {}
+
+        # --- account cfg ---
+        try:
+            equity_now = float(
+                self._starting_equity_usd
+                + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0)
+            )
+        except Exception:
+            equity_now = float(self._starting_equity_usd)
+
+        account_cfg = {
+            "starting_equity_usd": float(self._starting_equity_usd),
+            "leverage": float(self._leverage),
+            "min_notional_usd": float(self._min_notional_usd),
+            "equity_now_usd": round(equity_now, 6),
         }
 
-        pnl_day_clean = {
-            k: (round(v, 6) if isinstance(v, float) else v)
-            for k, v in self._pnl_day.items()
-            if not k.endswith("_raw")
+        # --- day limits snapshot ---
+        try:
+            day_state = DayState(
+                pnl_r_day=float(pnl_day.get("pnl_r", 0.0) or 0.0),
+                consec_losses=int(self._consec_losses),
+                trading_disabled=False,
+            )
+            day_dec = check_day_limits(day_state, self._risk_cfg)
+            day_limits = {
+                "can_trade": bool(day_dec.allow),
+                "reasons": list(day_dec.reasons),
+            }
+        except Exception:
+            day_limits = {
+                "can_trade": True,
+                "reasons": [],
+            }
+
+        # --- exec cfg per symbol ---
+        exec_cfg: Dict[str, Dict[str, Any]] = {}
+        for s in symbols:
+            try:
+                c = self.execs[s].c
+                exec_cfg[s] = {
+                    "price_tick": float(c.price_tick),
+                    "qty_step": float(c.qty_step),
+                    "limit_offset_ticks": int(c.limit_offset_ticks),
+                    "limit_timeout_ms": int(c.limit_timeout_ms),
+                    "time_in_force": str(c.time_in_force),
+                    "poll_ms": int(c.poll_ms),
+                    "prefer_maker": bool(c.prefer_maker),
+                    "fee_bps_maker": float(c.fee_bps_maker),
+                    "fee_bps_taker": float(c.fee_bps_taker),
+                }
+            except Exception:
+                exec_cfg[s] = {}
+
+        # --- counters / блокировки ---
+        exec_counters = dict(self._exec_counters or {})
+        block_reasons = dict(self._block_reasons or {})
+
+        # --- strategy / auto ---
+        strategy_cfg = {
+            "cooldown_ms": int(self._auto_cooldown_ms),
+            "min_flat_ms": int(self._auto_min_flat_ms),
         }
 
         return {
@@ -1191,50 +1393,22 @@ class Worker:
             "ws_detail": ws_detail,
             "coal": coal_stats,
             "best": best,
-            "exec_cfg": exec_cfg,
             "history": history,
             "positions": positions,
             "unrealized": unrealized,
-            "exec_counters": dict(self._exec_counters),
-            "pnl_day": pnl_day_clean,
-            "trades": {s: list(self._trades.get(s, [])) for s in symbols},
-            "block_reasons": dict(self._block_reasons),
-            "risk_cfg": {
-                "risk_per_trade_pct": self._risk_cfg.risk_per_trade_pct,
-                "daily_stop_r": self._risk_cfg.daily_stop_r,
-                "daily_target_r": self._risk_cfg.daily_target_r,
-                "max_consec_losses": self._risk_cfg.max_consec_losses,
-                "cooldown_after_sl_s": self._risk_cfg.cooldown_after_sl_s,
-                "min_risk_usd_floor": getattr(self._risk_cfg, "min_risk_usd_floor", 0.0),
-            },
-            "protection_cfg": {
-                "daily_stop_r": self._risk_cfg.daily_stop_r,
-                "daily_target_r": self._risk_cfg.daily_target_r,
-                "max_consec_losses": self._risk_cfg.max_consec_losses,
-            },
-            "safety_cfg": {
-                "max_spread_ticks": self._safety_cfg.max_spread_ticks,
-                "min_top5_liquidity_usd": self._safety_cfg.min_top5_liquidity_usd,
-                "skip_funding_minute": self._safety_cfg.skip_funding_minute,
-                "skip_minute_zero": self._safety_cfg.skip_minute_zero,
-                "min_liq_buffer_sl_mult": self._safety_cfg.min_liq_buffer_sl_mult,
-            },
-            "consec_losses": self._consec_losses,
-            "account_cfg": {
-                "starting_equity_usd": self._starting_equity_usd,
-                "leverage": self._leverage,
-                "min_notional_usd": self._min_notional_usd,
-                "equity_now_usd": round(
-                    self._starting_equity_usd
-                    + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0),
-                    6,
-                ),
-            },
-            "auto_signal_enabled": self._auto_enabled,
-            "strategy_cfg": {
-                "cooldown_ms": self._auto_cooldown_ms,
-                "min_flat_ms": self._auto_min_flat_ms,
-            },
+            "exec_cfg": exec_cfg,
+            "exec_counters": exec_counters,
+            "pnl_day": pnl_day,
+            "trades": trades,
+            "block_reasons": block_reasons,
+            "risk_cfg": risk_cfg,
+            "protection_cfg": protection_cfg,
+            "safety_cfg": safety_cfg,
+            "consec_losses": int(self._consec_losses),
+            "account_cfg": account_cfg,
+            "auto_signal_enabled": bool(self._auto_enabled),
+            "strategy_cfg": strategy_cfg,
+            "day_limits": day_limits,
         }
 
     # ---------- utils / sizing / config loaders ----------
