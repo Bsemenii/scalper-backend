@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from collections import deque, deque as Deque
 
+from exec.fsm import PositionFSM
+from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
+
 from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
 from adapters.binance_rest import PaperAdapter
@@ -47,6 +50,7 @@ class SymbolSpec:
 
 class MarketHub:
     """Хранит последнюю лучшую пару bid/ask по символу (потокобезопасно)."""
+
     def __init__(self, symbols: List[str]) -> None:
         self._best: Dict[str, Tuple[float, float]] = {s: (0.0, 0.0) for s in symbols}
         self._lock = asyncio.Lock()
@@ -78,7 +82,7 @@ class Worker:
       WS (BinanceWS) -> Coalescer -> MarketHub(best bid/ask) -> Executors(per-symbol, paper)
     Плюс:
       - история тиков (deque per-symbol),
-      - FSM позиции per-symbol,
+      - FSM позиции per-symbol (PositionFSM),
       - SL/TP план + watchdog (таймаут и защита),
       - учёт сделок и дневной PnL (best-effort),
       - счётчики исполнения (для /metrics),
@@ -108,8 +112,8 @@ class Worker:
 
         # спецификации шагов (дефолты для перпов)
         self.specs: Dict[str, SymbolSpec] = {
-            "BTCUSDT": SymbolSpec("BTCUSDT", price_tick=0.1,   qty_step=0.001),
-            "ETHUSDT": SymbolSpec("ETHUSDT", price_tick=0.01,  qty_step=0.001),
+            "BTCUSDT": SymbolSpec("BTCUSDT", price_tick=0.1, qty_step=0.001),
+            "ETHUSDT": SymbolSpec("ETHUSDT", price_tick=0.01, qty_step=0.001),
             "SOLUSDT": SymbolSpec("SOLUSDT", price_tick=0.001, qty_step=0.1),
         }
         for s in self.symbols:
@@ -118,8 +122,10 @@ class Worker:
 
         # executors per symbol
         self.execs: Dict[str, Executor] = {}
+        # FSM per symbol
+        self._fsm: Dict[str, PositionFSM] = {s: PositionFSM() for s in self.symbols}
 
-        # FSM + мьютексы
+        # локи и рантайм-позиции
         self._locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in self.symbols}
         self._pos: Dict[str, PositionState] = {
             s: PositionState(
@@ -129,7 +135,7 @@ class Worker:
             for s in self.symbols
         }
 
-        # Исполнение: агрегированные счётчики (для /metrics)
+        # счётчики исполнения (для /metrics)
         self._exec_counters: Dict[str, int] = {
             "limit_total": 0,
             "market_total": 0,
@@ -456,7 +462,7 @@ class Worker:
         if not day_dec.allow:
             for r in day_dec.reasons:
                 self._inc_block_reason("day_" + r)
-            return {"ok": False, "reason": ",".join(["day_"+r for r in day_dec.reasons]), "symbol": symbol, "side": side}
+            return {"ok": False, "reason": ",".join(["day_" + r for r in day_dec.reasons]), "symbol": symbol, "side": side}
 
         lock = self._locks[symbol]
         async with lock:
@@ -495,7 +501,7 @@ class Worker:
     async def place_entry(self, symbol: str, side: Side, qty: float) -> Dict[str, Any]:
         """
         Прямой тестовый вход (обходит стратегии) + риск-фильтры + постановка SL/TP (paper-план).
-        FSM: FLAT -> ENTERING -> OPEN; таймаут -> EXITING -> FLAT.
+        FSM: FLAT -> ENTERING -> OPEN; таймаут/флаттен -> EXITING -> FLAT.
         Возвращает словарь с ключом "report" для совместимости с API.
         """
         symbol = symbol.upper()
@@ -514,7 +520,7 @@ class Worker:
         if not day_dec.allow:
             for r in day_dec.reasons:
                 self._inc_block_reason("day_" + r)
-            return {"ok": False, "reason": ",".join(["day_"+r for r in day_dec.reasons]), "symbol": symbol, "side": side, "qty": qty}
+            return {"ok": False, "reason": ",".join(["day_" + r for r in day_dec.reasons]), "symbol": symbol, "side": side, "qty": qty}
 
         lock = self._locks[symbol]
         async with lock:
@@ -538,7 +544,9 @@ class Worker:
                     self._inc_block_reason(r)
                 return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side, "qty": qty}
 
-            # ENTERING
+            # --- FSM: ENTERING ---
+            with contextlib.suppress(Exception):
+                await self._fsm[symbol].on_entering()
             pos.state = "ENTERING"
             pos.side = side
 
@@ -552,6 +560,8 @@ class Worker:
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
                 )
+                with contextlib.suppress(Exception):
+                    await self._fsm[symbol].on_flat()
                 return {
                     "symbol": symbol,
                     "side": side,
@@ -575,8 +585,12 @@ class Worker:
             sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
 
             plan: SLTPPlan = compute_sltp(
-                side=side, entry_px=entry_px, qty=qty_open,
-                price_tick=spec.price_tick, sl_distance_px=sl_distance_px, rr=1.8
+                side=side,
+                entry_px=entry_px,
+                qty=qty_open,
+                price_tick=spec.price_tick,
+                sl_distance_px=sl_distance_px,
+                rr=1.8,
             )
 
             post_dec = check_entry_safety(
@@ -593,10 +607,14 @@ class Worker:
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
                 )
+                with contextlib.suppress(Exception):
+                    await self._fsm[symbol].on_flat()
                 return {
                     "ok": False,
                     "reason": ",".join(post_dec.reasons),
-                    "symbol": symbol, "side": side, "qty": qty,
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
                     "report": {
                         "status": rep.status,
                         "filled_qty": rep.filled_qty,
@@ -609,11 +627,29 @@ class Worker:
                 }
 
             # === 4) открываем позицию ===
+            opened_ts_ms = self._now_ms()
             self._pos[symbol] = PositionState(
-                state="OPEN", side=side, qty=qty_open, entry_px=entry_px,
-                sl_px=plan.sl_px, tp_px=plan.tp_px, opened_ts_ms=self._now_ms(), timeout_ms=pos.timeout_ms
+                state="OPEN",
+                side=side,
+                qty=qty_open,
+                entry_px=entry_px,
+                sl_px=plan.sl_px,
+                tp_px=plan.tp_px,
+                opened_ts_ms=opened_ts_ms,
+                timeout_ms=pos.timeout_ms,
             )
             self._entry_steps[symbol] = list(rep.steps)
+
+            # --- FSM: OPEN (снапшот в БД через on_open) ---
+            with contextlib.suppress(Exception):
+                await self._fsm[symbol].on_open(
+                    entry_px=entry_px,
+                    qty=qty_open,
+                    sl=float(plan.sl_px) if plan.sl_px is not None else entry_px,
+                    tp=float(plan.tp_px) if plan.tp_px is not None else None,
+                    rr=1.8,
+                    opened_ts=opened_ts_ms,
+                )
 
             return {
                 "symbol": symbol,
@@ -662,6 +698,8 @@ class Worker:
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
                 )
+                with contextlib.suppress(Exception):
+                    await self._fsm[symbol].on_flat()
                 return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "no_open_position"}
             await self._paper_close(symbol, pos, reason="flatten_forced")
             return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "flatten_forced"}
@@ -672,8 +710,11 @@ class Worker:
         return {"ok": True, "symbol": symbol, "timeout_ms": self._pos[symbol].timeout_ms}
 
     async def _paper_close(self, sym: str, pos: PositionState, *, reason: str) -> None:
-        close_side: Side = "SELL" if pos.side == "BUY" else "BUY"
+        close_side: Side = "SELL" if (pos.side or "BUY") == "BUY" else "BUY"
         try:
+            with contextlib.suppress(Exception):
+                await self._fsm[sym].on_exiting()
+
             ex = self.execs[sym]
             rep: ExecutionReport = await ex.place_entry(sym, close_side, pos.qty)
             self._accumulate_exec_counters(rep.steps)
@@ -692,6 +733,8 @@ class Worker:
                 sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
             )
             self._entry_steps.pop(sym, None)
+            with contextlib.suppress(Exception):
+                await self._fsm[sym].on_flat()
 
     # ---------- учёт/PNL ----------
 
@@ -717,7 +760,7 @@ class Worker:
             pnl_risk_usd = max(1e-9, (float(pos.sl_px or entry) - entry) * qty)
 
         entry_bps = self._fee_bps_for_steps(entry_steps or [])
-        exit_bps  = self._fee_bps_for_steps(exit_steps or [])
+        exit_bps = self._fee_bps_for_steps(exit_steps or [])
         fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
 
         pnl_usd = pnl_usd_gross - fees_usd
@@ -749,7 +792,15 @@ class Worker:
 
         day = self._day_str()
         if self._pnl_day["day"] != day:
-            self._pnl_day = {"day": day, "trades": 0, "winrate": None, "avg_r": None, "pnl_r": 0.0, "pnl_usd": 0.0, "max_dd_r": None}
+            self._pnl_day = {
+                "day": day,
+                "trades": 0,
+                "winrate": None,
+                "avg_r": None,
+                "pnl_r": 0.0,
+                "pnl_usd": 0.0,
+                "max_dd_r": None,
+            }
             self._pnl_r_equity = 0.0
             self._consec_losses = 0
 
@@ -782,6 +833,69 @@ class Worker:
 
     # ---------- diag ----------
 
+    def _unrealized_snapshot(self) -> Dict[str, Any]:
+        """
+        Быстрый uPnL-снапшот (как в /pnl/now): по выходной стороне стакана и с вычетом taker-комиссии.
+        """
+    # подтянем bps аккуратно и дешево
+        taker_bps = 4.0
+        if get_settings:
+            try:
+                s = get_settings()
+                taker_bps = float(getattr(s.execution, "fee_bps_taker", taker_bps))
+            except Exception:
+                pass
+
+        total = 0.0
+        per_symbol: Dict[str, float] = {}
+        open_positions = 0
+
+        for sym, p in self.diag_positions().items():
+            if p.get("state") != "OPEN":
+                continue
+            open_positions += 1
+            side = p.get("side")
+            qty = float(p.get("qty") or 0.0)
+            entry = float(p.get("entry_px") or 0.0)
+            if qty <= 0.0 or entry <= 0.0 or not side:
+                continue
+
+            close_side: Side = "SELL" if side == "BUY" else "BUY"
+            exit_px = self._exit_price_conservative(sym, close_side, entry)
+            if exit_px <= 0.0:
+                continue
+
+            if side == "BUY":
+                pnl_gross = (exit_px - entry) * qty
+            else:
+                pnl_gross = (entry - exit_px) * qty
+
+            fee = exit_px * qty * (taker_bps / 10_000.0)
+            u = float(round(pnl_gross - fee, 6))
+            per_symbol[sym] = u
+            total += u
+        return {
+        "total_usd": float(round(total, 6)),
+        "per_symbol": per_symbol or None,
+        "open_positions": open_positions,}
+
+# Вспомогательное: отдаём positions как dict (без лишней математики)
+    def diag_positions(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            s: {
+                "state": self._pos[s].state,
+                "side": self._pos[s].side,
+                "qty": self._pos[s].qty,
+                "entry_px": self._pos[s].entry_px,
+                "sl_px": self._pos[s].sl_px,
+                "tp_px": self._pos[s].tp_px,
+                "opened_ts_ms": self._pos[s].opened_ts_ms,
+                "timeout_ms": self._pos[s].timeout_ms,
+        }
+            for s in self.symbols
+    }
+
+
     def diag(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
             "symbols": list(self.symbols),
@@ -803,7 +917,9 @@ class Worker:
                 s: {
                     "len": len(self._hist.get(s, [])),
                     "maxlen": self._history_maxlen,
-                    "latest_ts_ms": (self._hist[s][-1]["ts_ms"] if self._hist.get(s) and len(self._hist[s]) > 0 else 0),
+                    "latest_ts_ms": (
+                        self._hist[s][-1]["ts_ms"] if self._hist.get(s) and len(self._hist[s]) > 0 else 0
+                    ),
                 }
                 for s in self.symbols
             },
@@ -817,13 +933,16 @@ class Worker:
                     "tp_px": self._pos[s].tp_px,
                     "opened_ts_ms": self._pos[s].opened_ts_ms,
                     "timeout_ms": self._pos[s].timeout_ms,
+                    "positions": self.diag_positions(),
+                    "unrealized": self._unrealized_snapshot(),
                 }
                 for s in self.symbols
             },
             "exec_counters": dict(self._exec_counters),
             "pnl_day": {
                 k: (round(v, 6) if isinstance(v, float) else v)
-                for k, v in self._pnl_day.items() if not k.endswith("_raw")
+                for k, v in self._pnl_day.items()
+                if not k.endswith("_raw")
             },
             "trades": {s: list(self._trades.get(s, [])) for s in self.symbols},
             "block_reasons": dict(self._block_reasons),
@@ -849,12 +968,11 @@ class Worker:
                 "min_notional_usd": self._min_notional_usd,
                 "equity_now_usd": round(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0), 6),
             },
-        }
-        # авто-сигналы (новые поля)
-        d["auto_signal_enabled"] = self._auto_enabled
-        d["strategy_cfg"] = {
-            "cooldown_ms": self._auto_cooldown_ms,
-            "min_flat_ms": self._auto_min_flat_ms,
+            "auto_signal_enabled": self._auto_enabled,
+            "strategy_cfg": {
+                "cooldown_ms": self._auto_cooldown_ms,
+                "min_flat_ms": self._auto_min_flat_ms,
+            },
         }
         return d
 
@@ -898,41 +1016,88 @@ class Worker:
             except Exception:
                 pass
         return default
+    
+    def _exit_price_conservative(self, symbol: str, close_side: Side, entry_px: float) -> float:
+        """
+        Консервативная мгновенная цена выхода:
+        - если выходим SELL (закрываем long) — берём bid,
+        - если выходим BUY  (закрываем short) — берём ask,
+        фолбэки: mark_price -> mid(bid/ask) -> entry_px.
+        """
+        try:
+            bid, ask = self.hub.best_bid_ask(symbol)
+        except Exception:
+            bid, ask = 0.0, 0.0
+
+        px = 0.0
+        if close_side == "SELL" and bid > 0:
+            px = bid
+        elif close_side == "BUY" and ask > 0:
+            px = ask
+
+        if px <= 0.0:
+            try:
+                lt = self.latest_tick(symbol) or {}
+                mp = float(lt.get("mark_price") or 0.0)
+                if mp > 0:
+                    px = mp
+            except Exception:
+                pass
+
+        if px <= 0.0 and bid > 0 and ask > 0:
+            px = (bid + ask) / 2.0
+
+        if px <= 0.0:
+            px = float(entry_px or 0.0)
+
+        return float(px or 0.0)
+
 
     def _fee_bps_for_steps(self, steps: List[str]) -> float:
-        taker_like = any(s.startswith("market_") or s.startswith("limit_filled_immediate") for s in steps)
-        maker_bps = 1.0
-        taker_bps = 3.5
+        """
+        Выравниваем дефолты с app/status: maker=2.0 bps, taker=4.0 bps.
+        Если в steps есть market_* или limit_filled_immediate — считаем как taker.
+        """
+        taker_like = any(
+            s.startswith("market_") or s.startswith("limit_filled_immediate")
+            for s in (steps or [])
+        )
+        maker_bps = 2.0
+        taker_bps = 4.0
         if get_settings:
             try:
                 s = get_settings()
                 maker_bps = float(getattr(s.execution, "fee_bps_maker", maker_bps))
                 taker_bps = float(getattr(s.execution, "fee_bps_taker", taker_bps))
             except Exception:
-                pass
+                 pass
         return taker_bps if taker_like else maker_bps
-    
-        # --- strategy runtime api ---
+
+
+    # --- strategy runtime api (исправлено: без несуществующих приватных полей) ---
+
     @property
     def auto_signal_enabled(self) -> bool:
-        return self._auto_signal_enabled
+        return self._auto_enabled
 
     @property
     def strategy_cfg(self) -> Dict[str, int]:
-        return dict(self._strategy_cfg)
+        return {
+            "cooldown_ms": self._auto_cooldown_ms,
+            "min_flat_ms": self._auto_min_flat_ms,
+        }
 
     def set_strategy(self, *, enabled: bool, cooldown_ms: int, min_flat_ms: int) -> Dict[str, Any]:
         self._auto_enabled = bool(enabled)
         self._auto_cooldown_ms = max(0, int(cooldown_ms))
         self._auto_min_flat_ms = max(0, int(min_flat_ms))
         return {
-        "auto_signal_enabled": self._auto_enabled,
-        "strategy_cfg": {
-            "cooldown_ms": self._auto_cooldown_ms,
-            "min_flat_ms": self._auto_min_flat_ms,
-        },
-    }
-
+            "auto_signal_enabled": self._auto_enabled,
+            "strategy_cfg": {
+                "cooldown_ms": self._auto_cooldown_ms,
+                "min_flat_ms": self._auto_min_flat_ms,
+            },
+        }
 
     # --- sizing helpers ---
 
@@ -1046,7 +1211,8 @@ class Worker:
                 pass
         return default
 
-        # --- strategy cfg loader (robust: pydantic OR raw JSON fallback) ---
+    # --- strategy cfg loader (robust: pydantic OR raw JSON fallback) ---
+
     def _load_strategy_cfg(self) -> None:
         """
         Читает strategy.auto_* из get_settings(), а если модель их не знает — парсит raw JSON по source_path.
@@ -1062,13 +1228,6 @@ class Worker:
 
         def _apply_from_dict(d: Dict[str, Any]) -> None:
             nonlocal auto_enabled, auto_cd, auto_minflat
-            # нормализация ключей
-            keys = {k: k for k in d.keys()}
-            # camelCase -> snake_case map
-            if "autoSignalEnabled" in d: keys["autoSignalEnabled"] = "auto_signal_enabled"
-            if "autoCooldownMs" in d: keys["autoCooldownMs"] = "auto_cooldown_ms"
-            if "autoMinFlatMs" in d: keys["autoMinFlatMs"] = "auto_min_flat_ms"
-
             auto_enabled = bool(d.get("auto_signal_enabled", d.get("autoSignalEnabled", auto_enabled)))
             auto_cd = int(d.get("auto_cooldown_ms", d.get("autoCooldownMs", auto_cd)))
             auto_minflat = int(d.get("auto_min_flat_ms", d.get("autoMinFlatMs", auto_minflat)))
@@ -1083,7 +1242,6 @@ class Worker:
                     if isinstance(strat, dict):
                         _apply_from_dict(strat)
                     else:
-                        # pydantic-модель или объект с атрибутами
                         try:
                             if hasattr(strat, "dict"):
                                 _apply_from_dict(strat.dict())
@@ -1128,7 +1286,6 @@ class Worker:
                 "min_flat_ms": self._auto_min_flat_ms,
             },
         }
-
 
     # совместимость с /status фолбэком
     @property

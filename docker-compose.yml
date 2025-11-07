@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  scalper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-scalping-backend
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Warsaw
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8010/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 8
+    # если у провайдера странный DNS — раскомментируй:
+    # dns:
+    #   - 1.1.1.1
+    #   - 8.8.8.8
