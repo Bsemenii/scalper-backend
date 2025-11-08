@@ -1,89 +1,212 @@
 # strategy/candidates.py
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional, Literal
+from collections import deque
 
-from features.microstructure import MicroFeatureEngine
-from features.indicators import IndiEngine
+Side = Literal["BUY", "SELL"]
 
 
 @dataclass
 class Decision:
-    side: Optional[str]   # "BUY" | "SELL" | None
-    confidence: float     # 0..1
-    reason: str
+    """
+    Результат работы CandidateEngine.
+
+    side:
+      - "BUY"/"SELL" → есть сигнал
+      - None         → нет входа (reason объясняет почему)
+    kind:
+      - "momentum" / "reversion" / "none"
+    score:
+      - относительная сила сигнала (>=1.0 → достаточно сильный)
+    reason:
+      - короткое текстовое объяснение (идёт в block_reasons через Worker)
+    """
+    side: Optional[Side]
+    kind: str = "none"
+    score: float = 0.0
+    reason: str = "no_signal"
 
 
 class CandidateEngine:
     """
-    Лёгкий, быстрый генератор сигналов по последнему тіку.
-    Правила (минимальный, но боевой набор):
-      - спред <= 3 тика
-      - достаточная верхняя ликвидность (минимум ~$300k)
-      - Momentum: OBI > +t и EMA-слайп вверх → BUY; OBI < -t и EMA-вниз → SELL
-      - Reversion: BB_Z < -z → отскок BUY; BB_Z > +z → отскок SELL
-    Возвращает один кандидат с причиной и уверенностью.
+    Лёгкий генератор сигналов для авто-стратегии.
+
+    Идея:
+      - используем только то, что уже есть в Worker: mid-price, spread, bid/ask size.
+      - два типа сигналов:
+          1) momentum: пробой + поддержка со стороны OBI
+          2) reversion: откат от локального экстремума + контр-OBI
+      - сильно фильтруем:
+          - warmup: ждём пока накопится история
+          - max spread по тиковой сетке
+          - слабый OBI → нет входа
+          - score < 1.0 → нет входа (сигнал недостаточно сильный)
+      - частоту входов сверху контролирует сам Worker через cooldown/min_flat.
     """
 
     def __init__(
         self,
         price_tick: float,
-        top_liq_threshold_usd: float = 300_000.0,
-        obi_t: float = 0.12,
-        bb_z_abs: float = 2.0,
+        max_history: int = 256,
+        mom_lookback: int = 6,
+        mom_thr_ticks: float = 5.0,
+        rev_window: int = 48,
+        rev_thr_ticks: float = 8.0,
+        obi_mom_thr: float = 0.35,
+        obi_rev_thr: float = 0.30,
+        spread_max_ticks: float = 6.0,
     ) -> None:
-        self.price_tick = max(price_tick, 1e-9)
-        self.top_liq_threshold_usd = float(top_liq_threshold_usd)
-        self.obi_t = float(obi_t)
-        self.bb_z_abs = float(bb_z_abs)
+        self.price_tick = max(float(price_tick), 1e-6)
 
-        # пер-символьные движки
-        self._micro = MicroFeatureEngine(tick_size=self.price_tick, lot_usd=10_000.0)
-        self._indi = IndiEngine(price_step=self.price_tick)
+        self.max_history = int(max_history)
 
-        # последняя диагностика
-        self._last: Dict[str, float] = {}
+        # momentum
+        self.mom_lookback = int(mom_lookback)
+        self.mom_thr_ticks = float(mom_thr_ticks)
+        self.obi_mom_thr = float(obi_mom_thr)
+
+        # reversion
+        self.rev_window = int(rev_window)
+        self.rev_thr_ticks = float(rev_thr_ticks)
+        self.obi_rev_thr = float(obi_rev_thr)
+
+        # spread guard
+        self.spread_max_ticks = float(spread_max_ticks)
+
+        self._mid = deque(maxlen=self.max_history)
+        self._bid_sz = deque(maxlen=self.max_history)
+        self._ask_sz = deque(maxlen=self.max_history)
+
+    # ---- helpers ----
+
+    def _spread_ticks(self, bid: float, ask: float) -> float:
+        if bid > 0.0 and ask > 0.0:
+            return max(0.0, (ask - bid) / self.price_tick)
+        return 0.0
+
+    def _obi(self, bid_sz: float, ask_sz: float) -> float:
+        b = max(bid_sz, 0.0)
+        a = max(ask_sz, 0.0)
+        s = b + a
+        if s <= 0.0:
+            return 0.0
+        v = (b - a) / s
+        # слегка подрежем фантазию
+        return max(-1.0, min(1.0, v))
+
+    # ---- core ----
 
     def update(
         self,
-        *,
         price: float,
         bid: float,
         ask: float,
         bid_sz: float,
         ask_sz: float,
     ) -> Decision:
-        now = int(time.time() * 1000)
+        # 1) mid price
+        mid = 0.0
+        if bid > 0.0 and ask > 0.0:
+            mid = 0.5 * (bid + ask)
+        elif price > 0.0:
+            mid = float(price)
 
-        # обновляем микроструктуру и индикаторы
-        m = self._micro.update(price=price, bid=bid, ask=ask, bid_sz=bid_sz, ask_sz=ask_sz)
-        i = self._indi.update(price=price)
+        if mid <= 0.0:
+            return Decision(side=None, kind="none", score=0.0, reason="no_price")
 
-        # быстрые отсеки (спред и верхняя ликвидность)
-        if m.spread_ticks is not None and m.spread_ticks > 3:
-            return Decision(None, 0.0, f"skip:spread>{m.spread_ticks:.1f}t")
+        # 2) обновляем историю
+        self._mid.append(mid)
+        self._bid_sz.append(max(bid_sz, 0.0))
+        self._ask_sz.append(max(ask_sz, 0.0))
 
-        if m.top_liq_usd is not None and m.top_liq_usd < self.top_liq_threshold_usd:
-            return Decision(None, 0.0, f"skip:topliq<{int(m.top_liq_usd)}")
+        min_hist = max(self.mom_lookback + 1, self.rev_window // 2)
+        if len(self._mid) < min_hist:
+            return Decision(side=None, kind="none", score=0.0, reason="warmup")
 
-        # Momentum
-        if m.obi is not None and i.ema_slope_ticks is not None:
-            if m.obi >= +self.obi_t and i.ema_slope_ticks > 0:
-                conf = min(1.0, 0.5 + 0.5 * min(1.0, (m.obi - self.obi_t) / self.obi_t))
-                return Decision("BUY", conf, f"mom:obi={m.obi:.2f},ema_slope={i.ema_slope_ticks:.1f}t")
-            if m.obi <= -self.obi_t and i.ema_slope_ticks < 0:
-                conf = min(1.0, 0.5 + 0.5 * min(1.0, (-m.obi - self.obi_t) / self.obi_t))
-                return Decision("SELL", conf, f"mom:obi={m.obi:.2f},ema_slope={i.ema_slope_ticks:.1f}t")
+        # 3) spread guard — не торгуем широкий спред
+        spread_t = self._spread_ticks(bid, ask)
+        if spread_t > self.spread_max_ticks:
+            return Decision(
+                side=None,
+                kind="none",
+                score=0.0,
+                reason=f"spread>{self.spread_max_ticks:.1f}t",
+            )
 
-        # Reversion
-        if i.bb_z is not None:
-            if i.bb_z <= -self.bb_z_abs:
-                conf = min(1.0, (self.bb_z_abs - max(-self.bb_z_abs, i.bb_z)) / self.bb_z_abs)
-                return Decision("BUY", conf, f"rev:bb_z={i.bb_z:.2f}")
-            if i.bb_z >= +self.bb_z_abs:
-                conf = min(1.0, (i.bb_z - self.bb_z_abs) / self.bb_z_abs)
-                return Decision("SELL", conf, f"rev:bb_z={i.bb_z:.2f}")
+        # 4) текущий OBI
+        obi = self._obi(bid_sz, ask_sz)
 
-        return Decision(None, 0.0, "skip:no_rule")
+        # 5) Momentum-сигнал
+        mom_side: Optional[Side] = None
+        mom_score = 0.0
+        if len(self._mid) > self.mom_lookback:
+            base = self._mid[-1 - self.mom_lookback]
+            if base > 0.0:
+                move_ticks = (mid - base) / self.price_tick
+
+                # ап-тренд + перевес по бид-сайзу → BUY
+                if move_ticks >= self.mom_thr_ticks and obi >= self.obi_mom_thr:
+                    mom_side = "BUY"
+                    mom_score = (move_ticks / self.mom_thr_ticks) * (
+                        max(0.0, obi) / max(self.obi_mom_thr, 1e-9)
+                    )
+
+                # даун-тренд + перевес по аск-сайзу → SELL
+                elif move_ticks <= -self.mom_thr_ticks and obi <= -self.obi_mom_thr:
+                    mom_side = "SELL"
+                    mom_score = (abs(move_ticks) / self.mom_thr_ticks) * (
+                        max(0.0, -obi) / max(self.obi_mom_thr, 1e-9)
+                    )
+
+        # 6) Reversion-сигнал (откат от локального экстремума к среднему)
+        rev_side: Optional[Side] = None
+        rev_score = 0.0
+        if len(self._mid) >= self.rev_window:
+            window = list(self._mid)[-self.rev_window:]
+            mean = sum(window) / len(window)
+            dev_ticks = (mid - mean) / self.price_tick
+
+            # цена перекуплена + продавец доминирует → шорт
+            if dev_ticks >= self.rev_thr_ticks and obi <= -self.obi_rev_thr:
+                rev_side = "SELL"
+                rev_score = (dev_ticks / self.rev_thr_ticks) * (
+                    max(0.0, -obi) / max(self.obi_rev_thr, 1e-9)
+                )
+
+            # цена перепродана + покупатель доминирует → лонг
+            elif dev_ticks <= -self.rev_thr_ticks and obi >= self.obi_rev_thr:
+                rev_side = "BUY"
+                rev_score = (abs(dev_ticks) / self.rev_thr_ticks) * (
+                    max(0.0, obi) / max(self.obi_rev_thr, 1e-9)
+                )
+
+        # 7) Выбор лучшего сигнала
+        best_side: Optional[Side] = None
+        best_kind = "none"
+        best_score = 0.0
+        best_reason = "no_signal"
+
+        # Требуем score >= 1.0, чтобы не стрелять из каждого чиха.
+        if mom_side and mom_score >= 1.0 and mom_score >= rev_score:
+            best_side = mom_side
+            best_kind = "momentum"
+            best_score = float(mom_score)
+            best_reason = f"momentum_{mom_side.lower()}_{mom_score:.2f}"
+
+        elif rev_side and rev_score >= 1.0 and rev_score > mom_score:
+            best_side = rev_side
+            best_kind = "reversion"
+            best_score = float(rev_score)
+            best_reason = f"reversion_{rev_side.lower()}_{rev_score:.2f}"
+
+        if not best_side:
+            return Decision(side=None, kind="none", score=0.0, reason=best_reason)
+
+        return Decision(
+            side=best_side,
+            kind=best_kind,
+            score=best_score,
+            reason=best_reason,
+        )

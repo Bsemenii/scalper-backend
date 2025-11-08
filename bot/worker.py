@@ -442,6 +442,31 @@ class Worker:
 
                     side: Side = "BUY" if side_raw == "BUY" else "SELL"
 
+                                        # 2.6. (новое) Если движок даёт score/confidence — отсекаем слабые сигналы.
+                    score = getattr(dec, "score", getattr(dec, "confidence", None))
+                    if score is not None:
+                        try:
+                            if float(score) < 0.55:
+                                self._inc_block_reason(f"{sym}:skip_low_score")
+                                continue
+                        except Exception:
+                            pass
+
+                    # 2.7. (новое) Фильтр по локальной волатильности:
+                    spec = self.specs.get(sym)
+                    if spec is not None:
+                        vol_px = self._recent_volatility(sym, window_ms=60_000)
+                        if vol_px > 0.0:
+                            min_vol = spec.price_tick * 8.0      # не торгуем совсем мёртвый рынок
+                            max_vol = spec.price_tick * 400.0    # и не лезем в жесткий разнос
+                            if vol_px < min_vol:
+                                self._inc_block_reason(f"{sym}:skip_low_vol")
+                                continue
+                            if vol_px > max_vol:
+                                self._inc_block_reason(f"{sym}:skip_high_vol")
+                                continue
+
+
                     # 2.6. Safety перед входом (спред, время, базовые фильтры)
                     bid, ask = self.hub.best_bid_ask(sym)
                     spec = self.specs.get(sym)
@@ -485,6 +510,40 @@ class Worker:
             return
         except Exception:
             logger.exception("strategy loop error")
+    
+    def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
+        """
+        Унифицированный расчёт SL-дистанции:
+        - минимум из execution.min_stop_ticks,
+        - не уже спреда (>= 1 тик),
+        - плюс адаптация к локальной волатильности (доля σ за 60с).
+        """
+        spec = self.specs[symbol]
+        tick = float(spec.price_tick)
+
+        # базовый минимум из конфига
+        base_min = self._min_stop_ticks_default() * tick
+
+        # от спреда
+        spread_px = 0.0
+        if tick > 0.0 and spread_ticks > 0.0:
+            spread_px = max(spread_ticks, 1.0) * tick
+
+        # от волатильности за минуту
+        vol_px = 0.0
+        try:
+            vol_last_60s = self._recent_volatility(symbol, window_ms=60_000)
+            if vol_last_60s > 0.0:
+                # Берём мягко: 0.35σ, но не меньше 1 тика.
+                vol_px = max(tick, 0.35 * float(vol_last_60s))
+        except Exception:
+            vol_px = 0.0
+
+        sl_px = max(base_min, spread_px, vol_px)
+        if sl_px <= 0.0:
+            sl_px = base_min if base_min > 0.0 else tick
+
+        return float(sl_px)
 
     # ---------- public ops ----------
 
@@ -555,9 +614,7 @@ class Worker:
                 return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side}
 
             # оценим SL-дистанцию как в обычном входе
-            min_stop_ticks = self._min_stop_ticks_default()
-            sl_distance_px = max(min_stop_ticks * spec.price_tick, max(spread_ticks, 1.0) * spec.price_tick)
-
+            sl_distance_px = self._compute_sl_distance_px(symbol, spread_ticks)
             qty = self._compute_auto_qty(symbol, side, sl_distance_px)
             if qty <= 0.0:
                 self._inc_block_reason("qty_too_small")
@@ -698,11 +755,7 @@ class Worker:
             if bid > 0 and ask > 0 and spec.price_tick > 0:
                 spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
-            min_stop_ticks = self._min_stop_ticks_default()
-            sl_distance_px = max(
-                min_stop_ticks * spec.price_tick,
-                max(spread_ticks, 1.0) * spec.price_tick,
-            )
+            sl_distance_px = self._compute_sl_distance_px(symbol, spread_ticks)
 
             plan: SLTPPlan = compute_sltp(
                 side=side,
@@ -887,9 +940,11 @@ class Worker:
                     state="FLAT", side=None, qty=0.0, entry_px=0.0,
                     sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=pos.timeout_ms
                 )
+                self._last_flat_ms[symbol] = self._now_ms()
                 with contextlib.suppress(Exception):
                     await self._fsm[symbol].on_flat()
                 return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "no_open_position"}
+
             await self._paper_close(symbol, pos, reason="flatten_forced")
             return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "flatten_forced"}
 
@@ -905,18 +960,18 @@ class Worker:
         Правила:
         - Для sl_hit / tp_hit выходим по уровню SL/TP (строго, без переоценки в -30R).
         - Для flatten/timeout/no_protection — по консервативной рыночной цене.
-        - Executor.place_exit используем только для получения steps/аудита, но не даём ему ломать цену SL/TP.
-        - В любом случае в конце приводим состояние к FLAT.
+        - Executor.place_exit используем только для получения steps/аудита,
+          но не даём ему ломать целевой уровень SL/TP.
+        - В любом случае в конце приводим состояние к FLAT и обновляем last_flat_ms.
         """
         side = pos.side
         qty = float(pos.qty or 0.0)
         entry_px = float(pos.entry_px or 0.0)
         sl_px = float(pos.sl_px) if pos.sl_px is not None else None
         tp_px = float(pos.tp_px) if pos.tp_px is not None else None
-        opened_ts_ms = int(pos.opened_ts_ms or 0)
         timeout_ms = int(pos.timeout_ms or 180_000)
 
-        # Если по факту позиции нет — просто FLAT
+        # Если по факту позиции нет — просто приводим к FLAT.
         if qty <= 0.0 or not side or entry_px <= 0.0:
             self._pos[sym] = PositionState(
                 state="FLAT",
@@ -929,13 +984,14 @@ class Worker:
                 timeout_ms=timeout_ms,
             )
             self._entry_steps.pop(sym, None)
+            self._last_flat_ms[sym] = self._now_ms()
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_flat()
             return
 
         close_side: Side = "SELL" if side == "BUY" else "BUY"
 
-        # Целевой уровень для SL/TP
+        # Целевой уровень для SL/TP (только для sl_hit / tp_hit).
         level_px: Optional[float] = None
         if reason == "sl_hit" and sl_px is not None:
             level_px = sl_px
@@ -943,34 +999,36 @@ class Worker:
             level_px = tp_px
 
         exit_px: Optional[float] = None
-        exit_steps: Optional[list[str]] = None
+        exit_steps: List[str] = []
 
         try:
+            # FSM: переходим в EXITING (best-effort)
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_exiting()
 
             ex = self.execs.get(sym)
 
-            # --- 1) Попробуем формально вызвать Executor (reduce_only), чтобы получить steps ---
+            # 1) Пытаемся формально вызвать Executor.place_exit (reduce_only) ради steps/аудита.
             if ex is not None:
                 try:
                     rep: ExecutionReport = await ex.place_exit(sym, close_side, qty)
                     self._accumulate_exec_counters(rep.steps)
                     exit_steps = list(rep.steps or [])
                 except Exception:
-                    # не роняем закрытие, просто падаем в fallback
+                    # Не роняем закрытие, просто помечаем.
                     exit_steps = ["exec_exit_error"]
 
-            # --- 2) Определяем финальную цену выхода ---
+            # 2) Определяем финальную цену выхода.
             if level_px is not None:
-                # Для sl_hit / tp_hit в paper-режиме ЖЁСТКО закрываем по плановому уровню.
+                # Для sl_hit/tp_hit в paper-режиме ЖЁСТКО используем плановый уровень.
                 exit_px = float(level_px)
             else:
-                # Для остальных причин берём честную консервативную цену.
+                # Для остальных причин (timeout, flatten, no_protection, etc.)
+                # берём консервативную доступную цену.
                 exit_px = self._exit_price_conservative(sym, close_side, entry_px)
 
-            # --- 3) Регистрируем трейд, если цена вменяемая ---
-            if exit_px and exit_px > 0.0:
+            # 3) Регистрируем трейд, если цена вменяема.
+            if exit_px is not None and exit_px > 0.0:
                 entry_steps = self._entry_steps.get(sym, [])
                 trade = self._build_trade_record(
                     sym,
@@ -978,13 +1036,14 @@ class Worker:
                     float(exit_px),
                     reason=reason,
                     entry_steps=entry_steps,
-                    exit_steps=exit_steps,
+                    exit_steps=exit_steps or None,
                 )
                 self._register_trade(trade)
+                # Фоновая пересборка истории (если есть хранилище).
                 asyncio.create_task(self._rebuild_trades_safe())
 
         finally:
-            # --- 4) Всегда приводим к FLAT ---
+            # 4) Всегда приводим состояние к FLAT и фиксируем момент FLAT для анти-спама.
             self._pos[sym] = PositionState(
                 state="FLAT",
                 side=None,
@@ -996,6 +1055,7 @@ class Worker:
                 timeout_ms=timeout_ms,
             )
             self._entry_steps.pop(sym, None)
+            self._last_flat_ms[sym] = self._now_ms()
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_flat()
 
@@ -1441,6 +1501,52 @@ class Worker:
             await asyncio.to_thread(rebuild_trades)
         except Exception as e:
             logger.warning("rebuild_trades failed: %s", e)
+
+
+    def _recent_volatility(self, symbol: str, window_ms: int = 60_000) -> float:
+        """
+        Простейшая оценка волатильности по тикам за окно:
+        stddev(last_trade_price) за window_ms.
+        Используется только для калибровки SL и фильтра сигналов.
+        """
+        sym = symbol.upper()
+        dq = self._hist.get(sym)
+        if not dq:
+            return 0.0
+
+        now = self._now_ms()
+        prices: List[float] = []
+
+        # идём с конца, пока тики в окне
+        for t in reversed(dq):
+            try:
+                ts = int(t.get("ts_ms", 0))
+            except Exception:
+                continue
+            if ts <= 0 or now - ts > window_ms:
+                break
+
+            try:
+                p = float(t.get("price") or 0.0)
+            except Exception:
+                p = 0.0
+            if p > 0.0:
+                prices.append(p)
+
+        n = len(prices)
+        if n < 4:
+            return 0.0
+
+        mean = sum(prices) / n
+        var = 0.0
+        for p in prices:
+            diff = p - mean
+            var += diff * diff
+        var /= (n - 1)
+        if var <= 0.0:
+            return 0.0
+
+        return float(var ** 0.5)
     
     def _accumulate_exec_counters(self, steps: Optional[List[str]]) -> None:
         if not steps:
