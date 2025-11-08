@@ -17,7 +17,18 @@ from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
 from adapters.binance_rest import PaperAdapter
 from exec.executor import Executor, ExecCfg, ExecutionReport
-from exec.sltp import compute_sltp, SLTPPlan  # план цен SL/TP (paper)
+from exec.sltp import compute_sltp_adaptive, SLTPPlan  # план цен SL/TP (paper)
+# фичи микроструктуры/индикаторов — опциональны:
+# если модулей нет, воркер всё равно должен стартовать.
+try:
+    from features.microstructure import MicroFeatureEngine  # type: ignore
+except Exception:
+    MicroFeatureEngine = None  # type: ignore
+
+try:
+    from features.indicators import IndiEngine  # type: ignore
+except Exception:
+    IndiEngine = None  # type: ignore
 
 # риск-фильтры
 from risk.filters import (
@@ -158,6 +169,9 @@ class Worker:
         self._pnl_r_equity: float = 0.0
         self._consec_losses: int = 0
 
+        # ts последнего стоп-лосса (для локального cooldown_after_sl_s)
+        self._last_sl_ts_ms: int = 0
+
         # причины блокировок входа
         self._block_reasons: Dict[str, int] = {}
 
@@ -185,6 +199,12 @@ class Worker:
 
         # движок кандидатов (если используешь)
         self._cand: Dict[str, CandidateEngine] = {}
+
+        # фичи микроструктуры и индикаторов per-symbol
+        self._micro_eng: Dict[str, MicroFeatureEngine] = {}
+        self._indi_eng: Dict[str, IndiEngine] = {}
+        self._last_micro: Dict[str, Dict[str, Any]] = {}
+        self._last_indi: Dict[str, Dict[str, Any]] = {}
 
         # подгрузка начальных значений из settings.strategy
         self._load_strategy_cfg()
@@ -266,7 +286,16 @@ class Worker:
             adapter = PaperAdapter(_best, max_slippage_bp=max_slippage_bp)
             self.execs[sym] = Executor(adapter=adapter, cfg=cfg, get_best=_best)
 
+            # стратегия и фичи по символу
             self._cand[sym] = CandidateEngine(price_tick=spec.price_tick)
+
+            if MicroFeatureEngine is not None:
+                self._micro_eng[sym] = MicroFeatureEngine(
+                    tick_size=spec.price_tick,
+                    lot_usd=50_000.0,  # можно вынести в конфиг
+                )
+            if IndiEngine is not None:
+                self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
         # запускаем потоки
         await self.ws.connect(self._on_ws_raw)
@@ -339,37 +368,71 @@ class Worker:
         if pos.state == "FLAT":
             self._last_flat_ms[tick.symbol] = tick.ts_ms
 
-        # (здесь позже может быть enrichment для фич, если потребуется)
+        # обогащаем микроструктурой и индикаторами (best-effort)
+        try:
+            me = self._micro_eng.get(tick.symbol)
+            ie = self._indi_eng.get(tick.symbol)
+
+            if me is not None:
+                mf = me.update(
+                    price=float(tick.price or 0.0),
+                    bid=float(tick.bid or 0.0),
+                    ask=float(tick.ask or 0.0),
+                    bid_sz=float(tick.bid_size or 0.0),
+                    ask_sz=float(tick.ask_size or 0.0),
+                )
+                self._last_micro[tick.symbol] = {
+                    "spread_ticks": float(mf.spread_ticks),
+                    "mid": float(mf.mid),
+                    "top_liq_usd": float(mf.top_liq_usd),
+                    "microprice_drift": float(mf.microprice_drift),
+                    "tick_velocity": float(mf.tick_velocity) if mf.tick_velocity is not None else None,
+                    "obi": float(mf.obi),
+                }
+
+            if ie is not None:
+                ii = ie.update(price=float(tick.price or 0.0))
+                self._last_indi[tick.symbol] = {
+                    "ema9": float(ii.ema9),
+                    "ema21": float(ii.ema21),
+                    "ema_slope_ticks": float(ii.ema_slope_ticks),
+                    "vwap_drift": float(ii.vwap_drift),
+                    "bb_z": float(ii.bb_z),
+                    "rsi": float(ii.rsi),
+                    "realized_vol_bp": float(ii.realized_vol_bp),
+                }
+        except Exception:
+            # индикаторы не критичны — не роняем пайплайн
+            pass
 
     # ---------- strategy loop (авто-сигналы) ----------
 
     async def _strategy_loop(self) -> None:
         """
-        Лёгкий авто-ордеринг поверх CandidateEngine.
+        Авто-ордеринг поверх CandidateEngine.
 
-        Принципы:
-        - работаем ТОЛЬКО если _auto_enabled = True;
-        - дневные лимиты проверяем один раз на цикл;
-        - по символу входим только из FLAT;
-        - соблюдаем cooldown и min_flat;
-        - используем только свежие тики;
-        - кандидат → check_entry_safety → place_entry_auto (единый пайплайн);
-        - все фейлы логируем в _block_reasons (для /debug/diag);
-        - не роняем цикл ни при каких исключениях.
+        Логика:
+        - дневные лимиты + cooldown после SL;
+        - только FLAT;
+        - свежий тик;
+        - Decision от CandidateEngine (side, score);
+        - при наличии фич: лёгкая фильтрация по EMA/RSI;
+        - фильтр по волатильности;
+        - pre-safety (spread и т.п.);
+        - вход через place_entry_auto(...) с передачей micro/indi в адаптивный SL/TP.
         """
-        tick_stale_ms = 2500  # максимум "возраст" тика для авто-входа (ms)
+        tick_stale_ms = 2500
 
         try:
             while True:
-                await asyncio.sleep(0.12)  # ~8 Гц опроса
+                await asyncio.sleep(0.12)
 
                 if not self._auto_enabled:
                     continue
 
                 now = self._now_ms()
 
-                # ---- 1) Дневные лимиты (общие) ----
-                day_dec = None
+                # 1) Дневные лимиты
                 try:
                     day_state = DayState(
                         pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
@@ -378,45 +441,55 @@ class Worker:
                     )
                     day_dec = check_day_limits(day_state, self._risk_cfg)
                 except Exception:
-                    # если фильтр сломался — не блокируем торговлю целиком, но помечаем
+                    day_dec = None
                     self._inc_block_reason("day_limits_error")
 
                 if day_dec is not None and not day_dec.allow:
                     for r in (day_dec.reasons or []):
                         self._inc_block_reason("day_" + str(r))
-                    # дневной стоп: выходим из цикла итерации, ждём следующего тика/дня
                     continue
 
-                # ---- 2) Перебор символов ----
+                # 1.b Cooldown после SL
+                try:
+                    cd_s = int(getattr(self._risk_cfg, "cooldown_after_sl_s", 0) or 0)
+                except Exception:
+                    cd_s = 0
+
+                if cd_s > 0 and self._last_sl_ts_ms > 0:
+                    if now - self._last_sl_ts_ms < cd_s * 1000:
+                        self._inc_block_reason("day_cooldown_required")
+                        continue
+
+                # 2) Перебор символов
                 for sym in self.symbols:
                     pos = self._pos[sym]
-
-                    # 2.1. Только из FLAT
                     if pos.state != "FLAT":
                         continue
 
-                    # 2.2. Anti-spam: cooldown между сигналами
-                    last_sig = int(self._last_signal_ms.get(sym, 0))
-                    if now - last_sig < int(self._auto_cooldown_ms):
+                    # cooldown между сигналами
+                    if now - int(self._last_signal_ms.get(sym, 0)) < int(self._auto_cooldown_ms):
                         continue
 
-                    # 2.3. Минимальное FLAT-время после предыдущей позиции
-                    last_flat = int(self._last_flat_ms.get(sym, 0))
-                    if now - last_flat < int(self._auto_min_flat_ms):
+                    # мин. FLAT-время
+                    if now - int(self._last_flat_ms.get(sym, 0)) < int(self._auto_min_flat_ms):
                         continue
 
-                    # 2.4. Свежий тик
+                    # свежий тик
                     last = self.latest_tick(sym)
                     if not last:
                         self._inc_block_reason(f"{sym}:no_tick")
                         continue
 
                     ts_ms = int(last.get("ts_ms") or 0)
-                    if ts_ms > 0 and now - ts_ms > tick_stale_ms:
+                    if ts_ms <= 0 or now - ts_ms > tick_stale_ms:
                         self._inc_block_reason(f"{sym}:stale_tick")
                         continue
 
-                    # 2.5. Кандидат от стратегии
+                    # фичи
+                    micro_feat = self._last_micro.get(sym, {}) or {}
+                    indi_feat = self._last_indi.get(sym, {}) or {}
+
+                    # кандидат от CE
                     ce = self._cand.get(sym)
                     if not ce:
                         self._inc_block_reason(f"{sym}:no_candidate_engine")
@@ -442,23 +515,40 @@ class Worker:
 
                     side: Side = "BUY" if side_raw == "BUY" else "SELL"
 
-                                        # 2.6. (новое) Если движок даёт score/confidence — отсекаем слабые сигналы.
-                    score = getattr(dec, "score", getattr(dec, "confidence", None))
-                    if score is not None:
-                        try:
-                            if float(score) < 0.55:
-                                self._inc_block_reason(f"{sym}:skip_low_score")
-                                continue
-                        except Exception:
-                            pass
+                    # сила сигнала: отсекаем совсем слабые
+                    score = float(getattr(dec, "score", 0.0) or 0.0)
+                    if score < 1.0:
+                        self._inc_block_reason(f"{sym}:skip_low_score")
+                        continue
 
-                    # 2.7. (новое) Фильтр по локальной волатильности:
+                    # лёгкий конфирм от индикаторов, если есть
+                    if indi_feat:
+                        ema9 = indi_feat.get("ema9")
+                        ema21 = indi_feat.get("ema21")
+                        rsi = indi_feat.get("rsi")
+
+                        if side == "BUY":
+                            if ema9 is not None and ema21 is not None and ema9 < ema21:
+                                self._inc_block_reason(f"{sym}:skip_ema_buy")
+                                continue
+                            if rsi is not None and rsi < 45:
+                                self._inc_block_reason(f"{sym}:skip_rsi_buy")
+                                continue
+                        else:  # SELL
+                            if ema9 is not None and ema21 is not None and ema9 > ema21:
+                                self._inc_block_reason(f"{sym}:skip_ema_sell")
+                                continue
+                            if rsi is not None and rsi > 55:
+                                self._inc_block_reason(f"{sym}:skip_rsi_sell")
+                                continue
+
+                    # волатильность (не трейдим в болоте/адском разлёте)
                     spec = self.specs.get(sym)
                     if spec is not None:
                         vol_px = self._recent_volatility(sym, window_ms=60_000)
                         if vol_px > 0.0:
-                            min_vol = spec.price_tick * 8.0      # не торгуем совсем мёртвый рынок
-                            max_vol = spec.price_tick * 400.0    # и не лезем в жесткий разнос
+                            min_vol = spec.price_tick * 8.0
+                            max_vol = spec.price_tick * 400.0
                             if vol_px < min_vol:
                                 self._inc_block_reason(f"{sym}:skip_low_vol")
                                 continue
@@ -466,26 +556,18 @@ class Worker:
                                 self._inc_block_reason(f"{sym}:skip_high_vol")
                                 continue
 
-
-                    # 2.6. Safety перед входом (спред, время, базовые фильтры)
+                    # pre-safety
                     bid, ask = self.hub.best_bid_ask(sym)
-                    spec = self.specs.get(sym)
                     spread_ticks = 0.0
                     if spec and bid > 0 and ask > 0 and spec.price_tick > 0:
                         spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
-                    micro = MicroCtx(
-                        spread_ticks=spread_ticks,
-                        top5_liq_usd=1e12,  # для paper MVP считаем ликвидность достаточной
-                    )
-                    tctx = TimeCtx(
-                        ts_ms=now,
-                        server_time_offset_ms=self._server_time_offset_ms,
-                    )
+                    mctx = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
+                    tctx = TimeCtx(ts_ms=now, server_time_offset_ms=self._server_time_offset_ms)
 
                     pre_dec = check_entry_safety(
                         side,
-                        micro=micro,
+                        micro=mctx,
                         time_ctx=tctx,
                         pos_ctx=None,
                         safety=self._safety_cfg,
@@ -495,56 +577,66 @@ class Worker:
                             self._inc_block_reason(f"{sym}:{r}")
                         continue
 
-                    # 2.7. Унифицированный авто-вход (risk sizing + SL/TP внутри)
-                    rep = await self.place_entry_auto(sym, side)
+                    # авто-вход с контекстом для адаптивного SL/TP
+                    rep = await self.place_entry_auto(
+                        sym,
+                        side,
+                        decision=dec,
+                        micro=micro_feat,
+                        indi=indi_feat,
+                    )
 
                     if not rep.get("ok", True):
                         reason = rep.get("reason", "auto_entry_fail")
                         self._inc_block_reason(f"{sym}:{reason}")
 
-                    # Даже если вход не удался — не спамим сигналами чаще cooldown.
                     self._last_signal_ms[sym] = now
 
         except asyncio.CancelledError:
-            # штатное завершение при остановке воркера
             return
         except Exception:
             logger.exception("strategy loop error")
     
     def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
         """
-        Унифицированный расчёт SL-дистанции:
-        - минимум из execution.min_stop_ticks,
-        - не уже спреда (>= 1 тик),
-        - плюс адаптация к локальной волатильности (доля σ за 60с).
+        Черновая оценка SL-дистанции для auto-qty:
+        - минимум по тикам,
+        - учёт спреда,
+        - учёт локальной волы,
+        - минимум в 0.5 bp от цены.
         """
         spec = self.specs[symbol]
         tick = float(spec.price_tick)
 
-        # базовый минимум из конфига
-        base_min = self._min_stop_ticks_default() * tick
+        # минимум в тиках
+        min_ticks = max(self._min_stop_ticks_default(), 4.0)
+        min_ticks_px = min_ticks * tick
 
         # от спреда
-        spread_px = 0.0
-        if tick > 0.0 and spread_ticks > 0.0:
+        if spread_ticks > 0.0:
             spread_px = max(spread_ticks, 1.0) * tick
+        else:
+            spread_px = tick
 
-        # от волатильности за минуту
+        # локальная волатильность (std цен за 60s)
         vol_px = 0.0
         try:
-            vol_last_60s = self._recent_volatility(symbol, window_ms=60_000)
-            if vol_last_60s > 0.0:
-                # Берём мягко: 0.35σ, но не меньше 1 тика.
-                vol_px = max(tick, 0.35 * float(vol_last_60s))
+            sigma = self._recent_volatility(symbol, window_ms=60_000)
+            if sigma > 0.0:
+                vol_px = 0.5 * float(sigma)
         except Exception:
             vol_px = 0.0
 
-        sl_px = max(base_min, spread_px, vol_px)
+        # минимум в bp (0.5 bp)
+        last = self.latest_tick(symbol) or {}
+        price = float(last.get("price") or 0.0)
+        bps_px = price * (0.5 / 10_000.0) if price > 0.0 else 0.0
+
+        sl_px = max(min_ticks_px, spread_px, vol_px, bps_px)
         if sl_px <= 0.0:
-            sl_px = base_min if base_min > 0.0 else tick
+            sl_px = min_ticks_px if min_ticks_px > 0.0 else tick
 
         return float(sl_px)
-
     # ---------- public ops ----------
 
     def best_bid_ask(self, symbol: str) -> Tuple[float, float]:
@@ -568,16 +660,28 @@ class Worker:
 
     # --- ВХОДЫ ---
 
-    async def place_entry_auto(self, symbol: str, side: Side) -> Dict[str, Any]:
+    async def place_entry_auto(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        decision: Optional[Decision] = None,
+        micro: Optional[Dict[str, Any]] = None,
+        indi: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Авто-сайзинг по risk_per_trade_pct и текущей SL-дистанции.
-        Условия и SL/TP — как в place_entry().
+        Авто-вход:
+        - дневные лимиты,
+        - только FLAT,
+        - pre-safety,
+        - оценка SL-дистанции для сайзинга,
+        - вызов place_entry с передачей decision/micro/indi.
         """
         symbol = symbol.upper()
         if symbol not in self.execs:
             raise ValueError(f"Unsupported symbol: {symbol}")
 
-        # быстрый чек дневных лимитов (до локов)
+        # дневные лимиты
         day_dec = check_day_limits(
             DayState(
                 pnl_r_day=float(self._pnl_day.get("pnl_r", 0.0) or 0.0),
@@ -587,43 +691,61 @@ class Worker:
             self._risk_cfg,
         )
         if not day_dec.allow:
-            for r in day_dec.reasons:
-                self._inc_block_reason("day_" + r)
-            return {"ok": False, "reason": ",".join(["day_" + r for r in day_dec.reasons]), "symbol": symbol, "side": side}
+            reasons = [f"day_{r}" for r in (day_dec.reasons or [])]
+            for r in reasons:
+                self._inc_block_reason(r)
+            return {"ok": False, "reason": ",".join(reasons), "symbol": symbol, "side": side}
 
         lock = self._locks[symbol]
         async with lock:
             pos = self._pos[symbol]
             if pos.state != "FLAT":
-                self._inc_block_reason("busy_" + pos.state)
+                self._inc_block_reason(f"busy_{pos.state}")
                 return {"ok": False, "reason": f"busy:{pos.state}", "symbol": symbol, "side": side}
 
-            # safety pre-check
             bid, ask = self.hub.best_bid_ask(symbol)
             spec = self.specs[symbol]
+
             spread_ticks = 0.0
             if bid > 0 and ask > 0 and spec.price_tick > 0:
                 spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
-            micro = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
+            mctx = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
             tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
-            pre_dec = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=self._safety_cfg)
+
+            pre_dec = check_entry_safety(side, micro=mctx, time_ctx=tctx, pos_ctx=None, safety=self._safety_cfg)
             if not pre_dec.allow:
-                for r in pre_dec.reasons:
+                for r in (pre_dec.reasons or []):
                     self._inc_block_reason(r)
                 return {"ok": False, "reason": ",".join(pre_dec.reasons), "symbol": symbol, "side": side}
 
-            # оценим SL-дистанцию как в обычном входе
+            # SL-дистанция (черновик для qty)
             sl_distance_px = self._compute_sl_distance_px(symbol, spread_ticks)
             qty = self._compute_auto_qty(symbol, side, sl_distance_px)
             if qty <= 0.0:
                 self._inc_block_reason("qty_too_small")
                 return {"ok": False, "reason": "qty_too_small", "symbol": symbol, "side": side}
 
-        # ВНИМАНИЕ: выходим из локов и используем стандартный путь входа
-        return await self.place_entry(symbol, side, qty)
+        # открытие вне лока
+        return await self.place_entry(
+            symbol,
+            side,
+            qty,
+            decision=decision,
+            micro=micro,
+            indi=indi,
+        )
 
-    async def place_entry(self, symbol: str, side: Side, qty: float) -> Dict[str, Any]:
+    async def place_entry(
+        self,
+        symbol: str,
+        side: Side,
+        qty: float,
+        *,
+        decision: Optional[Decision] = None,
+        micro: Optional[Dict[str, Any]] = None,
+        indi: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Унифицированный вход (ручной / авто):
 
@@ -631,7 +753,7 @@ class Worker:
           - только из FLAT,
           - pre-safety,
           - исполнение через Executor,
-          - расчёт SL/TP (paper),
+          - расчёт SL/TP (адаптивный),
           - post-safety,
           - обновление FSM и in-memory позиции.
         """
@@ -649,7 +771,7 @@ class Worker:
             self._risk_cfg,
         )
         if not day_dec.allow:
-            reasons = [f"day_{r}" for r in day_dec.reasons]
+            reasons = [f"day_{r}" for r in (day_dec.reasons or [])]
             for r in reasons:
                 self._inc_block_reason(r)
             return {
@@ -682,18 +804,18 @@ class Worker:
             if bid > 0 and ask > 0 and spec.price_tick > 0:
                 spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
 
-            micro = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
+            mctx = MicroCtx(spread_ticks=spread_ticks, top5_liq_usd=1e12)
             tctx = TimeCtx(ts_ms=self._now_ms(), server_time_offset_ms=self._server_time_offset_ms)
 
             pre_dec = check_entry_safety(
                 side,
-                micro=micro,
+                micro=mctx,
                 time_ctx=tctx,
                 pos_ctx=None,
                 safety=self._safety_cfg,
             )
             if not pre_dec.allow:
-                for r in pre_dec.reasons:
+                for r in (pre_dec.reasons or []):
                     self._inc_block_reason(r)
                 return {
                     "ok": False,
@@ -745,30 +867,58 @@ class Worker:
                     },
                 }
 
-            # --- 4) SL/TP + post-safety ---
+            # --- 4) SL/TP + post-safety (адаптивные) ---
             entry_px = float(rep.avg_px)
             qty_open = float(rep.filled_qty)
 
-            # пересчёт спреда уже после входа
-            bid, ask = self.hub.best_bid_ask(symbol)
-            spread_ticks = 0.0
-            if bid > 0 and ask > 0 and spec.price_tick > 0:
-                spread_ticks = max(0.0, (ask - bid) / spec.price_tick)
+            # актуальный спред после fill
+            bid2, ask2 = self.hub.best_bid_ask(symbol)
+            spread_ticks2 = 0.0
+            if spec.price_tick > 0 and bid2 > 0 and ask2 > 0:
+                spread_ticks2 = max(0.0, (ask2 - bid2) / spec.price_tick)
 
-            sl_distance_px = self._compute_sl_distance_px(symbol, spread_ticks)
+            # фичи для compute_sltp_adaptive:
+            # если пришли из стратегии — берём их, иначе — последний снапшот
+            micro_src: Dict[str, Any] = {}
+            if isinstance(micro, dict):
+                micro_src = micro
+            else:
+                micro_src = self._last_micro.get(symbol, {}) or {}
+            micro_feat = dict(micro_src)
 
-            plan: SLTPPlan = compute_sltp(
+            indi_src: Dict[str, Any] = {}
+            if isinstance(indi, dict):
+                indi_src = indi
+            else:
+                indi_src = self._last_indi.get(symbol, {}) or {}
+            indi_feat = dict(indi_src)
+
+            if not micro_feat.get("spread_ticks"):
+                micro_feat["spread_ticks"] = spread_ticks2
+
+            # контекст решения для адаптивного RR
+            if decision is not None:
+                decision_ctx = {
+                    "kind": getattr(decision, "kind", None),
+                    "score": float(getattr(decision, "score", 0.0) or 0.0),
+                }
+            else:
+                decision_ctx = None
+
+            plan: SLTPPlan = compute_sltp_adaptive(
                 side=side,
                 entry_px=entry_px,
                 qty=qty_open,
                 price_tick=spec.price_tick,
-                sl_distance_px=sl_distance_px,
-                rr=1.8,
+                micro=micro_feat,
+                indi=indi_feat,
+                decision=decision_ctx,
             )
 
+            # --- 4b) post-safety с учётом конкретного SL ---
             post_dec = check_entry_safety(
                 side,
-                micro=micro,
+                micro=mctx,
                 time_ctx=tctx,
                 pos_ctx=PositionalCtx(
                     entry_px=entry_px,
@@ -779,10 +929,10 @@ class Worker:
             )
 
             if not post_dec.allow:
-                for r in post_dec.reasons:
+                for r in (post_dec.reasons or []):
                     self._inc_block_reason(r)
 
-                # откат к FLAT, позицию не держим
+                # откат к FLAT
                 self._pos[symbol] = PositionState(
                     state="FLAT",
                     side=None,
@@ -828,14 +978,32 @@ class Worker:
             )
             self._entry_steps[symbol] = list(rep.steps or [])
 
+            # оценка эффективного RR
+            rr_eff = 0.0
+            try:
+                if plan.sl_px is not None and plan.tp_px is not None:
+                    r_px = abs(entry_px - float(plan.sl_px))
+                    if r_px > 0:
+                        rr_eff = abs(float(plan.tp_px) - entry_px) / r_px
+            except Exception:
+                rr_eff = 0.0
+
             with contextlib.suppress(Exception):
                 await self._fsm[symbol].on_open(
                     entry_px=entry_px,
                     qty=qty_open,
                     sl=float(plan.sl_px) if plan.sl_px is not None else entry_px,
                     tp=float(plan.tp_px) if plan.tp_px is not None else None,
-                    rr=1.8,
+                    rr=float(rr_eff),
                     opened_ts=opened_ts_ms,
+                    symbol=symbol,
+                    side=side,
+                    reason_open="auto" if decision is not None else "manual",
+                    meta={
+                        "decision_kind": getattr(decision, "kind", None) if decision is not None else None,
+                        "decision_score": float(getattr(decision, "score", 0.0) or 0.0)
+                        if decision is not None else None,
+                    },
                 )
 
             return {
@@ -1140,6 +1308,18 @@ class Worker:
         if dq is None:
             dq = self._trades[sym] = deque(maxlen=1000)
         dq.appendleft(trade)
+        
+        # запоминаем время последнего стоп-лосса для глобального кулдауна
+        now = self._now_ms()
+        try:
+            reason = str(trade.get("reason", "")).lower()
+            pnl_r = float(trade.get("pnl_r", 0.0) or 0.0)
+        except Exception:
+            reason = ""
+            pnl_r = 0.0
+
+        if pnl_r <= 0.0 and ("sl" in reason or "stop" in reason or "loss" in reason):
+            self._last_sl_ts_ms = now
 
         day = self._day_str()
         if self._pnl_day["day"] != day:
