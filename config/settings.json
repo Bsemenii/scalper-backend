@@ -46,15 +46,19 @@
   "execution": {
     "price_tick_fallback": 0.1,
     "qty_step_fallback": 0.001,
-    "limit_offset_ticks": 1,
+
+    "limit_offset_ticks": 0,
     "limit_timeout_ms": 500,
     "max_slippage_bp": 4,
-    "time_in_force": "GTX",
+
+    "time_in_force": "IOC",
+    "post_only": false,
+
     "fee_bps_maker": 0.00,
     "fee_bps_taker": 0.00,
+
     "min_stop_ticks": 24,
     "poll_ms": 50,
-    "post_only": true,
     "on_timeout": "market",
     "demo_upnl_mid": true
   },

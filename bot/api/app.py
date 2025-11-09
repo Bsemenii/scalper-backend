@@ -725,15 +725,21 @@ def _spread_ticks(bid: float, ask: float, tick: float) -> float:
 @app.post("/control/test-entry")
 async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     """
-    Тестовый вход (улучшенный):
-      - рассчитываем SL-дистанцию от min_stop_ticks и текущего спреда (как в Worker),
-      - авто-сайзим через внутренний метод воркера (полная консистентность),
-      - считаем комиссии: (A) conservative maker+taker, (B) maker-only (GTX+abort),
-      - НЕ блокируем по комиссиям — только предупреждаем,
-      - добавлен DRY-режим (dry=true): превью лимит-цены, SL/TP-план и safety-чек без сделки,
-      - при исполнении используем тот же путь, что и раньше (Worker.place_entry / place_entry_auto).
+    Тестовый вход (превью + опциональное исполнение) с единой логикой:
+
+    - sl_distance_px берём из Worker._compute_vol_stop_distance_px(sym, mid_px)
+      (волатильность + спред + min_stop_ticks).
+    - qty:
+        - если задан в запросе → используем как есть (с квантом/минимумами);
+        - иначе → w._compute_auto_qty(sym, side, sl_distance_px).
+    - SL/TP считаем через compute_sltp с этим sl_distance_px (rr=1.8).
+    - считаем комиссии и expected_risk_usd на основе этого стопа.
+    - safety-check через risk.filters (pre/post).
+    - dry=true → только превью, без сделки.
+    - dry=false → пытаемся вызвать w.place_entry(...) с limit_offset_ticks
+      и sl_distance_px (если поддерживается), иначе откатываемся к
+      старым сигнатурам / place_entry_auto.
     """
-    # локальные импорты, чтобы не трогать верх файла
     from risk.filters import MicroCtx, TimeCtx, PositionalCtx, check_entry_safety
     from exec.sltp import compute_sltp
 
@@ -741,52 +747,96 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     sym = _normalize_symbol(req.symbol, w.symbols)
     side = _normalize_side(req.side)
 
-    # 1) текущая цена/тик
+    # 1) последний тик
     last = _worker_latest_tick(w, sym)
     if not last:
-        return JSONResponse({"ok": False, "error": f"no ticks for {sym}"}, status_code=503)
-    price = float(last["price"])
+        return JSONResponse(
+            {"ok": False, "error": f"no ticks for {sym}"},
+            status_code=503,
+        )
+
+    price = float(last.get("price") or 0.0)
     bid = float(last.get("bid") or price)
     ask = float(last.get("ask") or price)
+    if price <= 0.0:
+        price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+    if price <= 0.0:
+        return JSONResponse(
+            {"ok": False, "error": f"no valid price for {sym}"},
+            status_code=503,
+        )
 
-    # 2) шаги символа
+    # 2) шаги
     price_step, qty_step = _get_symbol_steps_from_worker(w, sym)
 
-    # 3) конфиги (fees берём из execution)
+    # 3) конфиги
     s = get_settings()
     exec_cfg = _exec_cfg()
     time_in_force = str(exec_cfg.get("time_in_force", "GTX")).upper()
-    min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 12))
-    limit_offset_ticks = int(req.limit_offset_ticks) if req.limit_offset_ticks is not None else int(exec_cfg.get("limit_offset_ticks", 1))
+    limit_offset_ticks = (
+        int(req.limit_offset_ticks)
+        if req.limit_offset_ticks is not None
+        else int(exec_cfg.get("limit_offset_ticks", 1))
+    )
 
     e = getattr(s, "execution", object())
     fee_maker_bps = float(getattr(e, "fee_bps_maker", 2.0))
     fee_taker_bps = float(getattr(e, "fee_bps_taker", 4.0))
-    on_timeout = str(getattr(e, "on_timeout", "abort")).lower()  # "abort" | "market" | ...
+    on_timeout = str(getattr(e, "on_timeout", "abort")).lower()
 
     acc = _account_cfg()
     rsk = _risk_cfg()
 
-    # 4) SL-дистанция: минимум из min_stop_ticks и текущего спреда в тиках (как в Worker)
-    spr_ticks = _spread_ticks(bid, ask, price_step)
-    sl_distance_px = max(min_stop_ticks * price_step, max(spr_ticks, 1.0) * price_step)
+    # 4) волатильностная SL-дистанция (единый источник правды)
+    try:
+        sl_distance_px = float(w._compute_vol_stop_distance_px(sym, mid_px=price))
+    except Exception:
+        # fallback совместимый с прошлой логикой
+        try:
+            min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 8))
+        except Exception:
+            min_stop_ticks = 8
+        spread = max(0.0, ask - bid)
+        sl_distance_px = max(
+            price_step * max(4, min_stop_ticks),
+            spread * 2.0,
+            price_step,
+        )
 
-    # 5) qty: ручной или авто-сайзинг через воркер (консистентно с place_entry_auto)
+    if sl_distance_px <= 0:
+        return {
+            "ok": False,
+            "reason": "bad_sl_distance_px",
+            "symbol": sym,
+            "side": side,
+        }
+
+    # 5) qty: ручной или авто
     if req.qty is not None and req.qty > 0:
         qty = float(req.qty)
     else:
-        qty = float(w._compute_auto_qty(sym, side, sl_distance_px))  # тот же алгоритм, что у Worker.place_entry_auto
+        try:
+            qty = float(w._compute_auto_qty(sym, side, sl_distance_px))
+        except Exception as e:
+            return {
+                "ok": False,
+                "reason": "auto_qty_failed",
+                "symbol": sym,
+                "side": side,
+                "error": str(e),
+            }
 
-    # 6) квантизация + exchange минимумы
-    qty = float(_quantize(float(qty or 0.0), qty_step))
+    # 6) квантование и min_notional
+    qty = float(_quantize(qty, qty_step))
     if qty <= 0.0:
         return {
             "ok": False,
             "reason": "qty_rounded_to_zero",
-            "hint": f"try qty ≥ {max(qty_step, 2*qty_step)} for {sym}",
             "symbol": sym,
             "side": side,
+            "hint": f"try qty ≥ {max(qty_step, 2 * qty_step)} for {sym}",
         }
+
     if qty * price < acc["min_notional"]:
         min_qty = _quantize((acc["min_notional"] / price) + qty_step, qty_step)
         return {
@@ -798,43 +848,55 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "hint": f"min notional ${acc['min_notional']} → try qty ≥ {min_qty}",
         }
 
-    # 7) превью лимит-цены (для пост-онли) + SL/TP-план и safety-чек (read-only)
+    # 7) превью лимит-цены
     preview_px = _preview_limit_px(bid, ask, side, price_step, limit_offset_ticks)
     if preview_px <= 0.0:
-        preview_px = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else price
+        preview_px = price
 
-    # SLTP «на бумаге» (для превью)
+    # 8) SL/TP-план по тому же sl_distance_px
     try:
         plan = compute_sltp(
             side=side,
             entry_px=float(preview_px),
-            qty=qty,
-            price_tick=price_step,
-            sl_distance_px=sl_distance_px,
+            qty=float(qty),
+            price_tick=float(price_step),
+            sl_distance_px=float(sl_distance_px),
             rr=1.8,
         )
         sl_px = float(plan.sl_px) if getattr(plan, "sl_px", None) is not None else None
         tp_px = float(plan.tp_px) if getattr(plan, "tp_px", None) is not None else None
     except Exception:
+        plan = None
         sl_px, tp_px = None, None
 
-    # safety-чек до/после плана (не меняет состояние)
+    # 9) safety-check (pre/post)
+    spr_ticks = _spread_ticks(bid, ask, price_step)
     micro = MicroCtx(spread_ticks=spr_ticks, top5_liq_usd=1e12)
-    tctx = TimeCtx(ts_ms=w._now_ms(), server_time_offset_ms=getattr(w, "_server_time_offset_ms", 0))
+    tctx = TimeCtx(
+        ts_ms=w._now_ms(),
+        server_time_offset_ms=getattr(w, "_server_time_offset_ms", 0),
+    )
+
     pre_ok = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=w._safety_cfg)
+
     post_ok = pre_ok
     if sl_px is not None:
+        pos_ctx = PositionalCtx(
+            entry_px=float(preview_px),
+            sl_px=float(sl_px),
+            leverage=float(getattr(w, "_leverage", 10.0)),
+        )
         post_ok = check_entry_safety(
             side,
             micro=micro,
             time_ctx=tctx,
-            pos_ctx=PositionalCtx(entry_px=float(preview_px), sl_px=float(sl_px), leverage=float(w._leverage)),
+            pos_ctx=pos_ctx,
             safety=w._safety_cfg,
         )
 
-    # 8) оценка комиссий и риска
-    notional = price * qty  # как раньше: считаем от текущей цены
-    expected_risk_usd = sl_distance_px * qty  # линейные USDT-перпы: ΔPnL ≈ qty * Δprice
+    # 10) risk & fees под эту SL-дистанцию
+    notional = price * qty
+    expected_risk_usd = sl_distance_px * qty
 
     taker_like_entry = (time_in_force != "GTX")
     est_fees_usd_conservative = _estimate_fees_usd(
@@ -860,22 +922,24 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             f"risk({expected_risk_usd:.4f}) < 0.5×conservative_fees({est_fees_usd_conservative:.4f})"
         )
 
-    # 9) DRY-режим: только превью, без сделки
+    safety_block = (not pre_ok.allow) or (not post_ok.allow)
+
+    # 11) DRY-режим: только превью
     if req.dry:
         return {
-            "ok": True,
+            "ok": not safety_block,
             "dry": True,
             "symbol": sym,
             "side": side,
             "qty": float(qty),
-            "price": price,  # оставляем как раньше — текущая цена, а не превью
+            "price": float(price),
             "preview_px": float(preview_px),
             "sl_distance_px": round(float(sl_distance_px), 6),
             "expected_risk_usd": round(float(expected_risk_usd), 6),
             "fees_usd": {
                 "maker_only": round(float(est_fees_usd_maker_only), 6),
                 "conservative_maker_plus_taker": round(float(est_fees_usd_conservative), 6),
-                "entry_taker_like": taker_like_entry,
+                "entry_taker_like": bool(taker_like_entry),
             },
             "tif": time_in_force,
             "on_timeout": on_timeout,
@@ -887,51 +951,70 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "plan": {"sl_px": sl_px, "tp_px": tp_px, "rr": 1.8},
         }
 
-    # 10) Исполнение (совместимо с прежним поведением)
-    try:
-        # попытка передать offset, если у Executor поддержка появится — прозрачно заработает
-        report = await w.place_entry(sym, side, float(qty), int(limit_offset_ticks))  # type: ignore[arg-type]
-    except TypeError:
-        # текущая версия — без offset
-        if req.qty is not None and req.qty > 0:
-            report = await w.place_entry(sym, side, float(qty))
-        else:
-            report = await w.place_entry_auto(sym, side)
-
-    steps = (report or {}).get("steps") or []
-    if "qty_rounded_to_zero" in steps:
+    # 12) Реальное исполнение (используем те же параметры, насколько позволяет Worker)
+    if safety_block:
         return {
             "ok": False,
-            "reason": "qty_rounded_to_zero_by_executor",
+            "reason": "safety_pre_block",
             "symbol": sym,
             "side": side,
-            "hint": f"try qty ≥ {max(qty_step, 2*qty_step)} for {sym}",
-            "report": report,
+            "warnings": warnings or None,
+            "safety": {
+                "pre": {"allow": bool(pre_ok.allow), "reasons": pre_ok.reasons},
+                "post": {"allow": bool(post_ok.allow), "reasons": post_ok.reasons},
+            },
         }
 
-    # 11) финальный ответ (назад-совместимая форма)
-    out = {
+    # Пытаемся вызвать place_entry с limit_offset_ticks и sl_distance_px.
+    try:
+        report = await w.place_entry(
+            sym,
+            side,
+            float(qty),
+            int(limit_offset_ticks),
+            sl_distance_px=float(sl_distance_px),
+        )
+    except TypeError:
+        # без sl_distance_px
+        try:
+            report = await w.place_entry(sym, side, float(qty), int(limit_offset_ticks))
+        except TypeError:
+            # если qty не задан → юзаем новую place_entry_auto (она уже волатильностная)
+            if req.qty is None:
+                report = await w.place_entry_auto(sym, side)
+            else:
+                report = await w.place_entry(sym, side, float(qty))
+
+    out: Dict[str, Any] = {
         "ok": True,
         "symbol": sym,
         "side": side,
         "qty": float(qty),
-        "price": price,  # как раньше — текущая цена из тика
-        "sl_distance_px": round(sl_distance_px, 6),
-        "expected_risk_usd": round(expected_risk_usd, 6),
+        "price": float(price),
+        "preview_px": float(preview_px),
+        "sl_distance_px": round(float(sl_distance_px), 6),
+        "expected_risk_usd": round(float(expected_risk_usd), 6),
         "fees_usd": {
-            "maker_only": round(est_fees_usd_maker_only, 6),
-            "conservative_maker_plus_taker": round(est_fees_usd_conservative, 6),
-            "entry_taker_like": taker_like_entry
+            "maker_only": round(float(est_fees_usd_maker_only), 6),
+            "conservative_maker_plus_taker": round(float(est_fees_usd_conservative), 6),
+            "entry_taker_like": bool(taker_like_entry),
         },
         "tif": time_in_force,
         "on_timeout": on_timeout,
         "warnings": warnings or None,
-        "report": report,  # внутри структура воркера как была
+        "safety": {
+            "pre": {"allow": bool(pre_ok.allow), "reasons": pre_ok.reasons},
+            "post": {"allow": bool(post_ok.allow), "reasons": post_ok.reasons},
+        },
+        "plan": {"sl_px": sl_px, "tp_px": tp_px, "rr": 1.8},
+        "report": report,
     }
+
     if isinstance(report, dict) and report.get("ok") is False:
         out["ok"] = False
         if report.get("reason"):
             out["reason"] = report.get("reason")
+
     return out
 
 
