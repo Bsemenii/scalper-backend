@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from collections import deque
 from typing import Deque
+from contextlib import contextmanager
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
@@ -18,9 +19,12 @@ from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
 from adapters.binance_rest import PaperAdapter
 from exec.executor import Executor, ExecCfg, ExecutionReport
-from exec.sltp import compute_sltp, SLTPPlan  # план цен SL/TP (paper)
-# фичи микроструктуры/индикаторов — опциональны:
-# если модулей нет, воркер всё равно должен стартовать.
+# SL/TP планировщик: сначала пытаемся взять fee-aware, при неудаче — простой
+try:
+    from exec.sltp import compute_sltp_fee_aware, compute_sltp, SLTPPlan  # type: ignore
+except Exception:
+    from exec.sltp import compute_sltp, SLTPPlan  # type: ignore
+    compute_sltp_fee_aware = None  # type: ignore
 try:
     from features.microstructure import MicroFeatureEngine  # type: ignore
 except Exception:
@@ -118,6 +122,10 @@ class Worker:
         self.coal = Coalescer(coalesce_ms=coalesce_ms)
         self.hub = MarketHub(self.symbols)
 
+        self._tp_tol_ticks = getattr(self, "_tp_tol_ticks", 1)               # допуск по тикам
+        self._tp_grace_ms  = getattr(self, "_tp_grace_ms", 350)              # сколько ждём лимит перед market
+        self._tp_force     = getattr(self, "_tp_force", True)                # включить форс-закрытие
+
         # история тиков (последние N по символу)
         self._hist: Dict[str, Deque[Dict[str, Any]]] = {s: deque(maxlen=history_maxlen) for s in self.symbols}
         self._history_maxlen = history_maxlen
@@ -197,6 +205,8 @@ class Worker:
         # пер-символьные таймштампы для анти-спама сигналов
         self._last_signal_ms: Dict[str, int] = {s: 0 for s in self.symbols}
         self._last_flat_ms: Dict[str, int] = {s: 0 for s in self.symbols}
+        # метка первого «касания TP» (per-symbol), чтобы дать лимиту шанс и затем форс-закрыть
+        self._tp_first_hit_ms: Dict[str, int] = {s: 0 for s in self.symbols}
 
         # движок кандидатов (пер-симв.), инициализируем позже
         self._cand: Dict[str, CandidateEngine] = {}
@@ -226,7 +236,7 @@ class Worker:
         def _best(sym: str) -> tuple[float, float]:
             return self.hub.best_bid_ask(sym)
 
-        # базовые дефолты
+        # --- base defaults ---
         limit_offset_ticks = 1
         limit_timeout_ms = 500
         time_in_force = "GTC"
@@ -236,8 +246,9 @@ class Worker:
         fee_bps_taker = 4.0
         prefer_maker = False
 
-        # один раз читаем settings (если есть)
+        # --- read settings once (if available) ---
         s = None
+        exec_cfg = None
         if get_settings:
             try:
                 s = get_settings()
@@ -248,27 +259,39 @@ class Worker:
             exec_cfg = getattr(s, "execution", None)
             if exec_cfg is not None:
                 limit_offset_ticks = int(getattr(exec_cfg, "limit_offset_ticks", limit_offset_ticks))
-                limit_timeout_ms = int(getattr(exec_cfg, "limit_timeout_ms", limit_timeout_ms))
-                max_slippage_bp = float(getattr(exec_cfg, "max_slippage_bp", max_slippage_bp))
-                time_in_force = str(getattr(exec_cfg, "time_in_force", time_in_force))
-                poll_ms = int(getattr(exec_cfg, "poll_ms", poll_ms))
-                fee_bps_maker = float(getattr(exec_cfg, "fee_bps_maker", fee_bps_maker))
-                fee_bps_taker = float(getattr(exec_cfg, "fee_bps_taker", fee_bps_taker))
-                prefer_maker = bool(getattr(exec_cfg, "prefer_maker", prefer_maker))
+                limit_timeout_ms   = int(getattr(exec_cfg, "limit_timeout_ms",   limit_timeout_ms))
+                max_slippage_bp    = float(getattr(exec_cfg, "max_slippage_bp",  max_slippage_bp))
+                time_in_force      = str(getattr(exec_cfg, "time_in_force",      time_in_force))
+                poll_ms            = int(getattr(exec_cfg, "poll_ms",            poll_ms))
+                fee_bps_maker      = float(getattr(exec_cfg, "fee_bps_maker",    fee_bps_maker))
+                fee_bps_taker      = float(getattr(exec_cfg, "fee_bps_taker",    fee_bps_taker))
+                prefer_maker       = bool(getattr(exec_cfg, "prefer_maker",      prefer_maker))
 
-            # авто-сигналы — для обратной совместимости
+            # авто-сигналы (обратная совместимость)
             strat_cfg = getattr(s, "strategy", None)
             if strat_cfg is not None:
-                self._auto_enabled = bool(getattr(strat_cfg, "auto_signal_enabled", self._auto_enabled))
-                self._auto_cooldown_ms = int(getattr(strat_cfg, "auto_cooldown_ms", self._auto_cooldown_ms))
-                self._auto_min_flat_ms = int(getattr(strat_cfg, "auto_min_flat_ms", self._auto_min_flat_ms))
+                self._auto_enabled     = bool(getattr(strat_cfg, "auto_signal_enabled", self._auto_enabled))
+                self._auto_cooldown_ms = int(getattr(strat_cfg, "auto_cooldown_ms",     self._auto_cooldown_ms))
+                self._auto_min_flat_ms = int(getattr(strat_cfg, "auto_min_flat_ms",     self._auto_min_flat_ms))
 
-        # если TIF пост-онли — включаем prefer_maker
+        # prefer maker if post-only TIF requested
         tif_upper = (time_in_force or "").upper()
         if tif_upper in ("GTX", "PO", "POST_ONLY"):
             prefer_maker = True
 
-        # инициализируем executors + кандидаты по всем символам
+        # --- persist flat exec cfg used by helpers (after settings are applied) ---
+        try:
+            min_stop_ticks_cfg = int(getattr(exec_cfg, "min_stop_ticks", self._min_stop_ticks_default())) if exec_cfg else self._min_stop_ticks_default()
+        except Exception:
+            min_stop_ticks_cfg = self._min_stop_ticks_default()
+
+        self._exec_cfg = {
+            "min_stop_ticks": int(min_stop_ticks_cfg),
+            "limit_timeout_ms": int(limit_timeout_ms),
+            "time_in_force": str(time_in_force),
+        }
+
+        # --- init executors & per-symbol engines ---
         for sym in self.symbols:
             spec = self.specs[sym]
 
@@ -298,11 +321,10 @@ class Worker:
             if IndiEngine is not None:
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
-        # запускаем потоки
+        # --- start streams/tasks ---
         await self.ws.connect(self._on_ws_raw)
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
 
-        # фоновые циклы
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
         self._strat_task = asyncio.create_task(self._strategy_loop(), name="strategy")
 
@@ -410,119 +432,85 @@ class Worker:
 
     async def _strategy_loop(self) -> None:
         """
-        Простой, но боевой авто-скальпер для MVP.
+        Auto scalper (time-based windows, sane anti-chop):
 
-        Логика входов (только когда рынок даёт понятный сетап):
-
-        1) MOMENTUM BREAKOUT:
-        - Цена у локального high/low за последние ~60s.
-        - Есть направленный микро-тренд (short MA vs long MA + наклон).
-        - Входим по направлению пробоя.
-
-        2) REVERSION BOUNCE:
-        - Цена у локальной поддержки/сопротивления.
-        - Был прокол уровня и разворот short MA.
-        - Забираем откат обратно в диапазон.
-
-        Общие фильтры:
-        - Нет открытой позиции по символу.
-        - auto_enabled == True, day_limits.can_trade == True.
-        - Актуальные тики, ок спред.
-        - Стоп по волатильности или min_stop_ticks.
-        - Вход через place_entry_auto(sym, side).
-        - Все причины отказа логируются через _inc_block_reason.
+        - Windows based on time (robust to coalescer rate): long≈7s, short≈2s
+        - Anti-chop passes if EITHER absolute 1 tick move OR ~0.6 bps drift exists
+        - Momentum breakout and gentle reversion bounce
+        - Safety filters (spread/liquidity/funding/liq-buffer) preserved
         """
-
-        import asyncio
-        import logging
-        import time
-        import math
-
+        import asyncio, logging, math, time as _t
         log = logging.getLogger(__name__ + "._strategy")
 
-        symbols = list(getattr(self, "symbols", []) or [])
+        symbols = list(self.symbols)
         if not symbols:
             log.warning("[strategy] no symbols configured, exiting _strategy_loop")
             return
 
-        # --- strategy cfg ---
-        cfg = getattr(self, "_strategy_cfg", {}) or {}
-        cooldown_ms = int(cfg.get("cooldown_ms", 600))
-        min_flat_ms = int(cfg.get("min_flat_ms", 250))
+        # timings / basic pacing
+        cooldown_ms = max(250, int(getattr(self, "_auto_cooldown_ms", 1200)))
+        min_flat_ms = max(0, int(getattr(self, "_auto_min_flat_ms", 300)))
+        base_delay_s = max(0.09, cooldown_ms / 4000.0)
 
-        # Проверяем чаще, чем cooldown, но без безумия
-        base_delay_s = max(0.25, cooldown_ms / 3000.0)
+        # time-based windows & thresholds
+        warmup_ms = 15_000
+        stale_ms  = 1_500
+        long_ms   = 5_000      # было 7s → 5s
+        short_ms  = 1_400       # ~2s short MA
 
-        # --- safety cfg ---
-        safety_cfg = getattr(self, "_safety_cfg", {}) or {}
+        # momentum thresholds (slightly looser so signals occur)
+        ma_edge_mom     = 0.00006   # ~0.6 bps
+        slope_edge_mom  = 0.000006   # short MA slope
 
-        def _safety_get(name, default):
-            try:
-                if isinstance(safety_cfg, dict):
-                    v = safety_cfg.get(name, default)
-                else:
-                    v = getattr(safety_cfg, name, default)
-                return float(v)
-            except Exception:
-                return float(default)
+        # reversion thresholds (gentle edge)
+        ma_edge_rev     = 0.00003  # ~0.5 bps
 
-        max_spread_ticks = _safety_get("max_spread_ticks", 8.0)
-        if max_spread_ticks <= 0:
-            max_spread_ticks = 8.0
+        # anti-chop: pass if EITHER absolute tick range or small bps drift is present
+        min_range_bps    = 0.4
+        min_range_ticks  = 1
 
-        # --- exec cfg ---
-        exec_cfg = getattr(self, "_exec_cfg", {}) or {}
-        min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 24))
-        if min_stop_ticks <= 0:
-            min_stop_ticks = 24
-
-        # --- параметры микро-логики ---
-        warmup_ms = 60_000      # окно для уровней и MA
-        stale_ms = 3_000        # если последний тик старше → не входим
-
-        short_n = 9             # быстрая MA
-        long_n = 36             # медленная MA
-
-        # пороги: чуть мягче, чтобы сигналы реально появлялись
-        ma_edge_mom = 0.00018       # ~1.8 bps: тренд для breakout
-        slope_edge_mom = 0.000015   # наклон shortMA
-        ma_edge_rev = 0.00010       # ~1.0 bps для отскока
-
-        # per-symbol cooldown
         last_entry_ts = {sym: 0 for sym in symbols}
 
-        def _now_ms():
+        def _now_ms() -> int:
             try:
                 return int(self._now_ms())
             except Exception:
-                return int(time.time() * 1000)
+                return int(_t.time() * 1000)
 
-        def _inc_block(reason):
+        def _inc_block(reason: str) -> None:
             try:
-                if hasattr(self, "_inc_block_reason"):
-                    self._inc_block_reason(reason)
+                self._inc_block_reason(reason)
             except Exception:
                 pass
 
-        def _price_step(sym):
-            step = 0.1
+        def _price_step(sym: str) -> float:
             try:
-                specs = getattr(self, "specs", {}) or {}
-                spec = specs.get(sym)
-                if spec is None:
-                    return step
+                spec = (self.specs or {}).get(sym)
+                if not spec:
+                    return 0.1
                 for name in ("price_step", "price_tick", "tick_size", "tickSize"):
                     v = getattr(spec, name, None)
-                    if v:
-                        step = float(v)
-                        break
+                    if isinstance(v, (int, float)) and v > 0:
+                        return float(v)
             except Exception:
                 pass
-            if step <= 0:
-                step = 0.1
-            return step
+            return 0.1
 
-        # risk.filters — если есть, используем как доп. safety
+        def _load_best(sym: str, best_all) -> tuple[float, float]:
+            bid = ask = 0.0
+            b = best_all.get(sym) if isinstance(best_all, dict) else None
+            if isinstance(b, (list, tuple)) and len(b) >= 2:
+                bid, ask = float(b[0] or 0.0), float(b[1] or 0.0)
+            elif isinstance(b, dict):
+                bid, ask = float(b.get("bid") or 0.0), float(b.get("ask") or 0.0)
+            if bid <= 0 or ask <= 0:
+                try:
+                    bid, ask = self.best_bid_ask(sym)
+                except Exception:
+                    bid = ask = 0.0
+            return float(bid or 0.0), float(ask or 0.0)
+
+        # risk filters (optional soft import already available module-wide)
         try:
             from risk.filters import MicroCtx, TimeCtx, PositionalCtx, check_entry_safety
             _HAS_FILTERS = True
@@ -530,22 +518,43 @@ class Worker:
             MicroCtx = TimeCtx = PositionalCtx = check_entry_safety = None  # type: ignore
             _HAS_FILTERS = False
 
-        while getattr(self, "_running", True):
-            try:
-                # выключен авто-режим
+        # spread limit default (prefer strict unless cfg present)
+        try:
+            cfg_spread_ticks = float(getattr(self._safety_cfg, "max_spread_ticks", 4.0))
+            max_spread_ticks_default = 4.0 if not math.isfinite(cfg_spread_ticks) or cfg_spread_ticks <= 0 else cfg_spread_ticks
+        except Exception:
+            max_spread_ticks_default = 4.0
+        # адресное послабление спред-порога для SOL (чуть ступенчатый актив)
+        per_symbol_spread_max = {
+            "SOLUSDT": max_spread_ticks_default + 2.0
+        }
+
+        try:
+            while True:
                 if not bool(getattr(self, "_auto_enabled", False)):
                     await asyncio.sleep(0.3)
                     continue
 
                 now = _now_ms()
+                safety_cfg = getattr(self, "_safety_cfg", None)
+                # global cooldown after SL
+                try:
+                    cfg = self._risk_cfg
+                    if cfg.cooldown_after_sl_s > 0 and self._last_sl_ts_ms:
+                        if now - self._last_sl_ts_ms < cfg.cooldown_after_sl_s * 1000:
+                            _inc_block("cooldown_after_sl")
+                            await asyncio.sleep(base_delay_s)
+                            continue
+                except Exception:
+                    pass
 
-                # один diag на цикл
+                # diag snapshot
                 try:
                     d = self.diag() or {}
                 except Exception:
                     d = {}
 
-                # дневные лимиты
+                # day limits
                 day_limits = d.get("day_limits") or {}
                 if not bool(day_limits.get("can_trade", True)):
                     reasons = day_limits.get("reasons") or []
@@ -554,36 +563,29 @@ class Worker:
                     await asyncio.sleep(1.0)
                     continue
 
-                positions = d.get("positions") or {}
-                best_all = d.get("best") or {}
+                positions    = d.get("positions") or {}
+                best_all     = d.get("best") or {}
+                history_meta = d.get("history") or {}
 
                 for sym in symbols:
                     try:
-                        # пропускаем, если уже есть открытая позиция
-                        pos = positions.get(sym) if isinstance(positions, dict) else None
-                        if isinstance(pos, dict) and str(pos.get("state", "")).upper() == "OPEN":
+                        # skip if not flat enough
+                        pos = positions.get(sym) or {}
+                        st = str(pos.get("state", "")).upper()
+                        if st in ("OPEN", "ENTERING", "EXITING"):
                             continue
 
-                        # cooldown / min_flat
-                        last_ts = int(last_entry_ts.get(sym, 0))
-                        if now - last_ts < max(cooldown_ms, min_flat_ms):
+                        if now - last_entry_ts[sym] < cooldown_ms:
                             continue
 
-                        # --- best bid/ask ---
-                        bid = ask = 0.0
-                        if isinstance(best_all, dict):
-                            bi = best_all.get(sym)
-                            if isinstance(bi, dict):
-                                bid = float(bi.get("bid") or 0.0)
-                                ask = float(bi.get("ask") or 0.0)
-                        if bid <= 0 or ask <= 0:
-                            try:
-                                bid, ask = self.best_bid_ask(sym)
-                            except Exception:
-                                bid = ask = 0.0
+                        last_flat = int(self._last_flat_ms.get(sym, 0) or 0)
+                        if last_flat and now - last_flat < min_flat_ms:
+                            continue
 
+                        # best bid/ask & spread gate
+                        bid, ask = _load_best(sym, best_all)
                         if bid <= 0 or ask <= 0:
-                            _inc_block(f"{sym}:no_tick")
+                            _inc_block(f"{sym}:no_best")
                             continue
 
                         mid = (bid + ask) / 2.0
@@ -593,248 +595,231 @@ class Worker:
 
                         step = _price_step(sym)
                         spread = max(0.0, ask - bid)
-                        spr_ticks = (spread / step) if step > 0 else 0.0
+                        sprticks = (spread / step) if step > 0 else 0.0
                         spread_bps = (spread / mid * 1e4) if mid > 0 else 0.0
 
-                        # мягкий спред-фильтр: очень широкий спред режем
-                        if spr_ticks > max_spread_ticks and spread_bps > 4.0:
-                            _inc_block(f"{sym}:skip_spread>{max_spread_ticks:.1f}t")
+                        max_spread_ticks = max_spread_ticks_default
+                        max_spread_ticks_sym = per_symbol_spread_max.get(sym, max_spread_ticks_default)
+                        max_spread_ticks_sym = per_symbol_spread_max.get(sym, max_spread_ticks_default)
+                        if sprticks > max_spread_ticks_sym and spread_bps > 5.0:
+                            _inc_block(f"{sym}:spread>{max_spread_ticks:.1f}t")
                             continue
 
-                        # --- история ---
-                        if not hasattr(self, "history_ticks"):
-                            _inc_block(f"{sym}:no_history_api")
+                        # history freshness
+                        hmeta = history_meta.get(sym) or {}
+                        latest_ts = int(hmeta.get("latest_ts_ms") or 0)
+                        if not latest_ts or now - latest_ts > stale_ms:
+                            _inc_block(f"{sym}:stale_history_meta")
                             continue
 
-                        since = now - warmup_ms
                         try:
-                            ticks = self.history_ticks(sym, since_ms=since, limit=600)  # type: ignore[attr-defined]
+                            ticks = self.history_ticks(sym, since_ms=now - warmup_ms, limit=800)
                         except Exception:
                             _inc_block(f"{sym}:no_history")
                             continue
 
-                        prices = []
-                        vols = []
-                        ts_last = 0
-
-                        for t in ticks or []:
+                        # build aligned arrays
+                        prices: list[float] = []
+                        ts_list: list[int] = []
+                        vols: list[float] = []
+                        for t in (ticks or []):
                             if isinstance(t, dict):
                                 ts = int(t.get("ts_ms") or t.get("ts") or 0)
                                 px = t.get("price")
                                 if px is None:
-                                    b = t.get("bid")
-                                    a = t.get("ask")
-                                    if b and a:
-                                        px = (float(b) + float(a)) / 2.0
+                                    b_ = t.get("bid"); a_ = t.get("ask")
+                                    if b_ and a_:
+                                        px = (float(b_) + float(a_)) / 2.0
                                 vol = t.get("volume") or t.get("qty") or t.get("size") or 0.0
                             else:
                                 ts = int(getattr(t, "ts_ms", getattr(t, "ts", 0)) or 0)
                                 px = getattr(t, "price", None)
                                 if px is None:
-                                    b = getattr(t, "bid", None)
-                                    a = getattr(t, "ask", None)
-                                    if b and a:
-                                        px = (float(b) + float(a)) / 2.0
+                                    b_ = getattr(t, "bid", None); a_ = getattr(t, "ask", None)
+                                    if b_ and a_:
+                                        px = (float(b_) + float(a_)) / 2.0
                                 vol = getattr(t, "volume", getattr(t, "qty", getattr(t, "size", 0.0)))
-
-                            if ts:
-                                if ts > ts_last:
-                                    ts_last = ts
-                            if px is not None:
+                            if ts > 0 and px is not None:
+                                ts_list.append(ts)
                                 prices.append(float(px))
                                 try:
                                     vols.append(float(vol) if vol is not None else 0.0)
                                 except Exception:
                                     vols.append(0.0)
 
-                        if len(prices) < long_n:
+                        if len(prices) < 24:
                             _inc_block(f"{sym}:skip_warmup")
                             continue
-
-                        if ts_last and now - ts_last > stale_ms:
+                        if ts_list and now - ts_list[-1] > stale_ms:
                             _inc_block(f"{sym}:stale_tick")
                             continue
 
-                        last_px = prices[-1]
+                        # time-slicing helpers
+                        def slice_since(ms: int) -> list[float]:
+                            if not ts_list:
+                                return []
+                            lo = ts_list[-1] - ms
+                            return [p for p, ts in zip(prices, ts_list) if ts >= lo]
 
-                        # --- локальные уровни (S/R) ---
-                        sr_window = min(max(long_n, 60), len(prices))
-                        window_prices = prices[-sr_window:]
-                        local_high = max(window_prices)
-                        local_low = min(window_prices)
-                        range_px = max(0.0, local_high - local_low)
+                        _short = slice_since(short_ms)
+                        _long  = slice_since(long_ms)
 
-                        # если вообще нет движения — смысла нет
-                        if range_px < step * 4:
-                            _inc_block(f"{sym}:skip_chop_range")
+                        if len(_short) < 6 or len(_long) < 12:
+                            _inc_block(f"{sym}:skip_warmup")
                             continue
 
-                        # --- MAs + наклон ---
-                        short_ma = sum(prices[-short_n:]) / short_n
-                        long_ma = sum(prices[-long_n:]) / long_n
+                        short_ma = sum(_short) / len(_short)
+                        long_ma  = sum(_long) / len(_long)
                         if long_ma <= 0:
                             _inc_block(f"{sym}:skip_no_baseline")
                             continue
 
-                        if len(prices) >= short_n + 5:
-                            prev_short_ma = sum(prices[-short_n - 5:-5]) / short_n
-                        else:
-                            prev_short_ma = short_ma
+                        # local range from long window
+                        local_high = max(_long)
+                        local_low  = min(_long)
+                        range_px   = max(0.0, local_high - local_low)
 
-                        diff_rel = (short_ma - long_ma) / long_ma
+                        # anti-chop: require either ≥1 tick OR ≥0.6 bps
+                        min_range_px_ticks = step * float(min_range_ticks)
+                        min_range_px_bps   = mid * (min_range_bps / 10_000.0)
+                        if not (range_px >= min_range_px_ticks or range_px >= min_range_px_bps):
+                            _inc_block(f"{sym}:skip_chop_range")
+                            continue
+
+                        # slope via older vs newer chunk inside short window
+                        k = max(4, int(0.4 * len(_short)))
+                        prev_short_ma = sum(_short[:-k]) / max(1, len(_short) - k) if len(_short) > k else short_ma
+
+                        last_px   = prices[-1]
+                        diff_rel  = (short_ma - long_ma) / long_ma
                         slope_rel = (short_ma - prev_short_ma) / prev_short_ma if prev_short_ma > 0 else 0.0
 
-                        # --- оценка волатильности для стопа ---
+                        # stop distance (vol-aware)
                         try:
                             sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid))
                         except Exception:
-                            # простая оценка: std последних цен
-                            if len(prices) >= 20:
-                                m = sum(prices[-20:]) / 20.0
-                                var = sum((p - m) ** 2 for p in prices[-20:]) / 20.0
+                            # sigma fallback
+                            if len(_long) >= 20:
+                                m = sum(_long[-20:]) / 20.0
+                                var = sum((p - m) ** 2 for p in _long[-20:]) / 20.0
                                 sigma = math.sqrt(var)
                             else:
-                                sigma = range_px / 6.0 if range_px > 0 else step * min_stop_ticks
-
-                            sl_distance_px = max(
-                                min_stop_ticks * step,
-                                1.2 * sigma,
-                                spread * 2.0,
-                            )
+                                sigma = range_px / 6.0 if range_px > 0 else step * min_range_ticks
+                            sl_distance_px = max(step * float(min_range_ticks), 1.2 * sigma, spread * 2.0)
 
                         if sl_distance_px <= 0:
                             _inc_block(f"{sym}:bad_sl_distance")
                             continue
 
-                        # --- триггеры уровней относительно стопа ---
-                        # Чем уже стоп, тем ближе хотим быть к уровню.
+                        # trigger zones within range
                         upper_trigger = local_high - 0.5 * sl_distance_px
-                        lower_trigger = local_low + 0.5 * sl_distance_px
+                        lower_trigger = local_low  + 0.5 * sl_distance_px
 
-                        side = None
+                        side: str | None = None
+                        signal_kind: str | None = None  # "momentum" | "reversion"
 
-                        # 1) MOMENTUM BREAKOUT: работаем по тренду
-                        #    BUY: у верхней границы + short MA выше long + наклон вверх
+                        # MOMENTUM breakout
                         if (
                             last_px >= upper_trigger
                             and diff_rel > ma_edge_mom
                             and slope_rel > slope_edge_mom
                         ):
-                            side = "BUY"
-
-                        #    SELL: у нижней границы + short MA ниже long + наклон вниз
+                            side = "BUY"; signal_kind = "momentum"
                         elif (
                             last_px <= lower_trigger
                             and diff_rel < -ma_edge_mom
                             and slope_rel < -slope_edge_mom
                         ):
-                            side = "SELL"
+                            side = "SELL"; signal_kind = "momentum"
 
-                        # 2) REVERSION BOUNCE: только если нет явного тренда, но есть разворот от уровня
+                        # REVERSION bounce (only if trend not strong)
                         if side is None:
-                            edge_zone = 0.2 * range_px
+                            trend_strong = abs(diff_rel) > ma_edge_mom * 2.0
+                            if not trend_strong:
+                                edge_zone = 0.25 * range_px
+                                if (
+                                    last_px <= local_low + edge_zone
+                                    and diff_rel > ma_edge_rev
+                                    and slope_rel > 0.0
+                                ):
+                                    side = "BUY"; signal_kind = "reversion"
+                                elif (
+                                    last_px >= local_high - edge_zone
+                                    and diff_rel < -ma_edge_rev
+                                    and slope_rel < 0.0
+                                ):
+                                    side = "SELL"; signal_kind = "reversion"
+                        
+                        # --- Fast micro-momentum (если фичи доступны) ---
+                        if side is None and self._last_micro.get(sym):
+                            lm = self._last_micro.get(sym) or {}
+                            drift = float(lm.get("microprice_drift") or 0.0)
+                            tvel  = float(lm.get("tick_velocity") or 0.0)
+                            spread_ticks_now = sprticks
 
-                            # отбой от поддержки
-                            if (
-                                last_px <= local_low + edge_zone
-                                and diff_rel > ma_edge_rev
-                                and slope_rel > 0.0
-                            ):
-                                side = "BUY"
-
-                            # отбой от сопротивления
-                            elif (
-                                last_px >= local_high - edge_zone
-                                and diff_rel < -ma_edge_rev
-                                and slope_rel < 0.0
-                            ):
-                                side = "SELL"
+                            # условия: маленький спред, явный дрейф и тиковая скорость
+                            if spread_ticks_now <= max_spread_ticks_default and abs(drift) > 0.35 and abs(tvel) > 0.6:
+                                if drift > 0 and tvel > 0:
+                                    side = "BUY";  signal_kind = "momentum"
+                                elif drift < 0 and tvel < 0:
+                                    side = "SELL"; signal_kind = "momentum"
 
                         if side is None:
                             _inc_block(f"{sym}:skip_no_signal")
                             continue
 
-                        # --- объём как мягкий фильтр (если есть данные) ---
+                        # light relative volume filter
                         if vols and sum(vols) > 0:
-                            if len(vols) > 12:
-                                base_slice = vols[:-5]
-                            else:
-                                base_slice = vols
+                            base_slice = vols[:-5] if len(vols) > 12 else vols
                             recent_vol = sum(vols[-5:])
-                            base_vol = (sum(base_slice) / max(1, len(base_slice))) if base_slice else 0.0
-
-                            # если совсем дохлый объём — скипаем
-                            if base_vol > 0 and recent_vol < 0.4 * base_vol:
+                            base_vol   = (sum(base_slice) / max(1, len(base_slice))) if base_slice else 0.0
+                            if base_vol > 0 and recent_vol < 0.3 * base_vol:
                                 _inc_block(f"{sym}:skip_low_volume")
                                 continue
 
-                        # --- risk.filters (если доступны) ---
-                        if _HAS_FILTERS:
+                        # risk.filters safety pre-check
+                        if _HAS_FILTERS and safety_cfg is not None:
                             try:
-                                micro = MicroCtx(
-                                    spread_ticks=float(spr_ticks),
-                                    top5_liq_usd=1e12,
+                                lm = (self._last_micro.get(sym, {}) or {})
+                                eff_liq = float(lm.get("top5_liq_usd") or 0.0)
+                                if eff_liq <= 0:
+                                    tl = float(lm.get("top_liq_usd") or 0.0)
+                                    eff_liq = tl * 3.0 if tl > 0 else 0.0
+
+                                micro_ctx = MicroCtx(
+                                    spread_ticks=float(sprticks),
+                                    top5_liq_usd=float(eff_liq if eff_liq and eff_liq > 0 else 1e9),
                                 )
                                 tctx = TimeCtx(
                                     ts_ms=now,
                                     server_time_offset_ms=getattr(self, "_server_time_offset_ms", 0),
                                 )
-
-                                pre = check_entry_safety(
-                                    side,
-                                    micro=micro,
-                                    time_ctx=tctx,
-                                    pos_ctx=None,
-                                    safety=self._safety_cfg,
-                                )
-                                if not pre.allow:
-                                    _inc_block(f"{sym}:safety_pre_block")
-                                    continue
-
-                                if side == "BUY":
-                                    sl_px = mid - sl_distance_px
-                                else:
-                                    sl_px = mid + sl_distance_px
-
+                                sl_px = (mid - sl_distance_px) if side == "BUY" else (mid + sl_distance_px)
                                 pos_ctx = PositionalCtx(
                                     entry_px=float(mid),
                                     sl_px=float(sl_px),
                                     leverage=float(getattr(self, "_leverage", 10.0)),
                                 )
-
-                                post = check_entry_safety(
-                                    side,
-                                    micro=micro,
-                                    time_ctx=tctx,
-                                    pos_ctx=pos_ctx,
-                                    safety=self._safety_cfg,
-                                )
-                                if not post.allow:
-                                    _inc_block(f"{sym}:safety_post_block")
+                                dec = check_entry_safety(side, micro=micro_ctx, time_ctx=tctx, pos_ctx=pos_ctx, safety=safety_cfg)
+                                if not dec.allow:
+                                    _inc_block(f"{sym}:safety_pre:" + ",".join(dec.reasons))
                                     continue
-
                             except Exception:
-                                log.exception("[strategy] safety-check failed for %s", sym)
+                                log.exception("[strategy] safety check failed for %s", sym)
 
-                        # --- вход ---
+                        # ENTRY: route by kind (momentum→IOC, reversion→maker)
                         try:
-                            report = await self.place_entry_auto(sym, side)
+                            rep = await self._place_entry_with_kind(sym, side, signal_kind, sl_distance_px, mid, bid, ask)
                         except Exception as e:
-                            log.exception(
-                                "[strategy] place_entry_auto failed for %s %s: %s",
-                                sym,
-                                side,
-                                e,
-                            )
+                            log.exception("[strategy] place_entry failed for %s %s: %s", sym, side, e)
                             _inc_block(f"{sym}:entry_error")
                             continue
 
-                        if isinstance(report, dict) and not report.get("ok", True):
-                            reason = (report.get("reason") or "rejected")
+                        if not isinstance(rep, dict) or not rep.get("ok", False):
+                            reason = (rep or {}).get("reason", "rejected")
                             _inc_block(f"{sym}:entry_rejected_{reason}")
                             continue
 
-                        # успешный вход → фиксируем cooldown
                         last_entry_ts[sym] = now
 
                     except Exception:
@@ -844,13 +829,12 @@ class Worker:
 
                 await asyncio.sleep(base_delay_s)
 
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                log.exception("[strategy] outer-loop error")
-                await asyncio.sleep(1.0)
-
-        log.info("[strategy] _strategy_loop stopped")
+        except asyncio.CancelledError:
+            log.info("[strategy] _strategy_loop canceled")
+            return
+        except Exception:
+            log.exception("[strategy] outer-loop error")
+            await asyncio.sleep(1.0)
     
     def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
         """
@@ -901,45 +885,77 @@ class Worker:
         decision: Optional[Any] = None,
     ) -> SLTPPlan:
         """
-        Единая точка расчёта SL/TP.
+        Единая точка расчёта SL/TP (fee-aware, с безопасными фолбэками).
 
-        Принцип:
-        - вычисляем адекватную дистанцию до SL через _compute_sl_distance_px
-          (учёт тика, спреда, воли, min bps),
-        - выбираем целевой RR по типу сигнала (_tp_rr_from_decision),
-        - строим базовый план через exec.sltp.compute_sltp,
-        - прогоняем через _normalize_sltp для финальной валидации.
+        Шаги:
+        - считаем базовую дистанцию до SL через _compute_sl_distance_px (тик/спред/вола/bps);
+        - выбираем целевой RR по типу сигнала (_tp_rr_from_decision);
+        - строим план через compute_sltp_fee_aware (если доступен), иначе compute_sltp;
+        - нормализуем финальные уровни через _normalize_sltp (округления, минимумы).
         """
         symbol = symbol.upper()
         spec = self.specs[symbol]
         tick = float(spec.price_tick) or 0.1
 
-        # best bid/ask -> спред в тиках
+        # best bid/ask -> спред (в bps и в px)
         bid, ask = self.hub.best_bid_ask(symbol)
-        spread_ticks = 0.0
-        if tick > 0.0 and bid > 0.0 and ask > 0.0:
-            spread_ticks = max(0.0, (ask - bid) / tick)
+        spread_px = max(0.0, (ask - bid))
+        spread_bps = 0.0
+        if bid > 0.0 and ask > 0.0 and (bid + ask) > 0.0:
+            mid = (bid + ask) / 2.0
+            if mid > 0.0:
+                spread_bps = (spread_px / mid) * 1e4
 
         # базовая дистанция до SL
-        sl_distance_px = float(self._compute_sl_distance_px(symbol, spread_ticks))
+        # (учитывает тик, спред, волу и минимум в bps)
+        # используем spread_ticks только как хинт, реальная логика внутри метода
+        sl_distance_px = float(self._compute_sl_distance_px(symbol, spread_px / max(tick, 1e-12)))
         if sl_distance_px <= 0.0:
-            sl_distance_px = max(tick, abs(entry_px) * 0.0008)  # на всякий случай
+            sl_distance_px = max(tick, abs(entry_px) * 0.0008)  # резерв
 
         # целевой RR
         rr = float(self._tp_rr_from_decision(decision))
 
-        # --- базовый план через compute_sltp ---
+        # комиссии
+        maker_bps, taker_bps = self._fees_for_symbol(symbol)
+        # консервативная добавка к выходу: половина спреда в bps
+        addl_exit_bps = 0.5 * spread_bps
+
+        # --- построение плана ---
         try:
-            base_plan = compute_sltp(
-                side=side,
-                entry_px=float(entry_px),
-                qty=float(qty),
-                price_tick=tick,
-                sl_distance_px=sl_distance_px,
-                rr=rr,
-            )
+            if compute_sltp_fee_aware:
+                base_plan = compute_sltp_fee_aware(
+                    side=side,
+                    entry_px=float(entry_px),
+                    qty=float(qty),
+                    price_tick=tick,
+                    sl_distance_px=sl_distance_px,
+                    rr_target=rr,
+                    maker_bps=maker_bps,
+                    taker_bps=taker_bps,
+                    entry_taker_like=True,   # вход считаем как taker
+                    exit_taker_like=True,    # выход считаем как taker
+                    addl_exit_bps=float(addl_exit_bps),
+                    # полы/минимумы
+                    min_stop_ticks=max(int(self._min_stop_ticks_default()), 8),
+                    spread_px=spread_px,
+                    spread_mult=1.5,
+                    min_sl_bps=12.0,
+                    # требуем минимальный net-RR (после комиссий/спреда)
+                    min_net_rr=1.2,
+                    allow_expand_tp=True,
+                    sl_px_hint=None,
+                )
+            else:
+                base_plan = compute_sltp(
+                    side=side,
+                    entry_px=float(entry_px),
+                    qty=float(qty),
+                    price_tick=tick,
+                    sl_distance_px=sl_distance_px,
+                    rr=rr,
+                )
         except Exception as e:
-            # запасной вариант, если вдруг что-то пошло не так
             logger.warning("compute_sltp failed for %s (%s), using fallback", symbol, e)
             if side == "BUY":
                 sl_px = entry_px - sl_distance_px
@@ -947,7 +963,6 @@ class Worker:
             else:
                 sl_px = entry_px + sl_distance_px
                 tp_px = entry_px - rr * sl_distance_px
-
             base_plan = SLTPPlan(
                 sl_px=float(sl_px),
                 tp_px=float(tp_px),
@@ -955,7 +970,7 @@ class Worker:
                 tp_qty=float(qty),
             )
 
-        # --- финальная нормализация под правила воркера ---
+        # финальная нормализация (округления/минимумы/стороны)
         plan = self._normalize_sltp(
             symbol=symbol,
             side=side,
@@ -967,16 +982,15 @@ class Worker:
     
     def _tp_rr_from_decision(self, decision: Optional[Decision]) -> float:
         """
-        Выбор целевого RR для TP по типу сигнала (очень простой хелпер).
-        Если нет инфы — используем 1.5R.
+        Выбор целевого RR для TP по типу сигнала.
+        Без информации возвращает дефолт 1.5R.
         """
         try:
             kind = (getattr(decision, "kind", "") or "").lower()
         except Exception:
             kind = ""
 
-        # Можно подстроить под твою CandidateEngine:
-        if "rev" in kind or "mean" in kind or "revert" in kind:
+        if "rev" in kind or "mean" in kind or "revert" in kind or "bounce" in kind:
             return 1.3
         if "mom" in kind or "break" in kind or "trend" in kind:
             return 1.6
@@ -1057,6 +1071,38 @@ class Worker:
             tp_qty=tp_qty,
         )
     
+    # --- TP detection & force close ----------------------------------------------
+
+    def _tp_hit(self, side: str, tp_px: float, bid: float, ask: float, price_tick: float, tol_ticks: int = 1) -> bool:
+        """
+        Считаем TP-хит по исполнимой стороне:
+        LONG → можем выйти по bid >= tp;  SHORT → по ask <= tp.
+        Добавляем допуск tol_ticks*tick, чтобы не зависеть от квантования цены.
+        """
+        if not tp_px or tp_px <= 0:
+            return False
+        tol = max(0.0, float(tol_ticks) * float(max(price_tick, 0.0)))
+        if side == "BUY":
+            return (bid or 0.0) >= (tp_px - tol)
+        else:
+            return (ask or 0.0) <= (tp_px + tol)
+
+    async def _force_flatten_after_tp(self, symbol: str, side: str, qty: float) -> dict:
+        """
+        Аварийное закрытие позиции рыночным reduceOnly (если лимит не исполнился быстро).
+        """
+        try:
+            # если есть специальная ручка — используй её; иначе fallback на flatten()
+            close_side = "SELL" if side == "BUY" else "BUY"
+            # предпочтительно reduceOnly MARKET:
+            place_reduce = getattr(self, "place_reduce_only_market", None)
+            if callable(place_reduce):
+                return await place_reduce(symbol, close_side, float(qty))
+        except Exception:
+            pass
+        # фолбэк
+        return await self.flatten(symbol)
+    
     # ---------- public ops ----------
 
     def best_bid_ask(self, symbol: str) -> Tuple[float, float]:
@@ -1079,42 +1125,227 @@ class Worker:
         return result
 
     # --- ВХОДЫ ---
+    @contextmanager
+    def _temporary_exec_overrides(
+        self,
+        sym: str,
+        *,
+        time_in_force: Optional[str] = None,
+        prefer_maker: Optional[bool] = None,
+        limit_offset_ticks: Optional[int] = None,
+    ):
+        """
+        Temporarily override per-symbol Executor config fields for one call.
+        Safe for single-threaded worker context.
+        """
+        ex = self.execs.get(sym)
+        if ex is None or not hasattr(ex, "c"):
+            yield
+            return
+
+        c = ex.c
+        old_tif = getattr(c, "time_in_force", None)
+        old_pm  = getattr(c, "prefer_maker", None)
+        old_lo  = getattr(c, "limit_offset_ticks", None)
+
+        try:
+            if time_in_force is not None:
+                c.time_in_force = str(time_in_force)
+            if prefer_maker is not None:
+                c.prefer_maker = bool(prefer_maker)
+            if limit_offset_ticks is not None:
+                try:
+                    c.limit_offset_ticks = int(limit_offset_ticks)
+                except Exception:
+                    pass
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                if time_in_force is not None and old_tif is not None:
+                    c.time_in_force = old_tif
+                if prefer_maker is not None and old_pm is not None:
+                    c.prefer_maker = old_pm
+                if limit_offset_ticks is not None and old_lo is not None:
+                    c.limit_offset_ticks = old_lo
+    
+    async def place_entry(
+        self,
+        symbol: str,
+        side: Side,
+        qty: float,
+        limit_offset_ticks: Optional[int] = None,
+        *,
+        sl_distance_px: Optional[float] = None,
+        sl_px: Optional[float] = None,
+        tp_px: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Unified entry:
+        - Accepts optional limit_offset_ticks (temporary override for this call).
+        - If sl_px/tp_px are not given, computes them.
+            If sl_distance_px is provided → use it for planning; else use volatility-based distance.
+        - Enforces qty step & min notional.
+        Compatible with older callers that passed (symbol, side, qty) or (symbol, side, qty, sl_px, tp_px).
+        """
+        sym = symbol.upper()
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            return {"ok": False, "reason": "bad_side"}
+
+        ex = self.execs.get(sym)
+        if ex is None:
+            return {"ok": False, "reason": "no_executor"}
+
+        # steps for later fee accounting
+        self._entry_steps.pop(sym, None)
+
+        # best bid/ask for mid/guards
+        bid, ask = self.best_bid_ask(sym)
+        if bid <= 0 or ask <= 0:
+            return {"ok": False, "reason": "no_best_bid_ask"}
+        entry_px = (bid + ask) / 2.0
+        if entry_px <= 0:
+            return {"ok": False, "reason": "bad_entry_px"}
+
+        # qty step & min notional
+        spec = self.specs[sym]
+        step = max(float(spec.qty_step), 1e-12)
+        qty = (int(qty / step)) * step
+        if qty <= 0:
+            return {"ok": False, "reason": "qty_rounded_to_zero"}
+
+        notional = qty * entry_px
+        if notional < float(self._min_notional_usd):
+            return {"ok": False, "reason": "below_min_notional", "hint": f"need ≥ ${self._min_notional_usd}"}
+
+        # Build SL/TP if needed
+        if sl_px is None or tp_px is None:
+            # choose stop distance: explicit → volatility-based
+            if sl_distance_px is None or sl_distance_px <= 0:
+                try:
+                    sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=entry_px))
+                except Exception:
+                    sl_distance_px = None
+
+            if sl_distance_px is not None and sl_distance_px > 0:
+                # direct plan using provided distance
+                rr = self._tp_rr_from_decision(None)
+                try:
+                    plan = compute_sltp(
+                        side=s,
+                        entry_px=float(entry_px),
+                        qty=float(qty),
+                        price_tick=float(spec.price_tick),
+                        sl_distance_px=float(sl_distance_px),
+                        rr=float(rr),
+                    )
+                    sl_px = float(plan.sl_px)
+                    tp_px = float(plan.tp_px)
+                except Exception:
+                    # fallback math
+                    if s == "BUY":
+                        sl_px = entry_px - sl_distance_px
+                        tp_px = entry_px + rr * sl_distance_px
+                    else:
+                        sl_px = entry_px + sl_distance_px
+                        tp_px = entry_px - rr * sl_distance_px
+                # normalize to internal rules (rounding, floors, sanity)
+                plan_norm = self._normalize_sltp(sym, s, entry_px, SLTPPlan(sl_px=sl_px, tp_px=tp_px, sl_qty=qty, tp_qty=qty))
+                sl_px, tp_px = float(plan_norm.sl_px), float(plan_norm.tp_px)
+            else:
+                # use standard builder (tick/spread/vol/min-bps aware)
+                plan = self._build_sltp_plan(
+                    symbol=sym,
+                    side=s,
+                    entry_px=float(entry_px),
+                    qty=float(qty),
+                    micro=self._last_micro.get(sym),
+                    indi=self._last_indi.get(sym),
+                    decision=None,
+                )
+                sl_px = float(plan.sl_px)
+                tp_px = float(plan.tp_px)
+
+        # Submit through executor with optional per-call overrides
+        try:
+            ctx_mgr = self._temporary_exec_overrides(
+                sym,
+                limit_offset_ticks=limit_offset_ticks if limit_offset_ticks is not None else None,
+            )
+        except Exception:
+            # fallback if override helper fails for any reason
+            @contextlib.contextmanager
+            def _dummy():  # type: ignore
+                yield
+            ctx_mgr = _dummy()
+
+        try:
+            with ctx_mgr:
+                # NEW: не передаём sl_px/tp_px в executor — у executora их больше нет в сигнатуре
+                rep: ExecutionReport = await ex.place_entry(sym, s, float(qty))
+                self._accumulate_exec_counters(rep.steps)
+                self._entry_steps[sym] = list(rep.steps or [])
+        except Exception as e:
+            logger.exception("[place_entry] executor error for %s %s: %s", sym, s, e)
+            return {"ok": False, "reason": "exec_error", "error": str(e)}
+
+        # update runtime position
+        lock = self._locks[sym]
+        async with lock:
+            self._pos[sym] = PositionState(
+                state="OPEN",
+                side=s,
+                qty=float(qty),
+                entry_px=float(entry_px),
+                sl_px=float(sl_px) if sl_px is not None else None,
+                tp_px=float(tp_px) if tp_px is not None else None,
+                opened_ts_ms=self._now_ms(),
+                timeout_ms=self._pos[sym].timeout_ms,
+            )
+            with contextlib.suppress(Exception):
+                await self._fsm[sym].on_open()
+
+        return {
+            "ok": True,
+            "symbol": sym,
+            "side": s,
+            "qty": float(qty),
+            "entry_px": float(entry_px),
+            "sl_px": float(sl_px) if sl_px is not None else None,
+            "tp_px": float(tp_px) if tp_px is not None else None,
+            "steps": self._entry_steps.get(sym, []),
+        }
 
     async def place_entry_auto(self, symbol: str, side: str) -> dict:
         """
-        Автовход по консистентной риск-модели.
+        Auto entry with risk-based sizing and SL/TP planning (fee-aware).
 
-        Гарантирует:
-        - Денежный риск на сделку ≈ risk_per_trade_pct * equity (но не меньше min_risk_usd_floor).
-        - Жёсткий верхний лимит по плечу (не берём больше, чем позволяет leverage).
-        - Учитывает min_notional_usd.
-        - Стоп по волатильности (если есть _compute_vol_stop_distance_px) или по min_stop_ticks.
-        - Если план даёт риск сильно выше таргета — сделка не открывается.
+        - Вычисляет дистанцию SL (волатильность/тик/спред/bps);
+        - Проверяет, что TP в bps >= комиссий+спреда+slippage+min_edge;
+        - Сайзит позицию по заданному риску;
+        - Строит SL/TP через fee-aware планировщик (fallback на простой);
+        - Делает unified place_entry с готовыми SL/TP.
         """
-
         import math
-        from exec.sltp import compute_sltp
 
         log = logging.getLogger(__name__ + ".place_entry_auto")
 
-        # --- normalize inputs ---
+        # normalize inputs
         sym = str(symbol).upper()
         s = str(side).upper()
         if s == "LONG":
             s = "BUY"
-        elif s == "SHORT":
+        if s == "SHORT":
             s = "SELL"
         if s not in ("BUY", "SELL"):
             return {"ok": False, "reason": "bad_side"}
 
-        # --- best bid/ask ---
+        # best bid/ask
         try:
             bid, ask = self.best_bid_ask(sym)
         except Exception:
             bid = ask = 0.0
-
         if bid <= 0 or ask <= 0:
-            # fallback через diag.best
             try:
                 d = self.diag() or {}
                 bi = (d.get("best") or {}).get(sym) or {}
@@ -1122,69 +1353,65 @@ class Worker:
                 ask = float(bi.get("ask") or 0.0)
             except Exception:
                 bid = ask = 0.0
-
         if bid <= 0 or ask <= 0:
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:no_ce")
+            self._inc_block_reason(f"{sym}:no_best_bid_ask")
             return {"ok": False, "reason": "no_best_bid_ask"}
 
         mid = (bid + ask) / 2.0
         if mid <= 0:
             return {"ok": False, "reason": "bad_mid"}
 
-        # --- symbol steps ---
-        price_step = 0.1
-        qty_step = 0.001
-        try:
-            specs = getattr(self, "specs", {}) or {}
-            spec = specs.get(sym)
-            if spec is not None:
-                ps = getattr(spec, "price_step", None)
-                if ps is None:
-                    ps = getattr(spec, "price_tick", None)
-                if ps is not None:
-                    price_step = float(ps)
-                qs = getattr(spec, "qty_step", None)
-                if qs is not None:
-                    qty_step = float(qs)
-        except Exception:
-            pass
+        # symbol steps
+        price_step = self._get_price_step(sym)
         if price_step <= 0:
             price_step = 0.1
+        qty_step = 0.001
+        try:
+            spec = (self.specs or {}).get(sym)
+            if spec is not None and getattr(spec, "qty_step", None) is not None:
+                qty_step = float(spec.qty_step)
+        except Exception:
+            pass
         if qty_step <= 0:
             qty_step = 0.001
 
-        # --- exec cfg ---
-        exec_cfg = getattr(self, "_exec_cfg", {}) or {}
-        min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 24))
+        # exec cfg (минимум по тикам для стопа)
+        exec_flat_cfg = getattr(self, "_exec_cfg", {}) or {}
+        min_stop_ticks = int(exec_flat_cfg.get("min_stop_ticks", round(self._min_stop_ticks_default())))
         if min_stop_ticks <= 0:
-            min_stop_ticks = 24
+            min_stop_ticks = int(round(self._min_stop_ticks_default()))
 
         spread = max(0.0, ask - bid)
 
-        # --- stop distance (vol-based if possible) ---
+        # stop distance (вола + полы)
         sl_distance_px = 0.0
         if hasattr(self, "_compute_vol_stop_distance_px"):
             try:
-                sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid))
+                sl_distance_px = float(self._compute_vol_stop_distance_px(
+                    sym, mid_px=mid, min_stop_ticks_cfg=min_stop_ticks
+                ))
             except Exception:
                 sl_distance_px = 0.0
-
         if sl_distance_px <= 0:
             sl_distance_px = max(
-                min_stop_ticks * price_step,  # конфиг
-                spread * 2.0,                 # чуть шире спреда
-                price_step * 6.0,             # минимальный осмысленный стоп
+                min_stop_ticks * price_step,  # config floor
+                spread * 2.0,
+                price_step * 6.0,
             )
-
         if sl_distance_px <= 0:
             return {"ok": False, "reason": "bad_sl_distance"}
 
-        # --- load risk & account cfg (из внутренних полей или diag) ---
+        # требуемый RR (гросс), edge-проверка в bps
+        rr = 1.6
+        ok_edge, info_edge = self._entry_edge_ok(sym, mid, bid, ask, sl_distance_px, rr)
+        if not ok_edge:
+            self._inc_block_reason(f"{sym}:edge_too_small")
+            return {"ok": False, "reason": "edge_too_small", "edge_diag": info_edge}
+
+        # risk & account cfg
         def _load_cfg():
             risk = getattr(self, "_risk_cfg", None)
             acc = getattr(self, "_account_cfg", None)
-
             if not isinstance(risk, dict) or not isinstance(acc, dict):
                 try:
                     d = self.diag() or {}
@@ -1195,50 +1422,38 @@ class Worker:
                 except Exception:
                     risk = risk or {}
                     acc = acc or {}
-
             return risk or {}, acc or {}
 
         risk_cfg, acc_cfg = _load_cfg()
-
         equity = float(acc_cfg.get("equity", acc_cfg.get("starting_equity_usd", 1000.0)))
         lev = float(acc_cfg.get("leverage", 15.0))
         min_notional = float(acc_cfg.get("min_notional_usd", 5.0))
-
         risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.15))
         min_risk_usd_floor = float(risk_cfg.get("min_risk_usd_floor", 1.0))
 
-        # таргетный риск на сделку
-        desired_risk_usd = max(
-            min_risk_usd_floor,
-            equity * (risk_pct / 100.0),
-        )
+        desired_risk_usd = max(min_risk_usd_floor, equity * (risk_pct / 100.0))
         if desired_risk_usd <= 0:
             return {"ok": False, "reason": "bad_risk_cfg"}
 
-        # --- auto sizing: под стоп sl_distance_px ---
+        # auto sizing
         raw_qty = desired_risk_usd / sl_distance_px
         max_qty_by_lev = (equity * lev) / mid
         qty = min(raw_qty, max_qty_by_lev)
 
-        # квантуем по шагу
         if qty_step > 0:
             qty = math.floor(qty / qty_step) * qty_step
-
         if qty <= 0:
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
+            self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
             return {
                 "ok": False,
                 "reason": "qty_rounded_to_zero",
                 "hint": f"increase risk_per_trade_pct or equity; desired_risk_usd={desired_risk_usd:.4f}",
             }
 
-        # проверка min_notional
         notional = qty * mid
         if notional < min_notional:
             min_qty = math.ceil((min_notional / mid) / qty_step) * qty_step
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:below_min_notional")
+            self._inc_block_reason(f"{sym}:below_min_notional")
             return {
                 "ok": False,
                 "reason": "below_min_notional",
@@ -1248,17 +1463,41 @@ class Worker:
                 "hint": f"min notional ${min_notional} → try qty ≥ {min_qty}",
             }
 
-        # --- SL / TP план (RR фиксируем как 1.6R по умолчанию) ---
-        rr = 1.6
+        # --- план SL/TP (fee-aware с фолбэком) ---
+        maker_bps, taker_bps = self._fees_for_symbol(sym)
+        spread_bps = (spread / mid) * 1e4 if mid > 0 else 0.0
+        addl_exit_bps = 0.5 * spread_bps
+
         try:
-            plan = compute_sltp(
-                side=s,
-                entry_px=float(mid),
-                qty=float(qty),
-                price_tick=float(price_step),
-                sl_distance_px=float(sl_distance_px),
-                rr=float(rr),
-            )
+            if compute_sltp_fee_aware:
+                plan = compute_sltp_fee_aware(
+                    side=s,
+                    entry_px=float(mid),
+                    qty=float(qty),
+                    price_tick=float(price_step),
+                    sl_distance_px=float(sl_distance_px),
+                    rr_target=float(rr),
+                    maker_bps=maker_bps,
+                    taker_bps=taker_bps,
+                    entry_taker_like=True,
+                    exit_taker_like=True,
+                    addl_exit_bps=float(addl_exit_bps),
+                    min_stop_ticks=int(min_stop_ticks),
+                    spread_px=spread,
+                    spread_mult=1.5,
+                    min_sl_bps=12.0,
+                    min_net_rr=1.2,     # требуемый net-RR
+                    allow_expand_tp=True,
+                )
+            else:
+                plan = compute_sltp(
+                    side=s,
+                    entry_px=float(mid),
+                    qty=float(qty),
+                    price_tick=float(price_step),
+                    sl_distance_px=float(sl_distance_px),
+                    rr=float(rr),
+                )
             sl_px = float(plan.sl_px)
             tp_px = float(plan.tp_px)
         except Exception:
@@ -1269,43 +1508,82 @@ class Worker:
                 sl_px = mid + sl_distance_px
                 tp_px = mid - sl_distance_px * rr
 
-        expected_risk_usd = abs(sl_px - mid) * qty
+        # expected risk & re-size qty to match target (no hard reject)
+        risk_px = abs(sl_px - mid)
+        if risk_px <= 0:
+            self._inc_block_reason(f"{sym}:plan_bad_risk_px")
+            return {"ok": False, "reason": "bad_sl_distance"}
 
-        # если по факту получается сильно больше таргета — не лезем
-        if expected_risk_usd > 1.2 * desired_risk_usd:
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:plan_risk_mismatch")
-            return {
-                "ok": False,
-                "reason": "plan_risk_mismatch",
-                "expected_risk_usd": round(expected_risk_usd, 6),
-                "target_risk_usd": round(desired_risk_usd, 6),
-            }
+        # 1) первичный риск от чернового qty
+        expected_risk_usd = risk_px * qty
 
-        # --- исполнение через place_entry ---
+        # 2) подгоняем qty под target_risk_usd и ограничения (плечо, нотионал, шаг)
+        target_risk_usd = desired_risk_usd
+        adj_qty = target_risk_usd / risk_px
+
+        # лимит по плечу
+        max_qty_by_lev = (equity * lev) / mid
+        adj_qty = min(adj_qty, max_qty_by_lev)
+
+        # минимальная нотиональ
+        min_qty_by_notional = min_notional / mid
+        adj_qty = max(adj_qty, min_qty_by_notional)
+
+        # к шагу лота
+        if qty_step > 0:
+            adj_qty = math.floor(adj_qty / qty_step) * qty_step
+
+        if adj_qty <= 0 or (adj_qty * mid) < min_notional:
+            self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
+            return {"ok": False, "reason": "qty_rounded_to_zero",
+                    "hint": f"min notional ${min_notional} → increase risk or equity"}
+
+        qty = float(adj_qty)
+        expected_risk_usd = round(risk_px * qty, 6)
+
+        # submit (без жёсткого отклонения по mismatch)
         try:
-            # если реализация умеет принимать sl/tp — пробуем так
-            try:
-                report = await self.place_entry(
-                    sym,
-                    s,
-                    float(qty),
-                    float(sl_px),
-                    float(tp_px),
-                )  # type: ignore[arg-type]
-            except TypeError:
-                # фолбэк: старый сигнатур без sl/tp, они будут посчитаны внутри
-                report = await self.place_entry(sym, s, float(qty))  # type: ignore[arg-type]
+            report = await self.place_entry(
+                sym, s, float(qty),
+                sl_px=float(sl_px),
+                tp_px=float(tp_px),
+            )
         except Exception as e:
             log.exception("[place_entry_auto] failed for %s %s: %s", sym, s, e)
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:entry_error")
+            self._inc_block_reason(f"{sym}:entry_error")
             return {"ok": False, "reason": "entry_error", "error": str(e)}
 
         if isinstance(report, dict) and not report.get("ok", True):
             reason = (report.get("reason") or "rejected")
-            if hasattr(self, "_inc_block_reason"):
-                self._inc_block_reason(f"{sym}:entry_rejected_{reason}")
+            self._inc_block_reason(f"{sym}:entry_rejected_{reason}")
+            return {"ok": False, "reason": reason, "report": report}
+
+        return {
+            "ok": True,
+            "symbol": sym, "side": s, "qty": float(qty),
+            "entry_px": float(mid), "sl_px": float(sl_px), "tp_px": float(tp_px),
+            "expected_risk_usd": round(expected_risk_usd, 6),
+            "target_risk_usd": round(target_risk_usd, 6),
+            "report": report,
+        }
+
+        # submit
+        try:
+            report = await self.place_entry(
+                sym,
+                s,
+                float(qty),
+                sl_px=float(sl_px),
+                tp_px=float(tp_px),
+            )
+        except Exception as e:
+            log.exception("[place_entry_auto] failed for %s %s: %s", sym, s, e)
+            self._inc_block_reason(f"{sym}:entry_error")
+            return {"ok": False, "reason": "entry_error", "error": str(e)}
+
+        if isinstance(report, dict) and not report.get("ok", True):
+            reason = (report.get("reason") or "rejected")
+            self._inc_block_reason(f"{sym}:entry_rejected_{reason}")
             return {"ok": False, "reason": reason, "report": report}
 
         return {
@@ -1320,60 +1598,184 @@ class Worker:
             "target_risk_usd": round(desired_risk_usd, 6),
             "report": report,
         }
-# bot/worker.py
+    
+    async def _place_entry_with_kind(
+        self,
+        sym: str,
+        side: str,
+        signal_kind: Optional[str],
+        sl_distance_px: float,
+        mid: float,
+        bid: float,
+        ask: float,
+    ) -> dict:
+        """
+        Исполнение под тип сигнала:
+        - momentum → быстрый вход (IOC / taker-like);
+        - reversion → выставляем лимит (maker/post-only).
+        Использует _compute_auto_qty и place_entry() с передачей sl_distance_px.
+        """
+        s = str(side).upper()
+        if s == "LONG":  s = "BUY"
+        if s == "SHORT": s = "SELL"
+        if s not in ("BUY", "SELL"):
+            return {"ok": False, "reason": "bad_side"}
 
+        # qty от риска
+        qty = float(self._compute_auto_qty(sym, s, float(sl_distance_px)))
+        if qty <= 0:
+            self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
+            return {"ok": False, "reason": "qty_rounded_to_zero"}
+
+        # роутинг по типу
+        kind = (signal_kind or "").lower()
+        is_momentum  = ("mom" in kind) or ("break" in kind) or ("trend" in kind)
+        is_reversion = ("rev" in kind) or ("mean" in kind) or ("bounce" in kind)
+
+        # дефолтные override параметры (на один вызов)
+        tif = None
+        prefer_maker = None
+        limit_offset_ticks = None
+
+        if is_momentum:
+            # Быстрый вход → IOC, берём ликвидность
+            tif = "IOC"
+            prefer_maker = False
+            limit_offset_ticks = 1
+        elif is_reversion:
+            # Откат → стараемся стать мейкером
+            tif = "GTC"
+            prefer_maker = True
+            limit_offset_ticks = 2
+        else:
+            # Если не распознали — умеренный по умолчанию
+            tif = "IOC"
+            prefer_maker = False
+            limit_offset_ticks = 1
+
+        # Временный override конфигурации Executor на один вызов
+        try:
+            ctx_mgr = self._temporary_exec_overrides(
+                sym,
+                time_in_force=tif,
+                prefer_maker=prefer_maker,
+                limit_offset_ticks=limit_offset_ticks,
+            )
+        except Exception:
+            @contextlib.contextmanager
+            def _dummy():
+                yield
+            ctx_mgr = _dummy()
+
+        # вызываем unified place_entry с нашей sl_distance_px (SL/TP построятся внутри)
+        with ctx_mgr:
+            rep = await self.place_entry(
+                sym,
+                s,
+                qty,
+                limit_offset_ticks=limit_offset_ticks,
+                sl_distance_px=float(sl_distance_px),
+            )
+        return rep if isinstance(rep, dict) else {"ok": False, "reason": "bad_report"}
+    
     # ---------- watchdog / closing / trades ----------
 
     async def _watchdog_loop(self) -> None:
-        """
-        Watchdog:
-          - следим за таймаутом позиции,
-          - гарантируем наличие защиты,
-          - исполняем SL/TP по последней цене (paper-режим),
-          - не роняем цикл при единичных ошибках.
-        """
+        """Watchdog with strict SL/TP triggering (dynamic protection disabled for MVP)."""
+        # soft imports (оставляем, но использовать не будем)
+        try:
+            from bot.core.protection import ProtectionCfg, PositionSnap, plan_next_protection  # type: ignore
+        except Exception:
+            ProtectionCfg = PositionSnap = plan_next_protection = None  # type: ignore
+
         try:
             while True:
                 await asyncio.sleep(0.25)
                 now = self._now_ms()
-
                 for sym in self.symbols:
                     lock = self._locks[sym]
                     async with lock:
                         pos = self._pos[sym]
-
                         if pos.state != "OPEN":
                             continue
 
-                        # 1) Если вообще нет защитных уровней — используем таймаут как fail-safe.
+                        # 1) fail-safe timeout if no SL/TP at all
                         if pos.sl_px is None and pos.tp_px is None:
                             if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
                                 await self._paper_close(sym, pos, reason="no_protection")
                             continue
 
-                        # 2) Для позиций со SL/TP таймаут НЕ закрывает сделку.
-                        # Они живут до sl_hit / tp_hit; ниже только проверка уровней.
-
-                        # 3) Проверка SL/TP по последнему тику (paper-логика)
+                        # 2) latest price + best bid/ask (для исполнимости)
                         last = self.latest_tick(sym)
                         if not last:
                             continue
-
-                        px = 0.0
                         try:
-                            # Триггерим SL/TP по last trade; mark_price только как запасной вариант.
                             p = float(last.get("price") or 0.0)
                             mp = float(last.get("mark_price") or 0.0)
                             px = p if p > 0 else mp
                         except Exception:
                             px = 0.0
 
-                        if px <= 0.0:
+                        try:
+                            bid, ask = self.best_bid_ask(sym)
+                            bid = float(bid or 0.0); ask = float(ask or 0.0)
+                        except Exception:
+                            bid = ask = 0.0
+
+                        if px <= 0.0 and (bid <= 0.0 or ask <= 0.0):
                             continue
 
-                        side = pos.side or "BUY"
+                        # шаг цены для допуска по тикам
+                        try:
+                            spec = (self.specs or {}).get(sym)
+                            price_tick = float(getattr(spec, "price_step", getattr(spec, "price_tick", 0.1)))
+                        except Exception:
+                            price_tick = 0.1
 
-                        # BUY (long): SL ниже, TP выше
+                        # 3) (DISABLED) dynamic protection — выключено для стабильности MVP
+                        # if (False and ProtectionCfg and PositionSnap and plan_next_protection
+                        #     and pos.sl_px is not None and px > 0.0):
+                        #     ... (оставлено намеренно выключенным)
+
+                        # 3.5) FAST TP: детект по исполнимой стороне + grace + форс-закрытие
+                        try:
+                            side_now = (pos.side or "BUY").upper()
+                            tp_px = float(pos.tp_px) if pos.tp_px is not None else None
+                            qty_now = float(pos.qty or 0.0)
+
+                            # если есть TP и есть котировка bid/ask — проверяем исполнимость
+                            if tp_px and qty_now > 0.0 and bid > 0.0 and ask > 0.0:
+                                if self._tp_hit(side_now, tp_px, bid, ask, price_tick, tol_ticks=self._tp_tol_ticks):
+                                    # зафиксировать момент первого касания, если ещё нет
+                                    first = int(self._tp_first_hit_ms.get(sym, 0) or 0)
+                                    now_ms = self._now_ms()
+                                    if first <= 0:
+                                        self._tp_first_hit_ms[sym] = now_ms
+                                        # убедиться, что reduceOnly лимит на TP стоит (best-effort)
+                                        try:
+                                            place_take = getattr(self, "ensure_take_order", None)
+                                            if callable(place_take):
+                                                await place_take(sym, side_now, qty_now, tp_px)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # если grace истёк — форсируем рыночным reduceOnly
+                                        if self._tp_force and (now_ms - first >= int(self._tp_grace_ms)):
+                                            await self._force_flatten_after_tp(sym, side_now, qty_now)
+                                            self._tp_first_hit_ms[sym] = 0
+                                            self._inc_block_reason(f"{sym}:tp_force_close")
+                                            # после форс-закрытия позиция станет FLAT в _paper_close; продолжать нечего
+                                            continue
+                                else:
+                                    # ушли от TP — сбросить маркер
+                                    if int(self._tp_first_hit_ms.get(sym, 0) or 0) > 0:
+                                        self._tp_first_hit_ms[sym] = 0
+                        except Exception:
+                            # не ломаем сторож
+                            pass
+
+                        # 4) strict SL/TP triggering
+                        side = pos.side or "BUY"
                         if side == "BUY":
                             if pos.sl_px is not None and px <= pos.sl_px:
                                 await self._paper_close(sym, pos, reason="sl_hit")
@@ -1381,16 +1783,13 @@ class Worker:
                             if pos.tp_px is not None and px >= pos.tp_px:
                                 await self._paper_close(sym, pos, reason="tp_hit")
                                 continue
-
-                        # SELL (short): SL выше, TP ниже
-                        elif side == "SELL":
+                        else:  # SELL
                             if pos.sl_px is not None and px >= pos.sl_px:
                                 await self._paper_close(sym, pos, reason="sl_hit")
                                 continue
                             if pos.tp_px is not None and px <= pos.tp_px:
                                 await self._paper_close(sym, pos, reason="tp_hit")
                                 continue
-
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1938,6 +2337,66 @@ class Worker:
             return time.strftime("%Y-%m-%d", time.gmtime())
         except Exception:
             return None
+    
+    def _unrealized_snapshot(self) -> Dict[str, Any]:
+        """
+        Compute unrealized PnL snapshot in USD:
+        - per_symbol uPnL for OPEN positions only,
+        - total_usd across symbols,
+        - open_positions count.
+        Price source priority: last.trade price -> mark_price -> mid(bid/ask) -> entry_px.
+        Safe and exception-free.
+        """
+        total = 0.0
+        per_symbol: Dict[str, float] = {}
+        open_cnt = 0
+
+        for sym in self.symbols:
+            try:
+                pos = self._pos.get(sym)
+                if not pos or pos.state != "OPEN":
+                    continue
+
+                side = (pos.side or "BUY").upper()
+                qty = float(pos.qty or 0.0)
+                entry = float(pos.entry_px or 0.0)
+                if qty <= 0.0 or entry <= 0.0:
+                    continue
+
+                # latest price heuristic
+                last = self.latest_tick(sym) or {}
+                px = 0.0
+                try:
+                    p = float(last.get("price") or 0.0)
+                    mp = float(last.get("mark_price") or 0.0)
+                    px = p if p > 0 else mp
+                except Exception:
+                    px = 0.0
+
+                if px <= 0.0:
+                    try:
+                        bid, ask = self.best_bid_ask(sym)
+                        if bid > 0 and ask > 0:
+                            px = (bid + ask) / 2.0
+                    except Exception:
+                        px = 0.0
+
+                if px <= 0.0:
+                    px = float(entry)  # ultimate fallback
+
+                upnl = (px - entry) * qty if side == "BUY" else (entry - px) * qty
+                per_symbol[sym] = round(float(upnl), 6)
+                total += upnl
+                open_cnt += 1
+            except Exception:
+                # keep going; snapshot must never fail
+                continue
+
+        return {
+            "total_usd": round(float(total), 6),
+            "per_symbol": per_symbol if per_symbol else None,
+            "open_positions": int(open_cnt),
+        }
 
     async def _rebuild_trades_safe(self) -> None:
         """
@@ -2043,7 +2502,12 @@ class Worker:
         self._block_reasons[key] = self._block_reasons.get(key, 0) + 1
 
     def _min_stop_ticks_default(self) -> float:
-        default = 2.0
+        """
+        System-wide minimal SL distance, in ticks, when no setting is available.
+        We keep this modest (8–12 ticks) to avoid qty rounding to zero and
+        min-notional rejections on thin symbols.
+        """
+        default = 10.0  # <<< baseline 10 ticks (safe middle of 8–12 window)
         if get_settings:
             try:
                 s = get_settings()
@@ -2144,101 +2608,152 @@ class Worker:
         Гарантирует:
         - не меньше min_stop_ticks * price_step;
         - не меньше spread * spread_mult;
-        - не меньше k_sigma * sigma(дельты цены за окно).
-
-        Если что-то пошло не так — возвращает безопасный минимум.
+        - не меньше k_sigma * sigma(дельты за окно);
+        - NEW: не меньше USD-пола по символу (чтобы риск не проигрывал комиссиям).
         """
         step = self._get_price_step(sym)
         if mid_px <= 0 or step <= 0:
             return step * max(8, int(min_stop_ticks_cfg or 8))
 
         # min_stop_ticks из exec_cfg / аргумента
-        msticks = None
         try:
-            if min_stop_ticks_cfg is not None:
-                msticks = int(min_stop_ticks_cfg)
-            else:
-                ecfg = getattr(self, "_exec_cfg", {}) or {}
-                msticks = int(ecfg.get("min_stop_ticks", 8))
+            msticks = int(min_stop_ticks_cfg) if min_stop_ticks_cfg is not None else int((getattr(self, "_exec_cfg", {}) or {}).get("min_stop_ticks", 8))
         except Exception:
             msticks = 8
-
         base_min = max(step, step * max(4, msticks))
 
-        # история тиков
-        if not hasattr(self, "history_ticks"):
-            return base_min
-
+        # история для оценки sigma
         now_ms = int(getattr(self, "_now_ms", lambda: time.time() * 1000)())
         since = now_ms - int(window_ms)
-
         try:
             ticks = self.history_ticks(sym, since_ms=since, limit=max_lookback)  # type: ignore[attr-defined]
         except Exception:
-            return base_min
+            ticks = []
 
         prices: list[float] = []
         last_ts = 0
-
         for t in ticks or []:
             if isinstance(t, dict):
                 ts = int(t.get("ts_ms") or t.get("ts") or 0)
                 px = t.get("price")
                 if px is None:
-                    b = t.get("bid")
-                    a = t.get("ask")
-                    if b and a:
-                        px = (float(b) + float(a)) / 2.0
+                    b = t.get("bid"); a = t.get("ask")
+                    if b and a: px = (float(b) + float(a)) / 2.0
             else:
                 ts = int(getattr(t, "ts_ms", getattr(t, "ts", 0)) or 0)
                 px = getattr(t, "price", None)
                 if px is None:
-                    b = getattr(t, "bid", None)
-                    a = getattr(t, "ask", None)
-                    if b and a:
-                        px = (float(b) + float(a)) / 2.0
+                    b = getattr(t, "bid", None); a = getattr(t, "ask", None)
+                    if b and a: px = (float(b) + float(a)) / 2.0
+            if ts: last_ts = max(last_ts, ts)
+            if px: prices.append(float(px))
 
-            if ts:
-                last_ts = max(last_ts, ts)
-            if px:
-                prices.append(float(px))
-
-        # если данных мало или старьё — fallback
         if len(prices) < 20 or (last_ts and now_ms - last_ts > 3_000):
-            return base_min
+            # данных мало — вернём минимум в тиках
+            dist = base_min
+        else:
+            diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+            if diffs:
+                mean = sum(diffs) / len(diffs)
+                var = sum((d - mean) ** 2 for d in diffs) / len(diffs)
+                sigma = (var ** 0.5) if var > 0 else 0.0
+            else:
+                sigma = 0.0
 
-        # sigma по дельтам
-        diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
-        if not diffs:
-            return base_min
+            vol_stop = max(k_sigma * sigma, step)
+            try:
+                bid, ask = self.best_bid_ask(sym)
+                spread = max(0.0, (ask - bid))
+            except Exception:
+                spread = 0.0
+            spread_floor = spread * spread_mult if spread > 0 else 0.0
 
-        mean = sum(diffs) / len(diffs)
-        var = sum((d - mean) ** 2 for d in diffs) / len(diffs)
-        sigma = var ** 0.5 if var > 0 else 0.0
+            dist = max(base_min, vol_stop, spread_floor)
 
-        vol_stop = k_sigma * sigma
-        # защита: хотя бы один тик
-        vol_stop = max(vol_stop, step)
-
-        # спред из последних котировок
+        # --- NEW: жёсткий пол в USD по символам (чтобы expected_risk_usd >= fees)
+        usd_floor_by_sym = {
+            "BTCUSDT": 80.0,   # ~0.075% при ~106k
+            "ETHUSDT": 10.0,   # ~0.28% при ~3.6k
+            "SOLUSDT": 0.35,   # под шум/спред
+        }
         try:
-            bid, ask = self.best_bid_ask(sym)
-            spread = max(0.0, (ask - bid))
+            usd_floor = float(usd_floor_by_sym.get(str(sym).upper(), 0.0))
+            if usd_floor > 0:
+                dist = max(dist, usd_floor)
         except Exception:
-            spread = 0.0
+            pass
 
-        spread_floor = spread * spread_mult if spread > 0 else 0.0
-
-        dist = max(base_min, vol_stop, spread_floor)
-
-        # квантуем по шагу
+        # квантуем по шагу и уважаем min_stop_ticks
         if dist < step:
             dist = step
         dist_ticks = int(dist / step)
         if dist_ticks < msticks:
             dist_ticks = msticks
         return dist_ticks * step
+    
+    def _fees_for_symbol(self, sym: str) -> tuple[float, float]:
+        """
+        Вернёт (maker_bps, taker_bps) для символа из Executor.c
+        с безопасными дефолтами 2.0 / 4.0 bps.
+        """
+        try:
+            ex = self.execs.get(sym)
+            if ex and hasattr(ex, "c"):
+                return float(ex.c.fee_bps_maker), float(ex.c.fee_bps_taker)
+        except Exception:
+            pass
+        return 2.0, 4.0
+    
+    def _entry_edge_ok(
+        self,
+        sym: str,
+        mid: float,
+        bid: float,
+        ask: float,
+        sl_distance_px: float,
+        rr: float,
+    ) -> tuple[bool, dict]:
+        """
+        Проверяем, что TP в бипсах >= (комиссии + спред + минимальный edge).
+        Берём консервативно: обе стороны taker.
+        """
+        if mid <= 0 or sl_distance_px <= 0 or rr <= 0:
+            return False, {"why": "bad_params"}
 
+        tp_bps = (rr * sl_distance_px / mid) * 1e4
+
+        try:
+            ex = self.execs.get(sym)
+            maker = float(getattr(ex.c, "fee_bps_maker", 2.0)) if ex else 2.0
+            taker = float(getattr(ex.c, "fee_bps_taker", 4.0)) if ex else 4.0
+        except Exception:
+            maker, taker = 2.0, 4.0
+        fees_bps_total = 2.0 * taker  # taker in + taker out
+
+        spread = max(0.0, (ask - bid))
+        spread_bps = (spread / mid) * 1e4 if mid > 0 else 0.0
+
+        # ↓↓↓ fallback looser (settings.strategy.min_edge_bps still overrides) ↓↓↓
+        min_edge_bps = 1.0
+        if get_settings:
+            try:
+                s = get_settings()
+                strat = getattr(s, "strategy", object())
+                v = getattr(strat, "min_edge_bps", None)
+                if isinstance(v, (int, float)) and v >= 0:
+                    min_edge_bps = float(v)
+            except Exception:
+                pass
+
+        slip_bps = 0.35 * spread_bps
+        need_bps = fees_bps_total + 0.8 * spread_bps + slip_bps + min_edge_bps
+        return (tp_bps >= need_bps), {
+            "tp_bps": round(tp_bps, 3),
+            "need_bps": round(need_bps, 3),
+            "fees_bps_total": round(fees_bps_total, 3),
+            "spread_bps": round(spread_bps, 3),
+            "min_edge_bps": round(min_edge_bps, 3),
+        }
 
     # --- strategy runtime api (исправлено: без несуществующих приватных полей) ---
 
@@ -2375,6 +2890,19 @@ class Worker:
                 )
             except Exception:
                 logger.debug("safety cfg: using defaults")
+            # мягко увеличим допуск по спреду, если в конфиге его не задали
+        try:
+            if not isinstance(cfg.max_spread_ticks, (int, float)) or cfg.max_spread_ticks <= 0:
+                cfg.max_spread_ticks = 10
+        except Exception:
+            pass
+
+        # --- MVP override: разрешаем торговать на минуте ':00'
+        try:
+            cfg.skip_minute_zero = False
+        except Exception:
+            pass
+
         return cfg
 
     def _load_risk_cfg(self) -> RiskCfg:
@@ -2541,12 +3069,99 @@ class Worker:
                 "min_flat_ms": self._auto_min_flat_ms,
             },
         }
+    def reload_runtime_cfg(self) -> dict:
+        """
+        Горячая перечитка settings.* без рестарта:
+        - execution (limit_offset_ticks, fees, tif, poll_ms, prefer_maker)
+        - safety/risk/account
+        - strategy (auto_*), через reload_strategy_cfg()
+        Обновляет конфиги у всех Executor'ов.
+        """
+        if not get_settings:
+            return {"ok": False, "reason": "no_settings_provider"}
+
+        # 1) читаем настройки
+        try:
+            s = get_settings()
+        except Exception as e:
+            return {"ok": False, "reason": "get_settings_failed", "error": str(e)}
+
+        # 2) execution → обновить per-executor cfg
+        exec_cfg = getattr(s, "execution", None)
+        if exec_cfg is not None:
+            try:
+                limit_offset_ticks = int(getattr(exec_cfg, "limit_offset_ticks", 1))
+                limit_timeout_ms   = int(getattr(exec_cfg, "limit_timeout_ms", 500))
+                time_in_force      = str(getattr(exec_cfg, "time_in_force", "GTC"))
+                poll_ms            = int(getattr(exec_cfg, "poll_ms", 50))
+                fee_bps_maker      = float(getattr(exec_cfg, "fee_bps_maker", 2.0))
+                fee_bps_taker      = float(getattr(exec_cfg, "fee_bps_taker", 4.0))
+                prefer_maker       = bool(getattr(exec_cfg, "post_only", False))
+            except Exception:
+                limit_offset_ticks, limit_timeout_ms = 1, 500
+                time_in_force, poll_ms = "GTC", 50
+                fee_bps_maker, fee_bps_taker = 2.0, 4.0
+                prefer_maker = False
+
+            # store flat copy for helpers
+            try:
+                min_stop_ticks_cfg = int(getattr(exec_cfg, "min_stop_ticks", self._min_stop_ticks_default()))
+            except Exception:
+                min_stop_ticks_cfg = self._min_stop_ticks_default()
+
+            self._exec_cfg = {
+                "min_stop_ticks": int(min_stop_ticks_cfg),
+                "limit_timeout_ms": int(limit_timeout_ms),
+                "time_in_force": str(time_in_force),
+            }
+
+            # обновить всех исполнителей
+            for sym, ex in (self.execs or {}).items():
+                try:
+                    c = ex.c
+                    c.limit_offset_ticks = int(limit_offset_ticks)
+                    c.limit_timeout_ms   = int(limit_timeout_ms)
+                    c.time_in_force      = str(time_in_force)
+                    c.poll_ms            = int(poll_ms)
+                    c.fee_bps_maker      = float(fee_bps_maker)
+                    c.fee_bps_taker      = float(fee_bps_taker)
+                    c.prefer_maker       = bool(prefer_maker)
+                except Exception:
+                    continue
+
+        # 3) safety / risk / account
+        try:
+            self._safety_cfg = self._load_safety_cfg()
+        except Exception:
+            pass
+        try:
+            self._risk_cfg = self._load_risk_cfg()
+        except Exception:
+            pass
+        try:
+            # account поля
+            self._starting_equity_usd = self._load_starting_equity_usd()
+            self._leverage            = self._load_leverage()
+            self._min_notional_usd    = self._load_min_notional_usd()
+        except Exception:
+            pass
+
+        # 4) strategy auto_* (без рестарта)
+        self.reload_strategy_cfg()
+
+        # 5) вернуть актуальный снапшот
+        try:
+            snap = self.diag()
+        except Exception:
+            snap = {"ok": True}
+        return {"ok": True, "diag": snap}
 
     # совместимость с /status фолбэком
     @property
     def coalescer(self) -> Coalescer:
         return self.coal
 
+    
 
 # ---------- модульный smoke-тест ----------
 

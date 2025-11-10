@@ -9,25 +9,29 @@
     "coalesce_ms": 75
   },
   "risk": {
-    "risk_per_trade_pct": 0.1,
+    "risk_per_trade_pct": 0.3,
     "daily_stop_r": -4,
-    "daily_target_r": 6,
+    "daily_target_r": 8,
     "max_consec_losses": 3,
-    "cooldown_after_sl_s": 90,
-    "min_risk_usd_floor": 0.20
+    "cooldown_after_sl_s": 120,
+    "min_risk_usd_floor": 0.5
   },
   "safety": {
     "max_spread_ticks": 8,
     "min_top5_liquidity_usd": 300000.0,
-    "skip_funding_minute": true,
-    "skip_minute_zero": true,
+    "skip_funding_minute": false,
+    "skip_minute_zero": false,
     "min_liq_buffer_sl_mult": 3.0
   },
   "strategy": {
     "auto_signal_enabled": true,
-    "min_edge_bps": 2.5,
+    "min_edge_bps": 2.0,
+    "min_range_bps": 1.5,
+    "min_range_ticks": 2,
+    "warmup_ms": 30000,
+    "stale_ms": 4000,
     "auto_cooldown_ms": 600,
-    "auto_min_flat_ms": 250,
+    "auto_min_flat_ms": 300,
     "regime": {
       "vol_window_s": 60
     },
@@ -54,8 +58,8 @@
     "time_in_force": "IOC",
     "post_only": false,
 
-    "fee_bps_maker": 0.00,
-    "fee_bps_taker": 0.00,
+    "fee_bps_maker": 2.00,
+    "fee_bps_taker": 4.00,
 
     "min_stop_ticks": 24,
     "poll_ms": 50,

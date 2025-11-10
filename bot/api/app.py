@@ -8,7 +8,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -720,7 +720,6 @@ def _spread_ticks(bid: float, ask: float, tick: float) -> float:
     if bid > 0 and ask > 0 and tick > 0:
         return max(0.0, (ask - bid) / tick)
     return 0.0
-
 
 @app.post("/control/test-entry")
 async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
