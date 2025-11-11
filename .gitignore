@@ -18,3 +18,10 @@ venv/
 .env
 config/*.local.*
 ml_artifacts/
+*.zip
+__pycache__/
+.venv/
+.idea/
+.DS_Store
+*.pyc
+data/*.db
