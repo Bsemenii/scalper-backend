@@ -384,8 +384,6 @@ class Executor:
 
         limit_px = _round_price_to_tick(raw_px, price_tick, side)
         limit_px, note = self._enforce_post_only(side, bid, ask, limit_px, price_tick)
-        if note:
-            steps.append(note)
         if limit_px <= 0.0:
             limit_px = price_tick
 
@@ -402,8 +400,18 @@ class Executor:
             client_order_id=limit_coid,
         )
 
+        # если был post-only кламп — явно помечаем это,
+        # чтобы Worker._fee_bps_for_steps видел maker-like поведение
+        submit_tag = "limit_submit_postonly" if note in (
+            "post_only_clamped_to_bid",
+            "post_only_clamped_to_ask",
+        ) else "limit_submit"
+
+        if note:
+            steps.append(note)
+
         steps.append(
-            f"limit_submit:{limit_px} qty:{qty_rounded}"
+            f"{submit_tag}:{limit_px} qty:{qty_rounded}"
             + (" reduce_only" if reduce_only else "")
         )
 
@@ -435,7 +443,8 @@ class Executor:
                 vwap_cash += part * avg
                 steps.append(f"limit_filled_immediate:{part}@{avg}")
 
-                fee_bps = self.c.fee_bps_maker
+                # мгновенный fill по лимитке — по сути taker
+                fee_bps = self.c.fee_bps_taker
                 fee_usd = abs(part * avg) * (fee_bps / 10_000.0)
                 self._repo_save_fill(
                     order_id=limit_coid,
@@ -508,32 +517,14 @@ class Executor:
 
                 if state.status == "FILLED":
                     avg_px = vwap_cash / max(filled_qty, 1e-12)
+
+                    # явный maker-маркер для fee-аналитики
+                    steps.append("limit_filled_resting")
                     steps.append(
                         f"limit_filled_total:{filled_qty}@{avg_px:.8f}"
                     )
                     latency_ms = int((time.monotonic() - t_start) * 1000)
                     steps.append(f"latency_ms:{latency_ms}")
-
-                    self._repo_save_order(
-                        order_id=limit_coid,
-                        symbol=symbol,
-                        side=side,
-                        otype="LIMIT",
-                        reduce_only=bool(reduce_only),
-                        px=avg_px,
-                        qty=qty_rounded,
-                        status="FILLED",
-                    )
-
-                    return ExecutionReport(
-                        status="FILLED",
-                        filled_qty=float(filled_qty),
-                        avg_px=float(avg_px),
-                        limit_oid=limit_oid,
-                        market_oid=None,
-                        steps=steps,
-                        ts=_now_ms(),
-                    )
 
         # --- 6. Таймаут: отменяем лимитку (если остался объём) ---
         if filled_qty < qty_rounded - 1e-12:

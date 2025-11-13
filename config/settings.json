@@ -9,11 +9,11 @@
 
   "risk": {
     "risk_per_trade_pct": 0.30,
-    "daily_stop_r": -5.0,
-    "daily_target_r": 9.0,
+    "daily_stop_r": -6.0,
+    "daily_target_r": 8.0,
     "max_consec_losses": 3,
-    "cooldown_after_sl_s": 600,
-    "min_risk_usd_floor": 2.0
+    "cooldown_after_sl_s": 900,
+    "min_risk_usd_floor": 3.0
   },
 
   "safety": {
@@ -89,10 +89,10 @@
 
   "account": {
     "starting_equity_usd": 1000.0,
-    "leverage": 20,
+    "leverage": 15,
     "per_symbol_leverage": {
-      "BTCUSDT": 25,
-      "ETHUSDT": 15
+      "BTCUSDT": 15,
+      "ETHUSDT": 12
     },
     "min_notional_usd": 5.0
   },

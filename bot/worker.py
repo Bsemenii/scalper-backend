@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple, Literal
 from collections import deque
 from typing import Deque
 from contextlib import contextmanager
+from strategy.cross_guard import decide_cross_guard, CrossCfg, pick_best_symbol_by_speed
+
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
@@ -19,6 +21,8 @@ from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
 from adapters.binance_rest import PaperAdapter
 from exec.executor import Executor, ExecCfg, ExecutionReport
+from strategy.router import StrategyCfg, pick_candidate
+from strategy.momentum import EntryCandidate as MomEntry
 # SL/TP планировщик: сначала пытаемся взять fee-aware, при неудаче — простой
 try:
     from exec.sltp import compute_sltp_fee_aware, compute_sltp, SLTPPlan  # type: ignore
@@ -901,6 +905,10 @@ class Worker:
                             if side is None:
                                 _inc_block(f"{sym}:no_signal")
                                 continue
+                            ok_cross, why_cross = self._cross_guard_allow(sym, side)
+                            if not ok_cross:
+                                self._inc_block_reason(f"{sym}:{why_cross}")
+                                continue
 
                             # объём
                             if vols and sum(vols) > 0.0:
@@ -1037,6 +1045,20 @@ class Worker:
             mid_px=float(mid),
             min_stop_ticks_cfg=min_stop_ticks_cfg,
         )
+
+        # добавляем минимум по bps: пусть будет >= 0.25% от цены
+        step = self._get_price_step(sym)
+        if step <= 0.0:
+            step = 0.1
+        min_sl_bps = getattr(self, "_min_sl_bps", 25.0)  # можно вынести в конфиг
+        min_sl_px_bps = mid * (min_sl_bps / 10_000.0) if mid > 0 else 0.0
+        base_min_ticks = max(self._min_stop_ticks_default(), 8.0)
+
+        dist = max(
+            float(dist),
+            base_min_ticks * step,
+            min_sl_px_bps,
+        )
         return float(dist)
     
     def _build_sltp_plan(
@@ -1106,9 +1128,9 @@ class Worker:
                     min_stop_ticks=max(int(self._min_stop_ticks_default()), 8),
                     spread_px=spread_px,
                     spread_mult=1.5,
-                    min_sl_bps=12.0,
+                    min_sl_bps=25.0,
                     # требуем минимальный net-RR (после комиссий/спреда)
-                    min_net_rr=1.2,
+                    min_net_rr=1.4,
                     allow_expand_tp=True,
                     sl_px_hint=None,
                 )
@@ -1388,29 +1410,32 @@ class Worker:
 
         # Build SL/TP if needed
         if sl_px is None or tp_px is None:
-            price_tick = float(getattr(spec, "price_tick", 0.1) if spec else 0.1)
-            spread = max(0.0, ask - bid)
             try:
-                if sl_distance_px is None or sl_distance_px <= 0:
-                    sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=entry_px))
-            except Exception:
-                sl_distance_px = max(12 * price_tick, 2.0 * spread, 6.0 * price_tick)
-
-            # RR по стратегии
-            rr = float(self._tp_rr_from_decision(None) or 1.6)
-            try:
-                plan = compute_sltp(
-                    side=s,
-                    entry_px=float(entry_px),
-                    qty=float(qty),
-                    price_tick=float(price_tick),
-                    sl_distance_px=float(sl_distance_px),
-                    rr=float(rr),
+                plan = self._build_sltp_plan(
+                    symbol=sym,
+                    side=s,           # "BUY" / "SELL"
+                    entry_px=entry_px,
+                    qty=qty,
+                    micro=self._last_micro.get(sym),
+                    indi=self._last_indi.get(sym),
+                    decision=None,    # или сюда можно передавать info о типе сигнала
                 )
                 sl_px = float(plan.sl_px)
                 tp_px = float(plan.tp_px)
             except Exception:
-                # fallback
+                # старый фолбэк, чтобы не упасть
+                spec = self.specs.get(sym) if hasattr(self, "specs") else None
+                price_tick = float(getattr(spec, "price_tick", 0.1) if spec else 0.1)
+                spread = max(0.0, ask - bid)
+                try:
+                    if sl_distance_px is None or sl_distance_px <= 0:
+                        sl_distance_px = float(
+                            self._compute_vol_stop_distance_px(sym, mid_px=entry_px)
+                        )
+                except Exception:
+                    sl_distance_px = max(12 * price_tick, 2.0 * spread, 6.0 * price_tick)
+
+                rr = float(self._tp_rr_from_decision(None) or 1.6)
                 if s == "BUY":
                     sl_px = entry_px - sl_distance_px
                     tp_px = entry_px + rr * sl_distance_px
@@ -2057,7 +2082,7 @@ class Worker:
                 "fees": 0.0,
             }
 
-        # gross PnL и номинальный риск по SL
+        # gross PnL и номинальный риск по SL (без комиссий)
         if side == "BUY":
             pnl_usd_gross = (exit_px - entry) * qty
             sl_ref = sl_px if sl_px is not None and sl_px < entry else entry
@@ -2067,14 +2092,18 @@ class Worker:
             sl_ref = sl_px if sl_px is not None and sl_px > entry else entry
             risk_usd_nominal = abs(sl_ref - entry) * qty
 
-        # комиссии
+        # комиссии по фактическим шагам исполнения
         entry_bps = self._fee_bps_for_steps(entry_steps or [])
         exit_bps = self._fee_bps_for_steps(exit_steps or [])
         fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
 
         pnl_usd = pnl_usd_gross - fees_usd
 
-        # плановый риск
+        # фактический риск сделки = SL-дистанция + комиссии
+        gross_risk_usd = max(risk_usd_nominal, 0.0)
+        risk_usd_total = gross_risk_usd + max(fees_usd, 0.0)
+
+        # читаем конфиг риска (нужен для порогов, но не для искажения R)
         try:
             equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
         except Exception:
@@ -2087,7 +2116,9 @@ class Worker:
         if cfg_floor <= 0.0:
             cfg_floor = 1.0
 
-        risk_usd = max(risk_usd_nominal, risk_target, cfg_floor, 1e-9)
+        # ВАЖНО: risk_usd = реальный риск сделки (SL + fees), а не max с risk_target.
+        # floor нужен только чтобы не делить на 0 в аккуратных/микро-сделках.
+        risk_usd = max(risk_usd_total, cfg_floor, 1e-9)
         pnl_r = pnl_usd / risk_usd
 
         return {
@@ -2843,9 +2874,9 @@ class Worker:
         su = str(symbol).upper()
         floor = 0.0
         if su == "BTCUSDT":
-            floor = 2.0    # мягкий минимум TP/SL на BTC
+            floor = 2.2    # мягкий минимум TP/SL на BTC
         elif su == "ETHUSDT":
-            floor = 1.6    # можно оставить 1.4–1.6
+            floor = 2.0    # ETH можно держать чуть ниже
         # SOL / прочее — без флоора
 
         try:
@@ -3202,8 +3233,8 @@ class Worker:
         min_stop_ticks_cfg: int | None = None,
         window_ms: int = 60_000,
         max_lookback: int = 512,
-        k_sigma: float = 1.8,
-        spread_mult: float = 2.0,
+        k_sigma: float = 1.2,
+        spread_mult: float = 1.5,
     ) -> float:
         """
         Глобальный источник правды для стоп-дистанции.
@@ -3272,12 +3303,24 @@ class Worker:
             spread_floor = spread * spread_mult if spread > 0 else 0.0
 
             dist = max(base_min, vol_stop, spread_floor)
+            # внутри _compute_vol_stop_distance_px, после расчёта dist:
+            dist_bps = (dist / mid_px) * 1e4
+
+            su = str(sym).upper()
+            if su == "BTCUSDT":
+                # SL 10–20 bps
+                dist_bps = max(10.0, min(dist_bps, 20.0))
+            elif su == "ETHUSDT":
+                # SL 15–30 bps
+                dist_bps = max(15.0, min(dist_bps, 30.0))
+
+            dist = (dist_bps / 1e4) * mid_px
 
         # --- NEW: жёсткий пол в USD по символам (чтобы expected_risk_usd >= fees)
         usd_floor_by_sym = {
-            "BTCUSDT": 130.0,   # ~0.075% при ~106k
-            "ETHUSDT": 10.0,   # ~0.28% при ~3.6k
-            "SOLUSDT": 0.35,   # под шум/спред
+            "BTCUSDT": 70.0,   # ~0.075% при ~106k
+            "ETHUSDT": 6.0,   # ~0.28% при ~3.6k
+            "SOLUSDT": 0.25,   # под шум/спред
         }
         try:
             usd_floor = float(usd_floor_by_sym.get(str(sym).upper(), 0.0))
@@ -3400,12 +3443,8 @@ class Worker:
         """
         Размер позиции от процента риска и SL-дистанции.
 
-        Учитываем:
-        - risk_per_trade_pct и min_risk_usd_floor;
-        - фактическое плечо по символу (_leverage_for_symbol);
-        - min_notional;
-        - шаг лота;
-        - liq-buffer (чтобы SL был далеко от ликвидации).
+        NEW: учитываем комиссии (taker+taker) при расчёте qty так,
+        чтобы общий убыток на стопе (цена + комиссии) ≈ risk_usd_target.
         """
         sym = symbol.upper()
         spec = self.specs[sym]
@@ -3436,18 +3475,37 @@ class Worker:
         if px <= 0.0:
             return 0.0
 
-        # --- плечо и лимит по нотионалу ---
+        # --- комиссии в долях (taker + taker, консервативно) ---
+        try:
+            maker_bps, taker_bps = self._fees_for_symbol(sym)
+        except Exception:
+            maker_bps, taker_bps = 2.0, 4.0
+
+        fee_bps_total = 2.0 * float(taker_bps)  # вход + выход как taker
+        c = fee_bps_total / 10_000.0           # доля нотиционала
+
+        # относительное движение до SL (в доле цены)
+        d = sl_distance_px / px
+        if d <= 0.0:
+            return 0.0
+
+        denom = d + c
+        if denom <= 0.0:
+            return 0.0
+
+        # --- целевой нотиционал с учётом комиссий ---
+        notional_target = risk_usd_target / denom  # N = R / (d + c)
+
+        # лимит по плечу
         lev = float(self._leverage_for_symbol(sym))
         if lev < 1.0:
             lev = 1.0
         max_notional = equity * lev
-        max_qty_by_lev = max_notional / px if px > 0.0 else 0.0
-        if max_qty_by_lev <= 0.0:
+        if max_notional <= 0.0:
             return 0.0
 
-        # --- сырой сайзинг от риска ---
-        qty_raw = risk_usd_target / sl_distance_px
-        qty = min(qty_raw, max_qty_by_lev)
+        notional = min(notional_target, max_notional)
+        qty_raw = notional / px
 
         # --- минимальная нотиональ ---
         min_notional = float(getattr(self, "_min_notional_usd", 5.0))
@@ -3459,13 +3517,13 @@ class Worker:
         def floor_to_step(x: float, st: float) -> float:
             return (int(x / st)) * st
 
-        qty = max(min_qty_by_notional, qty)
+        qty = max(min_qty_by_notional, qty_raw)
         qty = floor_to_step(qty, step)
 
         # если после округления всё равно 0 — пробуем минимум, если он валиден
         if qty <= 0.0:
             qty = step
-            if qty * px < min_notional or qty > max_qty_by_lev:
+            if qty * px < min_notional or qty * px > max_notional:
                 return 0.0
 
         # --- liq-buffer: SL не должен быть рядом с ликвидацией ---
@@ -3475,16 +3533,88 @@ class Worker:
             min_mult = float(
                 getattr(self._safety_cfg, "min_liq_buffer_sl_mult", 3.0) or 3.0
             )
-            # мягко, но жёстко: если буфер меньше требуемого — лучше не входить
             if lb_mult < max(1.5, min_mult):
                 return 0.0
         except Exception:
-            # если что-то пошло не так — не блокируем, но и не падаем
             pass
 
         return float(qty)
 
     # --- cfg loaders ---
+    def _cross_guard_allow(self, sym: str, side: Side) -> tuple[bool, str]:
+        """
+        Cross-guard против BTC:
+        - BTC сам по себе не фильтруем (он — якорь),
+        - для ETH/других смотрим, не идём ли мы против доминирующего движения BTC,
+        и не проигрываем ли BTC по скорости.
+        """
+        su = sym.upper()
+        if su == "BTCUSDT":
+            return True, "root_symbol"
+
+        lookback_s = 60
+        btc_prices = self._last_mid_prices("BTCUSDT", lookback_s)
+        sym_prices = self._last_mid_prices(su, lookback_s)
+
+        if len(btc_prices) < 10 or len(sym_prices) < 10:
+            return True, "no_history"
+
+        allow, reason, btc_drift, sym_drift = decide_cross_guard(
+            side=side,
+            btc_prices=btc_prices,
+            sym_prices=sym_prices,
+            cfg=CrossCfg(
+                lookback_s=lookback_s,
+                min_btc_strength_bp=6.0,
+                block_on_divergence=True,
+                prefer_symbol_with_higher_speed=False,  # скорость разрулим ниже
+            ),
+        )
+
+        if not allow:
+            return False, f"cross_guard:{reason}"
+
+        # опционально: если BTC и символ в одну сторону, берём более быстрый
+        best = pick_best_symbol_by_speed(
+            btc_prices=btc_prices,
+            sym_a=("BTCUSDT", btc_prices),
+            sym_b=(su, sym_prices),
+            lookback_s=lookback_s,
+        )
+        if best != su:
+            return False, "cross_guard:prefer_btc"
+
+        return True, "ok"
+
+    def _last_mid_prices(self, sym: str, lookback_s: int) -> list[float]:
+        """Грубый хвост mid-цен за lookback_s секунд."""
+        now = self._now_ms()
+        since_ms = now - lookback_s * 1000
+        try:
+            ticks = self.history_ticks(sym, since_ms=since_ms, limit=2000)
+        except Exception:
+            ticks = []
+
+        out: list[float] = []
+        for t in ticks or []:
+            try:
+                if isinstance(t, dict):
+                    px = t.get("price")
+                    if px is None:
+                        b = t.get("bid"); a = t.get("ask")
+                        if b and a:
+                            px = (float(b) + float(a)) / 2.0
+                else:
+                    px = getattr(t, "price", None)
+                    if px is None:
+                        b = getattr(t, "bid", None); a = getattr(t, "ask", None)
+                        if b and a:
+                            px = (float(b) + float(a)) / 2.0
+                if px:
+                    out.append(float(px))
+            except Exception:
+                continue
+        return out
 
     def _make_candidate_engine(self, sym: str, spec: SymbolSpec) -> CandidateEngine:
         """

@@ -80,17 +80,27 @@ def _is_minute_zero(ts_ms: int, window_s: int = 5) -> bool:
 
 def _is_funding_minute_utc(ts_ms: int, window_s: int = 60) -> bool:
     """
-    Эвристика funding minute для Binance Perp: каждые 8 часов в XX:00 UTC.
-    Считаем «опасным» интервал ±window_s секунд вокруг отметки.
+    Эвристика funding minute для Binance Perp:
+    funding в 00:00, 08:00, 16:00 UTC.
+    Опасным считаем интервал [0; window_s) секунд в эти минуты.
     """
     if window_s <= 0:
         window_s = 30
+
     total_sec = ts_ms // 1000
-    # цикл 8 часов
-    minutes_in_cycle = (total_sec // 60) % (8 * 60)
-    seconds_in_minute = total_sec % 60
-    # близко к :00 и внутри funding-часа
-    return (minutes_in_cycle == 0) and (seconds_in_minute < window_s)
+    sec = total_sec % 60
+    minute = (total_sec // 60) % 60
+    hour = (total_sec // 3600) % 24
+
+    # интересует ровно хх:00 UTC
+    if minute != 0:
+        return False
+
+    # funding в 00:00, 08:00, 16:00 UTC
+    if hour % 8 != 0:
+        return False
+
+    return sec < window_s
 
 def _safe_offset(ts_ms: int, offset_ms: int) -> int:
     # ограничим offset разумными пределами, чтобы «время» не улетало
