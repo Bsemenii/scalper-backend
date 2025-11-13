@@ -117,23 +117,27 @@ class Worker:
         coalesce_ms: int = 75,
         history_maxlen: int = 4000,
     ) -> None:
+        # --- базовая инфраструктура рынка / потоков ---
         self.symbols = [s.upper() for s in symbols]
         self.ws = BinanceWS(self.symbols, futures=futures, mark_interval_1s=True)
         self.coal = Coalescer(coalesce_ms=coalesce_ms)
         self.hub = MarketHub(self.symbols)
 
-        self._tp_tol_ticks = getattr(self, "_tp_tol_ticks", 1)               # допуск по тикам
-        self._tp_grace_ms  = getattr(self, "_tp_grace_ms", 350)              # сколько ждём лимит перед market
-        self._tp_force     = getattr(self, "_tp_force", True)                # включить форс-закрытие
+        # --- настройки TP/форс-закрытия (оставляем как было) ---
+        self._tp_tol_ticks = getattr(self, "_tp_tol_ticks", 1)     # допуск по тикам
+        self._tp_grace_ms  = getattr(self, "_tp_grace_ms", 350)    # сколько ждём лимит перед market
+        self._tp_force     = getattr(self, "_tp_force", True)      # включить форс-закрытие
 
-        # история тиков (последние N по символу)
-        self._hist: Dict[str, Deque[Dict[str, Any]]] = {s: deque(maxlen=history_maxlen) for s in self.symbols}
+        # --- история тиков (последние N по символу) ---
+        self._hist: Dict[str, Deque[Dict[str, Any]]] = {
+            s: deque(maxlen=history_maxlen) for s in self.symbols
+        }
         self._history_maxlen = history_maxlen
         self._hist_lock = asyncio.Lock()
 
-        # спецификации шагов (дефолты для перпов)
+        # --- спецификации шагов (дефолты для перпов) ---
         self.specs: Dict[str, SymbolSpec] = {
-            "BTCUSDT": SymbolSpec("BTCUSDT", price_tick=0.1, qty_step=0.001),
+            "BTCUSDT": SymbolSpec("BTCUSDT", price_tick=0.1,  qty_step=0.001),
             "ETHUSDT": SymbolSpec("ETHUSDT", price_tick=0.01, qty_step=0.001),
             "SOLUSDT": SymbolSpec("SOLUSDT", price_tick=0.001, qty_step=0.1),
         }
@@ -141,22 +145,27 @@ class Worker:
             if s not in self.specs:
                 self.specs[s] = SymbolSpec(s, price_tick=0.01, qty_step=0.001)
 
-        # executors per symbol
+        # --- исполнители и FSM по символам ---
         self.execs: Dict[str, Executor] = {}
-        # FSM per symbol
         self._fsm: Dict[str, PositionFSM] = {s: PositionFSM() for s in self.symbols}
 
-        # локи и рантайм-позиции
+        # --- локи и рантайм-позиции ---
         self._locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in self.symbols}
         self._pos: Dict[str, PositionState] = {
             s: PositionState(
-                state="FLAT", side=None, qty=0.0, entry_px=0.0,
-                sl_px=None, tp_px=None, opened_ts_ms=0, timeout_ms=180_000
+                state="FLAT",
+                side=None,
+                qty=0.0,
+                entry_px=0.0,
+                sl_px=None,
+                tp_px=None,
+                opened_ts_ms=0,
+                timeout_ms=180_000,
             )
             for s in self.symbols
         }
 
-        # счётчики исполнения (для /metrics)
+        # --- счётчики исполнения (для /metrics) ---
         self._exec_counters: Dict[str, int] = {
             "limit_total": 0,
             "market_total": 0,
@@ -164,8 +173,10 @@ class Worker:
             "reject_total": 0,
         }
 
-        # Учёт сделок (in-memory) и дневная сводка (best-effort)
-        self._trades: Dict[str, Deque[Dict[str, Any]]] = {s: deque(maxlen=1000) for s in self.symbols}
+        # --- учёт сделок (in-memory) и дневная сводка ---
+        self._trades: Dict[str, Deque[Dict[str, Any]]] = {
+            s: deque(maxlen=1000) for s in self.symbols
+        }
         self._pnl_day: Dict[str, Any] = {
             "day": self._day_str(),
             "trades": 0,
@@ -178,53 +189,61 @@ class Worker:
         self._pnl_r_equity: float = 0.0
         self._consec_losses: int = 0
 
-        # ts последнего стоп-лосса (для локального cooldown_after_sl_s)
+        # ts последнего стоп-лосса (для cooldown_after_sl_s)
         self._last_sl_ts_ms: int = 0
 
-        # причины блокировок входа
+        # --- причины блокировок входа ---
         self._block_reasons: Dict[str, int] = {}
 
-        # для оценки комиссий входа: сохраняем steps открытия
+        # --- для оценки комиссий входа: сохраняем steps открытия ---
         self._entry_steps: Dict[str, List[str]] = {}
 
-        # риск-конфиги
+        # --- риск / safety конфиги ---
         self._safety_cfg = self._load_safety_cfg()
         self._risk_cfg = self._load_risk_cfg()
         self._server_time_offset_ms: int = 0
 
-        # account-конфиги (для авто-сайзинга)
+        # --- account-конфиги (для авто-сайзинга) ---
         self._starting_equity_usd = self._load_starting_equity_usd()
         self._leverage = self._load_leverage()
         self._min_notional_usd = self._load_min_notional_usd()
 
-        # --- strategy / auto-signal runtime (driven by settings.json) ---
+        # --- runtime стратегии / авто-сигналов (управляется settings.json и /control/auto) ---
         self._auto_enabled: bool = False
         self._auto_cooldown_ms: int = 2000   # пауза между авто-входами (ms)
         self._auto_min_flat_ms: int = 750    # минимум FLAT до нового входа (ms)
+        self._last_strategy_error: Optional[str] = None
+        self._strategy_heartbeat_ms: int = 0  # для диагностики живости цикла
+        self._strategy_cfg: Dict[str, Any] = {}  # актуальный cfg стратегии (diag)
 
         # пер-символьные таймштампы для анти-спама сигналов
         self._last_signal_ms: Dict[str, int] = {s: 0 for s in self.symbols}
         self._last_flat_ms: Dict[str, int] = {s: 0 for s in self.symbols}
+
         # метка первого «касания TP» (per-symbol), чтобы дать лимиту шанс и затем форс-закрыть
         self._tp_first_hit_ms: Dict[str, int] = {s: 0 for s in self.symbols}
 
-        # движок кандидатов (пер-симв.), инициализируем позже
+        # --- движок кандидатов, микрофич и индикаторов per-symbol ---
         self._cand: Dict[str, CandidateEngine] = {}
 
-        # фичи микроструктуры и индикаторов per-symbol
         self._micro_eng: Dict[str, MicroFeatureEngine] = {}
         self._indi_eng: Dict[str, IndiEngine] = {}
         self._last_micro: Dict[str, Dict[str, Any]] = {}
         self._last_indi: Dict[str, Dict[str, Any]] = {}
 
-        # подгрузка начальных значений из settings.strategy
-        self._load_strategy_cfg()
+        # подгрузка начальных значений из settings.strategy (если есть)
+        # (метод может обновить _auto_* и _strategy_cfg)
+        try:
+            self._load_strategy_cfg()
+        except Exception:
+            # не ломаем старт воркера, максимум оставим дефолты
+            pass
 
-        # таски жизненного цикла
+        # --- таски жизненного цикла воркера ---
         self._tasks: List[asyncio.Task] = []
-        self._wd_task: Optional[asyncio.Task] = None
-        self._strat_task: Optional[asyncio.Task] = None
-        self._started = False
+        self._wd_task: Optional[asyncio.Task] = None   # watchdog / health
+        self._strat_task: Optional[asyncio.Task] = None  # авто-стратегия
+        self._started: bool = False
 
     # ---------- lifecycle ----------
 
@@ -235,6 +254,10 @@ class Worker:
 
         def _best(sym: str) -> tuple[float, float]:
             return self.hub.best_bid_ask(sym)
+        
+        if self._strat_task is None or self._strat_task.done():
+            loop = asyncio.get_running_loop()
+            self._strat_task = loop.create_task(self._strategy_loop(), name="strategy_loop")
 
         # --- base defaults ---
         limit_offset_ticks = 1
@@ -325,12 +348,19 @@ class Worker:
         await self.ws.connect(self._on_ws_raw)
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
-        self._strat_task = asyncio.create_task(self._strategy_loop(), name="strategy")
 
     async def stop(self) -> None:
         if not self._started:
             return
         self._started = False
+
+        if self._strat_task is not None:
+            self._strat_task.cancel()
+            try:
+                await self._strat_task
+            except asyncio.CancelledError:
+                pass
+            self._strat_task = None
 
         # Остановить стратегию
         if self._strat_task:
@@ -392,11 +422,6 @@ class Worker:
             else:
                 self._hist[tick.symbol] = deque([item], maxlen=self._history_maxlen)
 
-        # фиксируем время последнего FLAT — нужно для анти-спама стратегии
-        pos = self._pos[tick.symbol]
-        if pos.state == "FLAT":
-            self._last_flat_ms[tick.symbol] = tick.ts_ms
-
         # обогащаем микроструктурой и индикаторами (best-effort)
         try:
             me = self._micro_eng.get(tick.symbol)
@@ -438,44 +463,70 @@ class Worker:
 
     async def _strategy_loop(self) -> None:
         """
-        Auto scalper (time-based windows, sane anti-chop):
+        Боевой авто-скальпер (MVP):
 
-        - Windows based on time (robust to coalescer rate): long≈7s, short≈2s
-        - Anti-chop passes if EITHER absolute 1 tick move OR ~0.6 bps drift exists
-        - Momentum breakout and gentle reversion bounce
-        - Safety filters (spread/liquidity/funding/liq-buffer) preserved
+        - Работает по времени: окна ~7s (long) и ~2s (short).
+        - Включается только когда _auto_enabled == True.
+        - Учитывает:
+            * cooldown между входами по символу
+            * min_flat_ms после FLAT
+            * глобальный cooldown после SL (из risk_cfg)
+        - Простые сигналы:
+            * momentum (пробой края диапазона + локальный тренд)
+            * reversion (отскок от края, когда тренд не сильный)
+            * micro-momentum по микрофичам, если доступны
+        - Safety:
+            * спред / ликвидность через risk.filters
+            * day_limits из diag()
+        - Все отказы пишутся в _block_reasons через self._inc_block_reason(reason).
         """
-        import asyncio, logging, math, time as _t
+        import asyncio
+        import logging
+        import math
+        import time as _t
+        from typing import Dict, Any, List
+
         log = logging.getLogger(__name__ + "._strategy")
+
+        # --- cfg стратегии из settings (если есть) ---
+        cfg: Dict[str, Any] = {}
+        try:
+            if hasattr(self, "_load_strategy_cfg"):
+                cfg = self._load_strategy_cfg() or {}
+        except Exception as e:
+            log.warning("[strategy] _load_strategy_cfg failed: %s", e)
+            cfg = {}
+        self._strategy_cfg = dict(cfg or {})
 
         symbols = list(self.symbols)
         if not symbols:
-            log.warning("[strategy] no symbols configured, exiting _strategy_loop")
+            log.warning("[strategy] no symbols configured, exit.")
             return
 
-        # timings / basic pacing
-        cooldown_ms = max(250, int(getattr(self, "_auto_cooldown_ms", 1200)))
-        min_flat_ms = max(0, int(getattr(self, "_auto_min_flat_ms", 300)))
-        base_delay_s = max(0.09, cooldown_ms / 4000.0)
+        # --- тайминги ---
+        cooldown_ms = int(cfg.get("cooldown_ms", getattr(self, "_auto_cooldown_ms", 2000)))
+        cooldown_ms = max(300, cooldown_ms)
 
-        # time-based windows & thresholds
-        warmup_ms = 15_000
-        stale_ms  = 1_500
-        long_ms   = 5_000      # было 7s → 5s
-        short_ms  = 1_400       # ~2s short MA
+        min_flat_ms = int(cfg.get("min_flat_ms", getattr(self, "_auto_min_flat_ms", 750)))
+        min_flat_ms = max(0, min_flat_ms)
 
-        # momentum thresholds (slightly looser so signals occur)
-        ma_edge_mom     = 0.00006   # ~0.6 bps
-        slope_edge_mom  = 0.000006   # short MA slope
+        warmup_ms = int(cfg.get("warmup_ms", 15_000))
+        stale_ms  = int(cfg.get("stale_ms", 3_000))
 
-        # reversion thresholds (gentle edge)
-        ma_edge_rev     = 0.00003  # ~0.5 bps
+        long_ms   = int(cfg.get("long_ms", 7_000))
+        short_ms  = int(cfg.get("short_ms", 2_000))
 
-        # anti-chop: pass if EITHER absolute tick range or small bps drift is present
-        min_range_bps    = 0.4
-        min_range_ticks  = 1
+        # --- пороги логики ---
+        ma_edge_mom    = float(cfg.get("ma_edge_mom", 0.00005))
+        slope_edge_mom = float(cfg.get("slope_edge_mom", 0.000004))
 
-        last_entry_ts = {sym: 0 for sym in symbols}
+        ma_edge_rev    = float(cfg.get("ma_edge_rev", 0.00003))
+
+        min_range_bps   = float(cfg.get("min_range_bps", 0.3))
+        min_range_ticks = int(cfg.get("min_range_ticks", 1))
+
+        # пер-символьный cooldown
+        last_entry_ts: Dict[str, int] = {s: 0 for s in symbols}
 
         def _now_ms() -> int:
             try:
@@ -484,6 +535,10 @@ class Worker:
                 return int(_t.time() * 1000)
 
         def _inc_block(reason: str) -> None:
+            """
+            Уважает существующую сигнатуру:
+            self._inc_block_reason(reason: str), где reason уже включает символ.
+            """
             try:
                 self._inc_block_reason(reason)
             except Exception:
@@ -502,344 +557,422 @@ class Worker:
                 pass
             return 0.1
 
-        def _load_best(sym: str, best_all) -> tuple[float, float]:
+        def _load_best(sym: str, best_all: Dict[str, Any], now_ms: int) -> tuple[float, float]:
             bid = ask = 0.0
-            b = best_all.get(sym) if isinstance(best_all, dict) else None
-            if isinstance(b, (list, tuple)) and len(b) >= 2:
-                bid, ask = float(b[0] or 0.0), float(b[1] or 0.0)
-            elif isinstance(b, dict):
-                bid, ask = float(b.get("bid") or 0.0), float(b.get("ask") or 0.0)
-            if bid <= 0 or ask <= 0:
+
+            # 1) diag.best
+            try:
+                b = (best_all or {}).get(sym) or {}
+                bid = float(b.get("bid") or 0.0)
+                ask = float(b.get("ask") or 0.0)
+            except Exception:
+                bid = ask = 0.0
+
+            # 2) live best
+            if bid <= 0.0 or ask <= 0.0:
                 try:
-                    bid, ask = self.best_bid_ask(sym)
+                    b2, a2 = self.best_bid_ask(sym)
+                    bid = float(b2 or 0.0)
+                    ask = float(a2 or 0.0)
                 except Exception:
                     bid = ask = 0.0
-            return float(bid or 0.0), float(ask or 0.0)
 
-        # risk filters (optional soft import already available module-wide)
+            # 3) фолбэк по последнему тику
+            if bid <= 0.0 or ask <= 0.0:
+                try:
+                    ticks = self.history_ticks(sym, since_ms=now_ms - stale_ms, limit=1)
+                except Exception:
+                    ticks = []
+                if ticks:
+                    t = ticks[-1]
+                    mid = 0.0
+                    try:
+                        mid = float(
+                            t.get("price")
+                            or t.get("mark_price")
+                            or t.get("mid")
+                            or 0.0
+                        )
+                    except Exception:
+                        mid = 0.0
+
+                    if mid <= 0.0:
+                        try:
+                            b_ = float(t.get("bid") or 0.0)
+                            a_ = float(t.get("ask") or 0.0)
+                            if b_ > 0.0 and a_ > 0.0:
+                                mid = (b_ + a_) / 2.0
+                        except Exception:
+                            mid = 0.0
+
+                    if mid > 0.0:
+                        try:
+                            tick_sz = float(self.hub.price_tick(sym))
+                        except Exception:
+                            tick_sz = 0.0
+                        if tick_sz <= 0.0:
+                            tick_sz = mid * 0.0001
+                        bid = mid - tick_sz
+                        ask = mid + tick_sz
+
+            if bid <= 0.0 or ask <= 0.0:
+                return 0.0, 0.0
+            return float(bid), float(ask)
+
+        # --- risk.filters (если есть) ---
         try:
             from risk.filters import MicroCtx, TimeCtx, PositionalCtx, check_entry_safety
-            _HAS_FILTERS = True
+            HAS_FILTERS = True
         except Exception:
             MicroCtx = TimeCtx = PositionalCtx = check_entry_safety = None  # type: ignore
-            _HAS_FILTERS = False
+            HAS_FILTERS = False
 
-        # spread limit default (prefer strict unless cfg present)
+        # --- лимит по спреду ---
         try:
-            cfg_spread_ticks = float(getattr(self._safety_cfg, "max_spread_ticks", 4.0))
-            max_spread_ticks_default = 4.0 if not math.isfinite(cfg_spread_ticks) or cfg_spread_ticks <= 0 else cfg_spread_ticks
+            cfg_spread_ticks = float(getattr(self._safety_cfg, "max_spread_ticks", 6.0))
+            if cfg_spread_ticks <= 0.0 or not math.isfinite(cfg_spread_ticks):
+                cfg_spread_ticks = 6.0
+            max_spread_ticks_default = cfg_spread_ticks
         except Exception:
-            max_spread_ticks_default = 4.0
-        # адресное послабление спред-порога для SOL (чуть ступенчатый актив)
-        per_symbol_spread_max = {
-            "SOLUSDT": max_spread_ticks_default + 2.0
+            max_spread_ticks_default = 6.0
+
+        per_symbol_spread_max: Dict[str, float] = {
+            "SOLUSDT": max_spread_ticks_default + 2.0,
         }
+
+        base_delay_s = max(0.1, cooldown_ms / 4000.0)
 
         try:
             while True:
-                if not bool(getattr(self, "_auto_enabled", False)):
-                    await asyncio.sleep(0.3)
-                    continue
-
-                now = _now_ms()
-                safety_cfg = getattr(self, "_safety_cfg", None)
-                # global cooldown after SL
                 try:
-                    cfg = self._risk_cfg
-                    if cfg.cooldown_after_sl_s > 0 and self._last_sl_ts_ms:
-                        if now - self._last_sl_ts_ms < cfg.cooldown_after_sl_s * 1000:
-                            _inc_block("cooldown_after_sl")
-                            await asyncio.sleep(base_delay_s)
-                            continue
-                except Exception:
-                    pass
+                    now = _now_ms()
+                    self._strategy_heartbeat_ms = now
 
-                # diag snapshot
-                try:
-                    d = self.diag() or {}
-                except Exception:
-                    d = {}
-
-                # day limits
-                day_limits = d.get("day_limits") or {}
-                if not bool(day_limits.get("can_trade", True)):
-                    reasons = day_limits.get("reasons") or []
-                    if reasons:
-                        _inc_block("day_limits:" + ",".join(map(str, reasons)))
-                    await asyncio.sleep(1.0)
-                    continue
-
-                positions    = d.get("positions") or {}
-                best_all     = d.get("best") or {}
-                history_meta = d.get("history") or {}
-
-                for sym in symbols:
-                    try:
-                        # skip if not flat enough
-                        pos = positions.get(sym) or {}
-                        st = str(pos.get("state", "")).upper()
-                        if st in ("OPEN", "ENTERING", "EXITING"):
-                            continue
-
-                        if now - last_entry_ts[sym] < cooldown_ms:
-                            continue
-
-                        last_flat = int(self._last_flat_ms.get(sym, 0) or 0)
-                        if last_flat and now - last_flat < min_flat_ms:
-                            continue
-
-                        # best bid/ask & spread gate
-                        bid, ask = _load_best(sym, best_all)
-                        if bid <= 0 or ask <= 0:
-                            _inc_block(f"{sym}:no_best")
-                            continue
-
-                        mid = (bid + ask) / 2.0
-                        if mid <= 0:
-                            _inc_block(f"{sym}:bad_mid")
-                            continue
-
-                        step = _price_step(sym)
-                        spread = max(0.0, ask - bid)
-                        sprticks = (spread / step) if step > 0 else 0.0
-                        spread_bps = (spread / mid * 1e4) if mid > 0 else 0.0
-
-                        max_spread_ticks = max_spread_ticks_default
-                        max_spread_ticks_sym = per_symbol_spread_max.get(sym, max_spread_ticks_default)
-                        max_spread_ticks_sym = per_symbol_spread_max.get(sym, max_spread_ticks_default)
-                        if sprticks > max_spread_ticks_sym and spread_bps > 5.0:
-                            _inc_block(f"{sym}:spread>{max_spread_ticks:.1f}t")
-                            continue
-
-                        # history freshness
-                        hmeta = history_meta.get(sym) or {}
-                        latest_ts = int(hmeta.get("latest_ts_ms") or 0)
-                        if not latest_ts or now - latest_ts > stale_ms:
-                            _inc_block(f"{sym}:stale_history_meta")
-                            continue
-
-                        try:
-                            ticks = self.history_ticks(sym, since_ms=now - warmup_ms, limit=800)
-                        except Exception:
-                            _inc_block(f"{sym}:no_history")
-                            continue
-
-                        # build aligned arrays
-                        prices: list[float] = []
-                        ts_list: list[int] = []
-                        vols: list[float] = []
-                        for t in (ticks or []):
-                            if isinstance(t, dict):
-                                ts = int(t.get("ts_ms") or t.get("ts") or 0)
-                                px = t.get("price")
-                                if px is None:
-                                    b_ = t.get("bid"); a_ = t.get("ask")
-                                    if b_ and a_:
-                                        px = (float(b_) + float(a_)) / 2.0
-                                vol = t.get("volume") or t.get("qty") or t.get("size") or 0.0
-                            else:
-                                ts = int(getattr(t, "ts_ms", getattr(t, "ts", 0)) or 0)
-                                px = getattr(t, "price", None)
-                                if px is None:
-                                    b_ = getattr(t, "bid", None); a_ = getattr(t, "ask", None)
-                                    if b_ and a_:
-                                        px = (float(b_) + float(a_)) / 2.0
-                                vol = getattr(t, "volume", getattr(t, "qty", getattr(t, "size", 0.0)))
-                            if ts > 0 and px is not None:
-                                ts_list.append(ts)
-                                prices.append(float(px))
-                                try:
-                                    vols.append(float(vol) if vol is not None else 0.0)
-                                except Exception:
-                                    vols.append(0.0)
-
-                        if len(prices) < 24:
-                            _inc_block(f"{sym}:skip_warmup")
-                            continue
-                        if ts_list and now - ts_list[-1] > stale_ms:
-                            _inc_block(f"{sym}:stale_tick")
-                            continue
-
-                        # time-slicing helpers
-                        def slice_since(ms: int) -> list[float]:
-                            if not ts_list:
-                                return []
-                            lo = ts_list[-1] - ms
-                            return [p for p, ts in zip(prices, ts_list) if ts >= lo]
-
-                        _short = slice_since(short_ms)
-                        _long  = slice_since(long_ms)
-
-                        if len(_short) < 6 or len(_long) < 12:
-                            _inc_block(f"{sym}:skip_warmup")
-                            continue
-
-                        short_ma = sum(_short) / len(_short)
-                        long_ma  = sum(_long) / len(_long)
-                        if long_ma <= 0:
-                            _inc_block(f"{sym}:skip_no_baseline")
-                            continue
-
-                        # local range from long window
-                        local_high = max(_long)
-                        local_low  = min(_long)
-                        range_px   = max(0.0, local_high - local_low)
-
-                        # anti-chop: require either ≥1 tick OR ≥0.6 bps
-                        min_range_px_ticks = step * float(min_range_ticks)
-                        min_range_px_bps   = mid * (min_range_bps / 10_000.0)
-                        if not (range_px >= min_range_px_ticks or range_px >= min_range_px_bps):
-                            _inc_block(f"{sym}:skip_chop_range")
-                            continue
-
-                        # slope via older vs newer chunk inside short window
-                        k = max(4, int(0.4 * len(_short)))
-                        prev_short_ma = sum(_short[:-k]) / max(1, len(_short) - k) if len(_short) > k else short_ma
-
-                        last_px   = prices[-1]
-                        diff_rel  = (short_ma - long_ma) / long_ma
-                        slope_rel = (short_ma - prev_short_ma) / prev_short_ma if prev_short_ma > 0 else 0.0
-
-                        # stop distance (vol-aware)
-                        try:
-                            sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid))
-                        except Exception:
-                            # sigma fallback
-                            if len(_long) >= 20:
-                                m = sum(_long[-20:]) / 20.0
-                                var = sum((p - m) ** 2 for p in _long[-20:]) / 20.0
-                                sigma = math.sqrt(var)
-                            else:
-                                sigma = range_px / 6.0 if range_px > 0 else step * min_range_ticks
-                            sl_distance_px = max(step * float(min_range_ticks), 1.2 * sigma, spread * 2.0)
-
-                        if sl_distance_px <= 0:
-                            _inc_block(f"{sym}:bad_sl_distance")
-                            continue
-
-                        # trigger zones within range
-                        upper_trigger = local_high - 0.5 * sl_distance_px
-                        lower_trigger = local_low  + 0.5 * sl_distance_px
-
-                        side: str | None = None
-                        signal_kind: str | None = None  # "momentum" | "reversion"
-
-                        # MOMENTUM breakout
-                        if (
-                            last_px >= upper_trigger
-                            and diff_rel > ma_edge_mom
-                            and slope_rel > slope_edge_mom
-                        ):
-                            side = "BUY"; signal_kind = "momentum"
-                        elif (
-                            last_px <= lower_trigger
-                            and diff_rel < -ma_edge_mom
-                            and slope_rel < -slope_edge_mom
-                        ):
-                            side = "SELL"; signal_kind = "momentum"
-
-                        # REVERSION bounce (only if trend not strong)
-                        if side is None:
-                            trend_strong = abs(diff_rel) > ma_edge_mom * 2.0
-                            if not trend_strong:
-                                edge_zone = 0.25 * range_px
-                                if (
-                                    last_px <= local_low + edge_zone
-                                    and diff_rel > ma_edge_rev
-                                    and slope_rel > 0.0
-                                ):
-                                    side = "BUY"; signal_kind = "reversion"
-                                elif (
-                                    last_px >= local_high - edge_zone
-                                    and diff_rel < -ma_edge_rev
-                                    and slope_rel < 0.0
-                                ):
-                                    side = "SELL"; signal_kind = "reversion"
-                        
-                        # --- Fast micro-momentum (если фичи доступны) ---
-                        if side is None and self._last_micro.get(sym):
-                            lm = self._last_micro.get(sym) or {}
-                            drift = float(lm.get("microprice_drift") or 0.0)
-                            tvel  = float(lm.get("tick_velocity") or 0.0)
-                            spread_ticks_now = sprticks
-
-                            # условия: маленький спред, явный дрейф и тиковая скорость
-                            if spread_ticks_now <= max_spread_ticks_default and abs(drift) > 0.35 and abs(tvel) > 0.6:
-                                if drift > 0 and tvel > 0:
-                                    side = "BUY";  signal_kind = "momentum"
-                                elif drift < 0 and tvel < 0:
-                                    side = "SELL"; signal_kind = "momentum"
-
-                        if side is None:
-                            _inc_block(f"{sym}:skip_no_signal")
-                            continue
-
-                        # light relative volume filter
-                        if vols and sum(vols) > 0:
-                            base_slice = vols[:-5] if len(vols) > 12 else vols
-                            recent_vol = sum(vols[-5:])
-                            base_vol   = (sum(base_slice) / max(1, len(base_slice))) if base_slice else 0.0
-                            if base_vol > 0 and recent_vol < 0.3 * base_vol:
-                                _inc_block(f"{sym}:skip_low_volume")
-                                continue
-
-                        # risk.filters safety pre-check
-                        if _HAS_FILTERS and safety_cfg is not None:
-                            try:
-                                lm = (self._last_micro.get(sym, {}) or {})
-                                eff_liq = float(lm.get("top5_liq_usd") or 0.0)
-                                if eff_liq <= 0:
-                                    tl = float(lm.get("top_liq_usd") or 0.0)
-                                    eff_liq = tl * 3.0 if tl > 0 else 0.0
-
-                                micro_ctx = MicroCtx(
-                                    spread_ticks=float(sprticks),
-                                    top5_liq_usd=float(eff_liq if eff_liq and eff_liq > 0 else 1e9),
-                                )
-                                tctx = TimeCtx(
-                                    ts_ms=now,
-                                    server_time_offset_ms=getattr(self, "_server_time_offset_ms", 0),
-                                )
-                                sl_px = (mid - sl_distance_px) if side == "BUY" else (mid + sl_distance_px)
-                                pos_ctx = PositionalCtx(
-                                    entry_px=float(mid),
-                                    sl_px=float(sl_px),
-                                    leverage=float(getattr(self, "_leverage", 10.0)),
-                                )
-                                dec = check_entry_safety(side, micro=micro_ctx, time_ctx=tctx, pos_ctx=pos_ctx, safety=safety_cfg)
-                                if not dec.allow:
-                                    _inc_block(f"{sym}:safety_pre:" + ",".join(dec.reasons))
-                                    continue
-                            except Exception:
-                                log.exception("[strategy] safety check failed for %s", sym)
-
-                        # ENTRY: route by kind (momentum→IOC, reversion→maker)
-                        try:
-                            rep = await self._place_entry_with_kind(sym, side, signal_kind, sl_distance_px, mid, bid, ask)
-                        except Exception as e:
-                            log.exception("[strategy] place_entry failed for %s %s: %s", sym, side, e)
-                            _inc_block(f"{sym}:entry_error")
-                            continue
-
-                        if not isinstance(rep, dict) or not rep.get("ok", False):
-                            reason = (rep or {}).get("reason", "rejected")
-                            _inc_block(f"{sym}:entry_rejected_{reason}")
-                            continue
-
-                        last_entry_ts[sym] = now
-
-                    except Exception:
-                        log.exception("[strategy] symbol-loop error for %s", sym)
-                        _inc_block(f"{sym}:loop_error")
+                    if not bool(getattr(self, "_auto_enabled", False)):
+                        await asyncio.sleep(0.3)
                         continue
 
-                await asyncio.sleep(base_delay_s)
+                    # глобальный cooldown после SL
+                    try:
+                        rcfg = self._risk_cfg
+                        last_sl = int(getattr(self, "_last_sl_ts_ms", 0) or 0)
+                        cd_s = int(getattr(rcfg, "cooldown_after_sl_s", 0) or 0)
+                        if cd_s > 0 and last_sl and now - last_sl < cd_s * 1000:
+                            _inc_block("GLOBAL:cooldown_after_sl")
+                            await asyncio.sleep(base_delay_s)
+                            continue
+                    except Exception:
+                        pass
+
+                    # diag-снапшот
+                    try:
+                        d = self.diag() or {}
+                    except Exception:
+                        d = {}
+
+                    day_limits = d.get("day_limits") or {}
+                    if not bool(day_limits.get("can_trade", True)):
+                        reasons = day_limits.get("reasons") or []
+                        if reasons:
+                            _inc_block("GLOBAL:day_limits:" + ",".join(map(str, reasons)))
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    positions = d.get("positions") or {}
+                    best_all = d.get("best") or {}
+                    history_meta = d.get("history") or {}
+
+                    for sym in symbols:
+                        try:
+                            pos = positions.get(sym) or {}
+                            st = str(pos.get("state", "")).upper()
+                            if st in ("OPEN", "ENTERING", "EXITING"):
+                                continue
+
+                            if now - last_entry_ts.get(sym, 0) < cooldown_ms:
+                                _inc_block(f"{sym}:cooldown_symbol")
+                                continue
+
+                            last_flat_ts = int(self._last_flat_ms.get(sym) or 0)
+                            if last_flat_ts > 0 and (now - last_flat_ts) < min_flat_ms:
+                                _inc_block(f"{sym}:min_flat")
+                                continue
+
+                            bid, ask = _load_best(sym, best_all, now)
+                            if bid <= 0.0 or ask <= 0.0:
+                                _inc_block(f"{sym}:no_best")
+                                continue
+
+                            mid = (bid + ask) / 2.0
+                            if mid <= 0.0:
+                                _inc_block(f"{sym}:bad_mid")
+                                continue
+
+                            step = _price_step(sym)
+                            spread = max(0.0, ask - bid)
+                            sprticks = spread / step if step > 0 else 0.0
+                            spread_bps = spread / mid * 1e4 if mid > 0 else 0.0
+
+                            max_spread_ticks = per_symbol_spread_max.get(sym, max_spread_ticks_default)
+                            if sprticks > max_spread_ticks and spread_bps > 5.0:
+                                _inc_block(f"{sym}:spread_too_wide")
+                                continue
+
+                            hmeta = history_meta.get(sym) or {}
+                            latest_ts = int(hmeta.get("latest_ts_ms") or 0)
+                            if not latest_ts or now - latest_ts > stale_ms:
+                                _inc_block(f"{sym}:stale_history_meta")
+                                continue
+
+                            try:
+                                ticks = self.history_ticks(sym, since_ms=now - warmup_ms, limit=800)
+                            except Exception:
+                                _inc_block(f"{sym}:no_history")
+                                continue
+
+                            prices: List[float] = []
+                            ts_list: List[int] = []
+                            vols: List[float] = []
+
+                            for t in ticks or []:
+                                if isinstance(t, dict):
+                                    ts = int(t.get("ts_ms") or t.get("ts") or 0)
+                                    px = t.get("price")
+                                    if px is None:
+                                        b_ = t.get("bid"); a_ = t.get("ask")
+                                        if b_ and a_:
+                                            px = (float(b_) + float(a_)) / 2.0
+                                    vol = t.get("volume") or t.get("qty") or t.get("size") or 0.0
+                                else:
+                                    ts = int(getattr(t, "ts_ms", getattr(t, "ts", 0)) or 0)
+                                    px = getattr(t, "price", None)
+                                    if px is None:
+                                        b_ = getattr(t, "bid", None); a_ = getattr(t, "ask", None)
+                                        if b_ and a_:
+                                            px = (float(b_) + float(a_)) / 2.0
+                                    vol = getattr(t, "volume", getattr(t, "qty", getattr(t, "size", 0.0)))
+
+                                if ts > 0 and px is not None:
+                                    ts_list.append(ts)
+                                    prices.append(float(px))
+                                    try:
+                                        vols.append(float(vol) if vol is not None else 0.0)
+                                    except Exception:
+                                        vols.append(0.0)
+
+                            if len(prices) < 24:
+                                _inc_block(f"{sym}:skip_warmup")
+                                continue
+                            if ts_list and now - ts_list[-1] > stale_ms:
+                                _inc_block(f"{sym}:stale_tick")
+                                continue
+
+                            def slice_since(window_ms: int) -> List[float]:
+                                if not ts_list:
+                                    return []
+                                lo = ts_list[-1] - window_ms
+                                return [p for p, ts in zip(prices, ts_list) if ts >= lo]
+
+                            arr_short = slice_since(short_ms)
+                            arr_long = slice_since(long_ms)
+
+                            if len(arr_short) < 6 or len(arr_long) < 12:
+                                _inc_block(f"{sym}:skip_warmup")
+                                continue
+
+                            short_ma = sum(arr_short) / len(arr_short)
+                            long_ma  = sum(arr_long) / len(arr_long)
+                            if long_ma <= 0.0:
+                                _inc_block(f"{sym}:no_baseline")
+                                continue
+
+                            local_high = max(arr_long)
+                            local_low  = min(arr_long)
+                            range_px   = max(0.0, local_high - local_low)
+
+                            min_range_px_ticks = step * float(min_range_ticks)
+                            min_range_px_bps   = mid * (min_range_bps / 10_000.0)
+
+                            if not (range_px >= min_range_px_ticks or range_px >= min_range_px_bps):
+                                _inc_block(f"{sym}:chop_range")
+                                continue
+
+                            k = max(4, int(0.4 * len(arr_short)))
+                            if len(arr_short) > k:
+                                prev_short_ma = sum(arr_short[:-k]) / max(1, len(arr_short) - k)
+                            else:
+                                prev_short_ma = short_ma
+
+                            last_px   = prices[-1]
+                            diff_rel  = (short_ma - long_ma) / long_ma
+                            slope_rel = (short_ma - prev_short_ma) / prev_short_ma if prev_short_ma > 0.0 else 0.0
+
+                            try:
+                                sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid))
+                            except Exception:
+                                if len(arr_long) >= 20:
+                                    m = sum(arr_long[-20:]) / 20.0
+                                    var = sum((p - m) ** 2 for p in arr_long[-20:]) / 20.0
+                                    sigma = math.sqrt(var)
+                                else:
+                                    sigma = range_px / 6.0 if range_px > 0.0 else step * max(1, min_range_ticks)
+                                sl_distance_px = max(
+                                    step * float(min_range_ticks),
+                                    1.2 * sigma,
+                                    spread * 2.0,
+                                )
+
+                            if sl_distance_px <= 0.0:
+                                _inc_block(f"{sym}:bad_sl_distance")
+                                continue
+
+                            upper_trigger = local_high - 0.5 * sl_distance_px
+                            lower_trigger = local_low  + 0.5 * sl_distance_px
+
+                            side: Optional[str] = None
+                            signal_kind: Optional[str] = None
+
+                            # momentum
+                            if (
+                                last_px >= upper_trigger
+                                and diff_rel > ma_edge_mom
+                                and slope_rel > slope_edge_mom
+                            ):
+                                side = "BUY"
+                                signal_kind = "momentum"
+                            elif (
+                                last_px <= lower_trigger
+                                and diff_rel < -ma_edge_mom
+                                and slope_rel < -slope_edge_mom
+                            ):
+                                side = "SELL"
+                                signal_kind = "momentum"
+
+                            # reversion
+                            if side is None:
+                                trend_strong = abs(diff_rel) > ma_edge_mom * 2.0
+                                if not trend_strong:
+                                    edge_zone = 0.25 * range_px
+                                    if (
+                                        last_px <= local_low + edge_zone
+                                        and diff_rel > ma_edge_rev
+                                        and slope_rel > 0.0
+                                    ):
+                                        side = "BUY"
+                                        signal_kind = "reversion"
+                                    elif (
+                                        last_px >= local_high - edge_zone
+                                        and diff_rel < -ma_edge_rev
+                                        and slope_rel < 0.0
+                                    ):
+                                        side = "SELL"
+                                        signal_kind = "reversion"
+
+                            # micro-momentum
+                            if side is None and getattr(self, "_last_micro", None):
+                                lm = (self._last_micro or {}).get(sym) or {}
+                                drift = float(lm.get("microprice_drift") or 0.0)
+                                tvel  = float(lm.get("tick_velocity") or 0.0)
+                                if sprticks <= max_spread_ticks_default and abs(drift) > 0.3 and abs(tvel) > 0.5:
+                                    if drift > 0.0 and tvel > 0.0:
+                                        side = "BUY"
+                                        signal_kind = "momentum"
+                                    elif drift < 0.0 and tvel < 0.0:
+                                        side = "SELL"
+                                        signal_kind = "momentum"
+
+                            if side is None:
+                                _inc_block(f"{sym}:no_signal")
+                                continue
+
+                            # объём
+                            if vols and sum(vols) > 0.0:
+                                base_slice = vols[:-5] if len(vols) > 12 else vols
+                                recent = sum(vols[-5:])
+                                base = sum(base_slice) / max(1, len(base_slice)) if base_slice else 0.0
+                                if base > 0.0 and recent < 0.25 * base:
+                                    _inc_block(f"{sym}:low_volume")
+                                    continue
+
+                            # safety
+                            if HAS_FILTERS and getattr(self, "_safety_cfg", None) is not None:
+                                try:
+                                    lm = (getattr(self, "_last_micro", {}) or {}).get(sym, {}) or {}
+                                    eff_liq = float(lm.get("top5_liq_usd") or 0.0)
+                                    if eff_liq <= 0.0:
+                                        tl = float(lm.get("top_liq_usd") or 0.0)
+                                        eff_liq = tl * 3.0 if tl > 0.0 else 0.0
+
+                                    micro_ctx = MicroCtx(
+                                        spread_ticks=float(sprticks),
+                                        top5_liq_usd=float(eff_liq if eff_liq > 0.0 else 1e9),
+                                    )
+                                    tctx = TimeCtx(
+                                        ts_ms=now,
+                                        server_time_offset_ms=getattr(self, "_server_time_offset_ms", 0),
+                                    )
+                                    sl_px_eff = mid - sl_distance_px if side == "BUY" else mid + sl_distance_px
+                                    pos_ctx = PositionalCtx(
+                                        entry_px=float(mid),
+                                        sl_px=float(sl_px_eff),
+                                        leverage=float(getattr(self, "_leverage", 10.0)),
+                                    )
+                                    dec = check_entry_safety(
+                                        side,
+                                        micro=micro_ctx,
+                                        time_ctx=tctx,
+                                        pos_ctx=pos_ctx,
+                                        safety=self._safety_cfg,
+                                    )
+                                    if not dec.allow:
+                                        _inc_block(f"{sym}:safety_pre:" + ",".join(dec.reasons))
+                                        continue
+                                except Exception:
+                                    log.exception("[strategy] safety check failed for %s", sym)
+
+                            # фактический вход
+                            try:
+                                rep = await self._place_entry_with_kind(
+                                    sym,
+                                    side,
+                                    signal_kind,
+                                    sl_distance_px,
+                                    mid,
+                                    bid,
+                                    ask,
+                                )
+                            except Exception as e:
+                                log.exception("[strategy] place_entry failed for %s %s: %s", sym, side, e)
+                                _inc_block(f"{sym}:entry_error")
+                                continue
+
+                            if not isinstance(rep, dict) or not rep.get("ok", False):
+                                reason = (rep or {}).get("reason", "rejected")
+                                _inc_block(f"{sym}:entry_rejected:{reason}")
+                                continue
+
+                            last_entry_ts[sym] = now
+
+                        except Exception:
+                            log.exception("[strategy] symbol-loop error for %s", sym)
+                            _inc_block(f"{sym}:loop_error")
+                            continue
+
+                    await asyncio.sleep(base_delay_s)
+
+                except asyncio.CancelledError:
+                    log.info("[strategy] _strategy_loop cancelled")
+                    return
+                except Exception as e:
+                    log.exception("[strategy] outer loop error: %s", e)
+                    self._last_strategy_error = f"{type(e).__name__}: {e}"
+                    await asyncio.sleep(1.0)
 
         except asyncio.CancelledError:
-            log.info("[strategy] _strategy_loop canceled")
-            return
-        except Exception:
-            log.exception("[strategy] outer-loop error")
+            log.info("[strategy] _strategy_loop cancelled (outer)")
+        except Exception as e:
+            log.exception("[strategy] fatal error: %s", e)
+            self._last_strategy_error = f"{type(e).__name__}: {e}"
             await asyncio.sleep(1.0)
     
     def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
@@ -2031,222 +2164,241 @@ class Worker:
 
     def diag(self) -> Dict[str, Any]:
         """
-        Стабильный снапшот состояния для API/фронта.
+        Стабильный снепшот состояния воркера для API.
 
-        Без выброса исключений наружу:
-        - ws/stream статус
-        - best bid/ask
-        - история тиков по символам (meta)
-        - позиции и uPnL
-        - сделки и дневной PnL
-        - риск, безопасники, дневные лимиты
-        - авто-сигналы/стратегия
+        Требования:
+        - НИКОГДА не падает (всё в try/except).
+        - Возвращает ключи, которых ждут эндпоинты:
+            symbols, ws_detail, coal, history, best, positions,
+            unrealized, trades, pnl_day, risk_cfg, protection_cfg,
+            safety_cfg, day_limits, consec_losses, account_cfg,
+            exec_cfg, exec_counters, block_reasons,
+            auto_signal_enabled, strategy_cfg, strategy_last_error,
+            strategy_heartbeat_ms.
         """
-        symbols = list(self.symbols)
+        import dataclasses
+        from typing import Dict, Any
 
-        # --- WS / coalescer ---
+        out: Dict[str, Any] = {}
+
+        # --- базовые вещи ---
         try:
-            ws_detail = self.ws.diag()
+            out["symbols"] = list(self.symbols)
+        except Exception:
+            out["symbols"] = []
+
+        # --- ws_detail ---
+        ws_detail: Dict[str, Any] = {}
+        try:
+            if hasattr(self.ws, "stats"):
+                ws_detail = self.ws.stats() or {}
         except Exception:
             ws_detail = {}
+        out["ws_detail"] = ws_detail
 
+        # --- coalescer stats (coal) ---
+        coal: Dict[str, Any] = {}
         try:
-            coal_stats = self.coal.stats()
+            if hasattr(self.coal, "stats"):
+                coal = self.coal.stats() or {}
         except Exception:
-            coal_stats = {}
+            coal = {}
+        out["coal"] = coal
+
+        # --- history meta: last ts по _hist ---
+        history_meta: Dict[str, Any] = {}
+        try:
+            for sym, dq in (getattr(self, "_hist", {}) or {}).items():
+                latest_ts = 0
+                if dq:
+                    last = dq[-1]
+                    try:
+                        latest_ts = int(
+                            (last.get("ts_ms")
+                            or last.get("ts")
+                            or 0)
+                        )
+                    except Exception:
+                        latest_ts = 0
+                history_meta[sym] = {"latest_ts_ms": latest_ts}
+        except Exception:
+            history_meta = {}
+        out["history"] = history_meta
 
         # --- best bid/ask ---
-        best: Dict[str, Tuple[float, float]] = {}
-        for s in symbols:
-            try:
-                bid, ask = self.hub.best_bid_ask(s)
-            except Exception:
-                bid, ask = 0.0, 0.0
-            best[s] = (float(bid), float(ask))
-
-        # --- history meta ---
-        history: Dict[str, Dict[str, Any]] = {}
-        for s in symbols:
-            dq = self._hist.get(s) or []
-            latest_ts = 0
-            if dq:
+        best: Dict[str, Any] = {}
+        try:
+            for sym in out.get("symbols", []):
                 try:
-                    latest_ts = int(dq[-1].get("ts_ms", 0))
+                    bid, ask = self.best_bid_ask(sym)
                 except Exception:
-                    latest_ts = 0
-            history[s] = {
-                "len": len(dq),
-                "maxlen": self._history_maxlen,
-                "latest_ts_ms": latest_ts,
-            }
-
-        # --- positions snapshot ---
-        positions = self.diag_positions()
-
-        # --- unrealized snapshot ---
-        try:
-            unrealized = self._unrealized_snapshot()
+                    bid, ask = 0.0, 0.0
+                best[sym] = {"bid": float(bid or 0.0), "ask": float(ask or 0.0)}
         except Exception:
-            unrealized = {
-                "total_usd": 0.0,
-                "per_symbol": None,
-                "open_positions": 0,
-            }
+            best = {}
+        out["best"] = best
 
-        # --- pnl_day (safe/rounded) ---
+        # --- positions (из self._pos) ---
+        positions: Dict[str, Any] = {}
         try:
-            pnl_raw = dict(self._pnl_day or {})
-        except Exception:
-            pnl_raw = {}
-
-        pnl_day: Dict[str, Any] = {}
-        if not pnl_raw:
-            pnl_day = {
-                "day": self._day_str(),
-                "trades": 0,
-                "winrate": None,
-                "avg_r": None,
-                "pnl_r": 0.0,
-                "pnl_usd": 0.0,
-                "max_dd_r": None,
-            }
-        else:
-            for k, v in pnl_raw.items():
-                if k.endswith("_raw"):
-                    continue
-                if isinstance(v, float):
-                    pnl_day[k] = round(v, 6)
+            for sym, p in (getattr(self, "_pos", {}) or {}).items():
+                if hasattr(p, "__dict__"):
+                    # dataclass PositionState
+                    try:
+                        positions[sym] = dataclasses.asdict(p)
+                    except Exception:
+                        positions[sym] = dict(p.__dict__)
                 else:
-                    pnl_day[k] = v
-
-        # --- trades snapshot ---
-        trades: Dict[str, Any] = {}
-        for s in symbols:
-            try:
-                trades[s] = list(self._trades.get(s, []))
-            except Exception:
-                trades[s] = []
-
-        # --- risk cfg ---
-        try:
-            risk_cfg = {
-                "risk_per_trade_pct": float(self._risk_cfg.risk_per_trade_pct),
-                "daily_stop_r": float(self._risk_cfg.daily_stop_r),
-                "daily_target_r": float(self._risk_cfg.daily_target_r),
-                "max_consec_losses": int(self._risk_cfg.max_consec_losses),
-                "cooldown_after_sl_s": int(self._risk_cfg.cooldown_after_sl_s),
-                "min_risk_usd_floor": float(getattr(self._risk_cfg, "min_risk_usd_floor", 0.0)),
-            }
+                    positions[sym] = dict(p or {})
         except Exception:
-            risk_cfg = {}
+            positions = {}
+        out["positions"] = positions
 
-        # --- protection cfg (subset risk) ---
-        try:
-            protection_cfg = {
-                "daily_stop_r": float(self._risk_cfg.daily_stop_r),
-                "daily_target_r": float(self._risk_cfg.daily_target_r),
-                "max_consec_losses": int(self._risk_cfg.max_consec_losses),
-            }
-        except Exception:
-            protection_cfg = {}
-
-        # --- safety cfg ---
-        try:
-            safety_cfg = {
-                "max_spread_ticks": int(self._safety_cfg.max_spread_ticks),
-                "min_top5_liquidity_usd": float(self._safety_cfg.min_top5_liquidity_usd),
-                "skip_funding_minute": bool(self._safety_cfg.skip_funding_minute),
-                "skip_minute_zero": bool(self._safety_cfg.skip_minute_zero),
-                "min_liq_buffer_sl_mult": float(self._safety_cfg.min_liq_buffer_sl_mult),
-            }
-        except Exception:
-            safety_cfg = {}
-
-        # --- account cfg ---
-        try:
-            equity_now = float(
-                self._starting_equity_usd
-                + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0)
-            )
-        except Exception:
-            equity_now = float(self._starting_equity_usd)
-
-        account_cfg = {
-            "starting_equity_usd": float(self._starting_equity_usd),
-            "leverage": float(self._leverage),
-            "min_notional_usd": float(self._min_notional_usd),
-            "equity_now_usd": round(equity_now, 6),
+        # --- unrealized PnL (best-effort) ---
+        unrealized = {
+            "total_usd": 0.0,
+            "per_symbol": {},
+            "open_positions": 0,
         }
-
-        # --- day limits snapshot ---
         try:
-            day_state = DayState(
-                pnl_r_day=float(pnl_day.get("pnl_r", 0.0) or 0.0),
-                consec_losses=int(self._consec_losses),
-                trading_disabled=False,
-            )
-            day_dec = check_day_limits(day_state, self._risk_cfg)
-            day_limits = {
-                "can_trade": bool(day_dec.allow),
-                "reasons": list(day_dec.reasons),
+            per_sym = {}
+            total = 0.0
+            open_pos = 0
+            for sym, p in (positions or {}).items():
+                p = p or {}
+                if str(p.get("state", "")).upper() != "OPEN":
+                    continue
+                open_pos += 1
+                qty = float(p.get("qty") or 0.0)
+                entry = float(p.get("entry_px") or 0.0)
+                if qty <= 0.0 or entry <= 0.0:
+                    continue
+                b = best.get(sym, {}).get("bid", 0.0)
+                a = best.get(sym, {}).get("ask", 0.0)
+                mid = (float(b or 0.0) + float(a or 0.0)) / 2.0
+                if mid <= 0.0:
+                    continue
+                side = (p.get("side") or "").upper()
+                diff = (mid - entry) if side == "BUY" else (entry - mid)
+                u = diff * qty
+                per_sym[sym] = u
+                total += u
+            unrealized["total_usd"] = float(total)
+            unrealized["per_symbol"] = per_sym if per_sym else None
+            unrealized["open_positions"] = int(open_pos)
+        except Exception:
+            pass
+        out["unrealized"] = unrealized
+
+        # --- trades (in-memory) ---
+        try:
+            out["trades"] = {
+                sym: list(dq) for sym, dq in (getattr(self, "_trades", {}) or {}).items()
             }
         except Exception:
-            day_limits = {
-                "can_trade": True,
-                "reasons": [],
-            }
+            out["trades"] = {}
 
-        # --- exec cfg per symbol ---
-        exec_cfg: Dict[str, Dict[str, Any]] = {}
-        for s in symbols:
-            try:
-                c = self.execs[s].c
-                exec_cfg[s] = {
-                    "price_tick": float(c.price_tick),
-                    "qty_step": float(c.qty_step),
-                    "limit_offset_ticks": int(c.limit_offset_ticks),
-                    "limit_timeout_ms": int(c.limit_timeout_ms),
-                    "time_in_force": str(c.time_in_force),
-                    "poll_ms": int(c.poll_ms),
-                    "prefer_maker": bool(c.prefer_maker),
-                    "fee_bps_maker": float(c.fee_bps_maker),
-                    "fee_bps_taker": float(c.fee_bps_taker),
+        # --- pnl_day ---
+        try:
+            out["pnl_day"] = dict(getattr(self, "_pnl_day", {}) or {})
+        except Exception:
+            out["pnl_day"] = {}
+
+        # --- risk_cfg ---
+        try:
+            rcfg = getattr(self, "_risk_cfg", None)
+            if rcfg is None:
+                out["risk_cfg"] = {}
+            elif isinstance(rcfg, dict):
+                out["risk_cfg"] = dict(rcfg)
+            elif hasattr(rcfg, "__dict__"):
+                out["risk_cfg"] = dict(rcfg.__dict__)
+            else:
+                out["risk_cfg"] = {}
+        except Exception:
+            out["risk_cfg"] = {}
+
+        # --- safety_cfg ---
+        try:
+            scfg = getattr(self, "_safety_cfg", None)
+            if scfg is None:
+                out["safety_cfg"] = {}
+            elif isinstance(scfg, dict):
+                out["safety_cfg"] = dict(scfg)
+            elif hasattr(scfg, "__dict__"):
+                out["safety_cfg"] = dict(scfg.__dict__)
+            else:
+                out["safety_cfg"] = {}
+        except Exception:
+            out["safety_cfg"] = {}
+
+        # protection_cfg — пока пустой (если позже добавишь — просто заполни)
+        out["protection_cfg"] = out.get("protection_cfg", {}) or {}
+
+        # --- day_limits (если у тебя нет логики — дефолт) ---
+        try:
+            if "day_limits" not in out or not out["day_limits"]:
+                out["day_limits"] = {
+                    "can_trade": True,
+                    "reasons": [],
                 }
-            except Exception:
-                exec_cfg[s] = {}
+        except Exception:
+            out["day_limits"] = {"can_trade": True, "reasons": []}
 
-        # --- counters / блокировки ---
-        exec_counters = dict(self._exec_counters or {})
-        block_reasons = dict(self._block_reasons or {})
+        # --- consec_losses ---
+        try:
+            out["consec_losses"] = int(getattr(self, "_consec_losses", 0) or 0)
+        except Exception:
+            out["consec_losses"] = 0
 
-        # --- strategy / auto ---
-        strategy_cfg = {
-            "cooldown_ms": int(self._auto_cooldown_ms),
-            "min_flat_ms": int(self._auto_min_flat_ms),
-        }
+        # --- account_cfg ---
+        try:
+            out["account_cfg"] = {
+                "starting_equity_usd": float(getattr(self, "_starting_equity_usd", 1000.0)),
+                "leverage": float(getattr(self, "_leverage", 15.0)),
+                "min_notional_usd": float(getattr(self, "_min_notional_usd", 5.0)),
+            }
+        except Exception:
+            out["account_cfg"] = {}
 
-        return {
-            "symbols": symbols,
-            "ws_detail": ws_detail,
-            "coal": coal_stats,
-            "best": best,
-            "history": history,
-            "positions": positions,
-            "unrealized": unrealized,
-            "exec_cfg": exec_cfg,
-            "exec_counters": exec_counters,
-            "pnl_day": pnl_day,
-            "trades": trades,
-            "block_reasons": block_reasons,
-            "risk_cfg": risk_cfg,
-            "protection_cfg": protection_cfg,
-            "safety_cfg": safety_cfg,
-            "consec_losses": int(self._consec_losses),
-            "account_cfg": account_cfg,
-            "auto_signal_enabled": bool(self._auto_enabled),
-            "strategy_cfg": strategy_cfg,
-            "day_limits": day_limits,
-        }
+        # --- exec_cfg ---
+        exec_cfg: Dict[str, Any] = {}
+        try:
+            if hasattr(self, "_exec_cfg"):
+                exec_cfg.update(getattr(self, "_exec_cfg") or {})
+            if hasattr(self, "exec") and hasattr(self.exec, "get_policy"):
+                exec_cfg.update(dict(self.exec.get_policy()))
+        except Exception:
+            pass
+        out["exec_cfg"] = exec_cfg
+
+        # --- exec_counters ---
+        try:
+            out["exec_counters"] = dict(getattr(self, "_exec_counters", {}) or {})
+        except Exception:
+            out["exec_counters"] = {}
+
+        # --- block_reasons ---
+        try:
+            out["block_reasons"] = dict(getattr(self, "_block_reasons", {}) or {})
+        except Exception:
+            out["block_reasons"] = {}
+
+        # --- авто-стратегия / статус ---
+        try:
+            out["auto_signal_enabled"] = bool(getattr(self, "_auto_enabled", False))
+        except Exception:
+            out["auto_signal_enabled"] = False
+
+        try:
+            out["strategy_cfg"] = dict(getattr(self, "_strategy_cfg", {}) or {})
+        except Exception:
+            out["strategy_cfg"] = {}
+
+        out["strategy_last_error"] = getattr(self, "_last_strategy_error", None)
+        out["strategy_heartbeat_ms"] = int(getattr(self, "_strategy_heartbeat_ms", 0) or 0)
+
+        return out
     
     # === BEGIN: Worker per-symbol fees/leverage & safe sizing ===
 
@@ -2308,17 +2460,57 @@ class Worker:
 
     def _fees_for_symbol(self, symbol: str) -> tuple[float, float]:
         """
-        Эффективные комиссии в bps (maker, taker) с фолбэком на глобальный exec_cfg.
-        Вызывается из app (/fees, /control/test-entry).
+        Эффективные комиссии в bps (maker, taker):
+        приоритет:
+        1) per-symbol override (set_per_symbol_fees_bps),
+        2) exec_cfg (update_exec_cfg / reload_runtime_cfg),
+        3) settings().fees.binance_usdtm,
+        4) дефолты 2 / 4.
         """
-        self._init_per_symbol_maps()
         sym = str(symbol).upper()
-        if sym in self._per_symbol_fees_bps:
-            return self._per_symbol_fees_bps[sym]
-        exec_cfg = getattr(self, "_exec_cfg", {})
-        mk = float(exec_cfg.get("fee_bps_maker", 2.0))
-        tk = float(exec_cfg.get("fee_bps_taker", 4.0))
-        return mk, tk
+        maker = taker = None
+
+        # 1) per-symbol map
+        try:
+            self._init_per_symbol_maps()
+            if sym in self._per_symbol_fees_bps:
+                mk, tk = self._per_symbol_fees_bps[sym]
+                maker, taker = float(mk), float(tk)
+        except Exception:
+            pass
+
+        # 2) exec_cfg
+        if maker is None or taker is None:
+            try:
+                ecfg = getattr(self, "_exec_cfg", {}) or {}
+                mk = ecfg.get("fee_bps_maker")
+                tk = ecfg.get("fee_bps_taker")
+                if mk is not None and tk is not None:
+                    maker = float(mk)
+                    taker = float(tk)
+            except Exception:
+                pass
+
+        # 3) settings().fees.binance_usdtm
+        if (maker is None or taker is None) and get_settings:
+            try:
+                s = get_settings()
+                f = (getattr(s, "fees", None) or {}).get("binance_usdtm", {})
+                mk = f.get("maker_bps")
+                tk = f.get("taker_bps")
+                if mk is not None and tk is not None:
+                    maker = float(mk)
+                    taker = float(tk)
+            except Exception:
+                pass
+
+        # 4) defaults
+        if maker is None:
+            maker = 2.0
+        if taker is None:
+            taker = 4.0
+
+        return float(maker), float(taker)
 
     def _leverage_for_symbol(self, symbol: str) -> float:
         """
@@ -2356,60 +2548,6 @@ class Worker:
         if dist_sl <= 0:
             return float("inf")
         return dist_liq / dist_sl
-
-    def _compute_auto_qty(self, symbol: str, side: str, sl_distance_px: float) -> float:
-        """
-        Автосайзинг под риск, с учётом:
-        - equity, risk_per_trade_pct, min_notional_usd,
-        - пер-символьного плеча,
-        - требуемого ликвидационного буфера относительно SL (safety.min_liq_buffer_sl_mult).
-        Возвращает неквантованное qty (квантование делает app).
-        """
-        from bot.core.config import get_settings
-        s = get_settings()
-        acc = getattr(s, "account", object())
-        risk = getattr(s, "risk", object())
-        safety = getattr(s, "safety", object())
-
-        equity_usd = float(getattr(acc, "starting_equity_usd", 1000.0))
-        risk_pct = float(getattr(risk, "risk_per_trade_pct", 0.25))
-        min_notional_usd = float(getattr(acc, "min_notional_usd", 5.0))
-        lev = float(self._leverage_for_symbol(symbol))
-        min_buf = float(getattr(safety, "min_liq_buffer_sl_mult", 3.0))
-
-        # цена сейчас (mid)
-        bid, ask = self.best_bid_ask(symbol)
-        if bid <= 0 and ask <= 0:
-            return 0.0
-        price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else max(bid, ask)
-
-        if price <= 0 or sl_distance_px <= 0:
-            return 0.0
-
-        # базовый qty от риска
-        desired_risk_usd = max(0.0, equity_usd * (risk_pct / 100.0))
-        qty = desired_risk_usd / sl_distance_px
-
-        # ограничение по плечу / нотионалу
-        max_qty_by_lev = (equity_usd * lev) / price
-        qty = min(qty, max_qty_by_lev)
-        if qty * price < min_notional_usd:
-            return 0.0
-
-        # проверка ликвидационного буфера относительно SL
-        entry_px = price
-        # SL вокруг entry на заданную дистанцию (направление не критично для буфера)
-        sl_px = entry_px - sl_distance_px if str(side).upper() == "BUY" else entry_px + sl_distance_px
-        buf = self._liq_buffer_mult(entry_px, sl_px, side, lev)
-        if buf < min_buf:
-            # если буфер мал — уменьшаем qty так, чтобы увеличить «эффективную дистанцию» до ликвидации.
-            # При линейной аппроксимации достаточно ослабить плечо: qty ограничим ещё сильнее.
-            # Правило: ограничим qty так, чтобы max_qty_by_lev стало на 20% ниже текущего (плавный даунсайз).
-            qty = min(qty, max_qty_by_lev * 0.8)
-            if qty * price < min_notional_usd:
-                return 0.0
-
-        return max(0.0, float(qty))
 
     # === END: Worker per-symbol fees/leverage & safe sizing ===
 
@@ -2837,8 +2975,6 @@ class Worker:
             elif "rejected" in s:
                 self._exec_counters["reject_total"] += 1
 
-    def _inc_block_reason(self, key: str) -> None:
-        self._block_reasons[key] = self._block_reasons.get(key, 0) + 1
 
     def _min_stop_ticks_default(self) -> float:
         """
@@ -2920,37 +3056,6 @@ class Worker:
 
         return False, ""
 
-    async def _watch_positions(self, interval_ms: int = 200) -> None:
-        """
-        Лёгкий watchdog: каждые ~200мс проверяем касание SL/TP по bid/ask.
-        Если коснулись, принудительно закрываем позицию по консервативной цене.
-        """
-        while True:
-            try:
-                for sym in self.symbols:
-                    pos = self._pos.get(sym)
-                    if not pos or pos.state != "OPEN":
-                        continue
-                    touched, which = self._price_touch_check(sym, pos.side, pos.sl_px, pos.tp_px)
-                    if touched:
-                        # закрываем СРАЗУ корректным reason (sl_hit / tp_hit),
-                        # чтобы trades не шли как flatten_forced
-                        reason = "sl_hit" if which == "sl" else "tp_hit"
-                        try:
-                            await self._paper_close(sym, pos, reason=reason)
-                        except Exception:
-                            # в крайнем случае — мягкий фолбэк (не должен понадобиться)
-                            with contextlib.suppress(Exception):
-                                await self.flatten(sym)
-                        self._accumulate_exec_counters([f"watchdog_force_close:{which}"])
-                        continue
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # вообще не должны падать
-                pass
-            await asyncio.sleep(max(0.05, interval_ms / 1000.0))
-
 
     def _fee_bps_for_steps(self, steps: List[str]) -> float:
         """
@@ -3012,6 +3117,43 @@ class Worker:
         except Exception:
             pass
         return 0.1
+    
+    def _inc_block_reason(self, *parts: str) -> None:
+        """
+        Универсальный счётчик причин блокировок.
+
+        Поддерживает оба варианта вызова:
+          - self._inc_block_reason("BTCUSDT", "no_best")
+          - self._inc_block_reason("BTCUSDT:no_best")
+          - self._inc_block_reason("GLOBAL:cooldown_after_sl")
+
+        Всё склеивается в один ключ и инкрементится в self._block_reasons.
+        Никогда не кидает исключений.
+        """
+        try:
+            if not parts:
+                return
+
+            # если одна строка – используем как есть
+            if len(parts) == 1:
+                key = str(parts[0])
+            else:
+                # несколько частей → склеиваем через ':'
+                key = ":".join(str(p) for p in parts if p is not None)
+
+            key = key.strip()
+            if not key:
+                return
+
+            # инициализация словаря на всякий случай
+            if not hasattr(self, "_block_reasons") or self._block_reasons is None:
+                self._block_reasons = {}
+
+            d = self._block_reasons
+            d[key] = d.get(key, 0) + 1
+        except Exception:
+            # защита от любых кривых кейсов — просто не падаем
+            pass
 
     def _compute_vol_stop_distance_px(
         self,
@@ -3112,20 +3254,7 @@ class Worker:
         if dist_ticks < msticks:
             dist_ticks = msticks
         return dist_ticks * step
-    
-    def _fees_for_symbol(self, sym: str) -> tuple[float, float]:
-        """
-        Возвращает (maker_bps, taker_bps). По умолчанию Binance USDT-M: 2 / 4 bps.
-        Можно подменить через settings.fees.binance_usdtm.
-        """
-        try:
-            f = (get_settings().fees or {}).get("binance_usdtm", {})
-            maker = float(f.get("maker_bps", 2.0))
-            taker = float(f.get("taker_bps", 4.0))
-        except Exception:
-            maker, taker = 2.0, 4.0
-        # Можно сделать пер-символьную корректировку, если надо:
-        return (maker, taker)
+
     
     def _entry_edge_ok(
         self,
@@ -3210,16 +3339,20 @@ class Worker:
             "min_flat_ms": self._auto_min_flat_ms,
         }
 
-    def set_strategy(self, *, enabled: bool, cooldown_ms: int, min_flat_ms: int) -> Dict[str, Any]:
+    def set_strategy(self, *, enabled: bool, cooldown_ms: int, min_flat_ms: int) -> dict:
         self._auto_enabled = bool(enabled)
-        self._auto_cooldown_ms = max(0, int(cooldown_ms))
-        self._auto_min_flat_ms = max(0, int(min_flat_ms))
+        self._auto_cooldown_ms = int(max(200, cooldown_ms))
+        self._auto_min_flat_ms = int(max(0, min_flat_ms))
+
+        # для diag()
+        self._strategy_cfg = {
+            "cooldown_ms": self._auto_cooldown_ms,
+            "min_flat_ms": self._auto_min_flat_ms,
+        }
+
         return {
             "auto_signal_enabled": self._auto_enabled,
-            "strategy_cfg": {
-                "cooldown_ms": self._auto_cooldown_ms,
-                "min_flat_ms": self._auto_min_flat_ms,
-            },
+            "strategy_cfg": dict(self._strategy_cfg),
         }
 
     # --- sizing helpers ---

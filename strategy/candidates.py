@@ -1,48 +1,24 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Optional, Literal, Deque, Dict, Any
+from typing import Optional, Literal, Deque, Dict, Any, List
 from collections import deque
 
 Side = Literal["BUY", "SELL"]
 
-
 @dataclass
 class Decision:
-    """
-    Результат работы CandidateEngine.
-
-    side:
-      - "BUY"/"SELL" → есть сигнал
-      - None         → нет входа
-    kind:
-      - "momentum" / "reversion" / "none"
-    score:
-      - относительная сила сигнала (>=1.0 → допускаем)
-    reason:
-      - текстовое объяснение (уходит в block_reasons)
-    """
     side: Optional[Side]
     kind: str = "none"
     score: float = 0.0
     reason: str = "no_signal"
 
-
 class CandidateEngine:
     """
-    Лёгкий, но адекватный генератор сигналов.
-
-    Идея:
-      - Используем mid-price + spread + OBI.
-      - Умеем смотреть в сторону микрофич (micro) и индикаторов (indi), если их прокинул Worker.
-      - Два типа сигналов:
-          1) momentum: импульс + подтверждение объёмом/OBI
-          2) reversion: откат от перекупленности/перепроданности + контр-OBI
-      - Жёсткий фильтр:
-          - warmup по истории
-          - ограничение по спреду
-          - OBI в сторону входа
-          - score < 1.0 → нет входа
+    Лёгкий генератор сигналов:
+      - mid-price + spread + OBI
+      - momentum: импульс + подтверждение объёмом/OBI
+      - reversion: возврат из перекупленности/перепроданности + контр-OBI
+      - фильтры качества: warmup, max spread, range-guard (bps и тики)
     """
 
     def __init__(
@@ -54,18 +30,21 @@ class CandidateEngine:
         # momentum
         mom_lookback: int = 6,
         mom_thr_ticks: float = 5.0,
-        obi_mom_thr: float = 0.35,
+        obi_mom_thr: float = 0.30,
 
         # reversion
         rev_window: int = 48,
-        rev_thr_ticks: float = 8.0,
-        obi_rev_thr: float = 0.30,
+        rev_thr_ticks: float = 7.0,
+        obi_rev_thr: float = 0.25,
 
         # spread / качество
         spread_max_ticks: float = 6.0,
+
+        # range guard (против «желе»)
+        min_range_ticks: float = 3.0,
+        min_range_bps: float = 2.0,
     ) -> None:
         self.price_tick = max(float(price_tick), 1e-9)
-
         self.max_history = int(max_history)
 
         self.mom_lookback = int(mom_lookback)
@@ -77,12 +56,14 @@ class CandidateEngine:
         self.obi_rev_thr = float(obi_rev_thr)
 
         self.spread_max_ticks = float(spread_max_ticks)
+        self.min_range_ticks = float(min_range_ticks)
+        self.min_range_bps = float(min_range_bps)
 
         self._mid: Deque[float] = deque(maxlen=self.max_history)
         self._bid_sz: Deque[float] = deque(maxlen=self.max_history)
         self._ask_sz: Deque[float] = deque(maxlen=self.max_history)
 
-    # ---- low-level helpers ----
+    # ---- helpers ----
 
     def _spread_ticks(self, bid: float, ask: float) -> float:
         if bid > 0.0 and ask > 0.0:
@@ -112,22 +93,16 @@ class CandidateEngine:
         micro: Optional[Dict[str, Any]] = None,
         indi: Optional[Dict[str, Any]] = None,
     ) -> Decision:
-        """
-        micro: dict от MicroFeatureEngine (spread_ticks, mid, microprice_drift, tick_velocity, obi, ...)
-        indi:  dict от IndiEngine (bb_z, rsi, vwap_drift, ...)
-        """
-
-        # 1) mid price
+        # mid
         mid = 0.0
         if bid > 0.0 and ask > 0.0:
             mid = 0.5 * (bid + ask)
         elif price > 0.0:
             mid = float(price)
-
         if mid <= 0.0:
             return Decision(side=None, kind="none", score=0.0, reason="no_price")
 
-        # 2) обновляем историю
+        # history
         self._mid.append(mid)
         self._bid_sz.append(max(bid_sz, 0.0))
         self._ask_sz.append(max(ask_sz, 0.0))
@@ -136,24 +111,32 @@ class CandidateEngine:
         if len(self._mid) < min_hist:
             return Decision(side=None, kind="none", score=0.0, reason="warmup")
 
-        # 3) spread guard
+        # spread guard
         spread_t = self._spread_ticks(bid, ask)
         if spread_t > self.spread_max_ticks:
-            return Decision(side=None, kind="none", score=0.0,
-                            reason=f"spread>{self.spread_max_ticks:.1f}t")
+            return Decision(side=None, kind="none", score=0.0, reason=f"spread>{self.spread_max_ticks:.1f}t")
 
-        # 4) OBI: сначала из micro, потом из bid/ask size
+        # range guard
+        hist: List[float] = list(self._mid)
+        hi = max(hist) if hist else mid
+        lo = min(hist) if hist else mid
+        range_px = max(0.0, hi - lo)
+        range_ticks = range_px / self.price_tick if self.price_tick > 0 else 0.0
+        range_bps = (range_px / mid) * 10_000.0 if mid > 0 else 0.0
+        if range_ticks < self.min_range_ticks or range_bps < self.min_range_bps:
+            return Decision(side=None, kind="none", score=0.0, reason=f"range_small:{range_ticks:.1f}t/{range_bps:.1f}bps")
+
+        # OBI
         obi_micro = 0.0
         if micro is not None:
             try:
                 obi_micro = float(micro.get("obi", 0.0) or 0.0)
             except Exception:
                 obi_micro = 0.0
-
         obi_sizes = self._obi_from_sizes(bid_sz, ask_sz)
         obi = obi_micro if obi_micro != 0.0 else obi_sizes
 
-        # 5) Индикаторы (если есть, используются как дополнительные фильтры)
+        # индикаторы
         bb_z = None
         rsi = None
         if indi is not None:
@@ -169,15 +152,13 @@ class CandidateEngine:
         # ---- Momentum ----
         mom_side: Optional[Side] = None
         mom_score = 0.0
-
         if len(self._mid) > self.mom_lookback:
             base = self._mid[-1 - self.mom_lookback]
             if base > 0.0:
                 move_ticks = (mid - base) / self.price_tick
 
-                # ап-тренд + спрос (OBI >= порога)
+                # BUY
                 if move_ticks >= self.mom_thr_ticks and obi >= self.obi_mom_thr:
-                    # если есть microprice_drift / tick_velocity — требуем, чтобы не шли против
                     drift_ok = True
                     if micro is not None:
                         mpd = float(micro.get("microprice_drift", 0.0) or 0.0)
@@ -186,10 +167,9 @@ class CandidateEngine:
                             drift_ok = False
                     if drift_ok:
                         mom_side = "BUY"
-                        mom_score = (move_ticks / max(self.mom_thr_ticks, 1e-9)) * \
-                                    (max(obi, 0.0) / max(self.obi_mom_thr, 1e-9))
+                        mom_score = (move_ticks / max(self.mom_thr_ticks, 1e-9)) * (max(obi, 0.0) / max(self.obi_mom_thr, 1e-9))
 
-                # даун-тренд + предложение (OBI <= -порог)
+                # SELL
                 elif move_ticks <= -self.mom_thr_ticks and obi <= -self.obi_mom_thr:
                     drift_ok = True
                     if micro is not None:
@@ -199,35 +179,29 @@ class CandidateEngine:
                             drift_ok = False
                     if drift_ok:
                         mom_side = "SELL"
-                        mom_score = (abs(move_ticks) / max(self.mom_thr_ticks, 1e-9)) * \
-                                    (max(-obi, 0.0) / max(self.obi_mom_thr, 1e-9))
+                        mom_score = (abs(move_ticks) / max(self.mom_thr_ticks, 1e-9)) * (max(-obi, 0.0) / max(self.obi_mom_thr, 1e-9))
 
         # ---- Reversion ----
         rev_side: Optional[Side] = None
         rev_score = 0.0
-
         if len(self._mid) >= self.rev_window:
             window = list(self._mid)[-self.rev_window:]
             mean = sum(window) / len(window)
             dev_ticks = (mid - mean) / self.price_tick
 
-            # переКУПлен → SELL, нужен контр-OBI
+            # SELL
             if dev_ticks >= self.rev_thr_ticks and obi <= -self.obi_rev_thr:
-                # если есть bb_z/rsi — подтверждаем перекупленность (bb_z>0, rsi>50+)
                 if (bb_z is None or bb_z > 0.0) and (rsi is None or rsi >= 55.0):
                     rev_side = "SELL"
-                    rev_score = (dev_ticks / max(self.rev_thr_ticks, 1e-9)) * \
-                                (max(-obi, 0.0) / max(self.obi_rev_thr, 1e-9))
+                    rev_score = (dev_ticks / max(self.rev_thr_ticks, 1e-9)) * (max(-obi, 0.0) / max(self.obi_rev_thr, 1e-9))
 
-            # переПРОДан → BUY, нужен контр-OBI
+            # BUY
             elif dev_ticks <= -self.rev_thr_ticks and obi >= self.obi_rev_thr:
                 if (bb_z is None or bb_z < 0.0) and (rsi is None or rsi <= 45.0):
                     rev_side = "BUY"
-                    rev_score = (abs(dev_ticks) / max(self.rev_thr_ticks, 1e-9)) * \
-                                (max(obi, 0.0) / max(self.obi_rev_thr, 1e-9))
+                    rev_score = (abs(dev_ticks) / max(self.rev_thr_ticks, 1e-9)) * (max(obi, 0.0) / max(self.obi_rev_thr, 1e-9))
 
         # ---- Выбор лучшего ----
-
         best_side: Optional[Side] = None
         best_kind = "none"
         best_score = 0.0
@@ -238,7 +212,6 @@ class CandidateEngine:
             best_kind = "momentum"
             best_score = float(mom_score)
             best_reason = f"momentum_{mom_side.lower()}_{mom_score:.2f}"
-
         elif rev_side and rev_score >= 1.0 and rev_score > mom_score:
             best_side = rev_side
             best_kind = "reversion"
@@ -248,9 +221,4 @@ class CandidateEngine:
         if not best_side:
             return Decision(side=None, kind="none", score=0.0, reason=best_reason)
 
-        return Decision(
-            side=best_side,
-            kind=best_kind,
-            score=best_score,
-            reason=best_reason,
-        )
+        return Decision(side=best_side, kind=best_kind, score=best_score, reason=best_reason)

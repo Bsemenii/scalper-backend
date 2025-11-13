@@ -172,6 +172,79 @@ def _exec_cfg() -> Dict[str, float | int | str]:
         "time_in_force": str(getattr(e, "time_in_force", "GTX")),
     }
 
+# --- cross-guard helpers ------------------------------------------------------
+def _cross_guard_enabled_from_settings() -> bool:
+    try:
+        s = get_settings()
+        cg = getattr(getattr(s, "strategy", object()), "cross_guard", object())
+        return bool(getattr(cg, "enabled", True))
+    except Exception:
+        return True
+
+def _build_cross_cfg():
+    """
+    Безопасно собирает CrossCfg из settings, подстраиваясь под фактическую
+    сигнатуру конструктора (разные имена полей в разных версиях модуля).
+    Ничего не падает: при любой ошибке вернёт минимально валидную конфигурацию.
+    """
+    try:
+        from strategy.cross_guard import CrossCfg  # твой класс
+        import inspect
+
+        s = get_settings()
+        cg = getattr(getattr(s, "strategy", object()), "cross_guard", object())
+
+        lookback = int(getattr(cg, "lookback_s", 60))
+
+        # то, как поля могут называться в разных ревизиях:
+        alt_names = {
+            "align": ["align_tolerance_bp", "align_tol_bp", "align_bp_tolerance", "align_bp_tol"],
+            "dom":   ["dominance_min_bp", "dom_min_bp", "dominance_bp_min"],
+            "single": ["single_candidate", "one_candidate", "single_only"],
+        }
+
+        # значения по умолчанию (если их нет в конфиге)
+        align_val = float(
+            getattr(cg, "align_tolerance_bp",
+                getattr(cg, "align_tol_bp", 2.5))
+        )
+        dom_val = float(
+            getattr(cg, "dominance_min_bp",
+                getattr(cg, "dom_min_bp", 4.0))
+        )
+        single_val = bool(
+            getattr(cg, "single_candidate",
+                getattr(cg, "one_candidate", True))
+        )
+
+        sig = inspect.signature(CrossCfg)
+        params = {}
+
+        # обязательное окно
+        if "lookback_s" in sig.parameters:
+            params["lookback_s"] = lookback
+
+        # подсовываем значение в первое подходящее имя параметра
+        def _maybe_apply(kind: str, value):
+            for name in alt_names[kind]:
+                if name in sig.parameters:
+                    params[name] = value
+                    return
+
+        _maybe_apply("align", align_val)
+        _maybe_apply("dom", dom_val)
+        _maybe_apply("single", single_val)
+
+        # финально
+        return CrossCfg(**params)
+
+    except Exception:
+        # запасной минимальный вариант — только lookback, без тонких правил
+        class _Mini:
+            def __init__(self, lookback_s: int = 60, **_):
+                self.lookback_s = lookback_s
+        return _Mini(lookback_s=60)
+
 
 def _estimate_fees_usd(
     notional_entry: float, notional_exit: float, maker_bps: float, taker_bps: float, taker_like_entry: bool
@@ -278,6 +351,11 @@ async def _startup() -> None:
 
     w = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms, history_maxlen=4000)
     await w.start()
+    try:
+        s = get_settings()
+        _apply_execution_settings_to_worker(w, s)
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning(f"[startup] apply exec settings failed: {e}")
     app.state.worker = w
     log.info(f"[startup] worker started: symbols={symbols}, coalesce_ms={coalesce_ms}")
 
@@ -365,6 +443,10 @@ async def control_reload_settings() -> dict:
         coalesce_ms = _coalesce_from_settings()
         w2 = Worker(symbols=symbols, futures=True, coalesce_ms=coalesce_ms, history_maxlen=4000)
         await w2.start()
+        try:
+            _apply_execution_settings_to_worker(w2, s)
+        except Exception as e:
+            logging.getLogger("uvicorn.error").warning(f"[reload-settings] apply exec settings failed: {e}")
         app.state.worker = w2
     return {
         "ok": True,
@@ -379,6 +461,17 @@ def control_reload_strategy() -> dict:
     w = _worker_required()
     applied = w.reload_strategy_cfg()
     return applied if isinstance(applied, dict) and applied.get("ok") is not None else {"ok": True, **(applied or {})}
+
+@app.post("/control/apply-exec")
+def control_apply_exec() -> dict:
+    """
+    Применить execution-политику из текущих settings к действующему воркеру/исполнителю.
+    Удобно, если правили settings.json и не хотим рестартовать процесс.
+    """
+    w = _worker_required()
+    s = get_settings()
+    applied = _apply_execution_settings_to_worker(w, s) or {}
+    return {"ok": True, **applied}
 
 
 # ------------------------------------------------------------------------------
@@ -408,6 +501,7 @@ def status() -> Dict[str, Any]:
     s = get_settings()
     w: Optional[Worker] = app.state.worker
 
+    # --- coalescer stats ---
     coalescer_stats: Optional[Dict[str, Any]] = None
     if w:
         try:
@@ -425,6 +519,44 @@ def status() -> Dict[str, Any]:
             except Exception:
                 coalescer_stats = None
 
+    # --- execution policy из воркера + из settings как дефолты ---
+    exec_worker: Optional[Dict[str, Any]] = None
+    if w:
+        try:
+            exec_worker = dict(getattr(w, "_exec_cfg", {}) or {})
+            if hasattr(w, "exec") and hasattr(w.exec, "get_policy"):
+                exec_worker = {**exec_worker, **dict(w.exec.get_policy())}
+        except Exception:
+            exec_worker = None
+
+    exec_out = {
+        "execution_worker": exec_worker,
+        "limit_offset_ticks": getattr(getattr(s, "execution", object()), "limit_offset_ticks", 0),
+        "limit_timeout_ms": getattr(getattr(s, "execution", object()), "limit_timeout_ms", 900),
+        "max_slippage_bp": getattr(getattr(s, "execution", object()), "max_slippage_bp", 4.0),
+        "time_in_force": getattr(getattr(s, "execution", object()), "time_in_force", "GTX"),
+        "fee_bps_maker": getattr(getattr(s, "execution", object()), "fee_bps_maker", 2.0),
+        "fee_bps_taker": getattr(getattr(s, "execution", object()), "fee_bps_taker", 4.0),
+        "post_only": getattr(getattr(s, "execution", object()), "post_only", True),
+        "on_timeout": getattr(getattr(s, "execution", object()), "on_timeout", "abort"),
+        "min_stop_ticks": getattr(getattr(s, "execution", object()), "min_stop_ticks", 12),
+    }
+    if isinstance(exec_worker, dict) and exec_worker:
+        for k in (
+            "time_in_force", "post_only", "on_timeout",
+            "limit_timeout_ms", "max_slippage_bp", "min_stop_ticks",
+            "fee_bps_maker", "fee_bps_taker"
+        ):
+            if k in exec_worker:
+                exec_out[k] = exec_worker[k]
+
+    # --- стратегия: ключевые пороги наружу ---
+    strat = getattr(s, "strategy", object())
+    cross = getattr(strat, "cross_guard", object())
+    mom = getattr(strat, "momentum", object())
+    rev = getattr(strat, "reversion", object())
+    regime = getattr(strat, "regime", object())
+
     return {
         "mode": getattr(s, "mode", "paper"),
         "symbols": getattr(s, "symbols", []),
@@ -433,47 +565,51 @@ def status() -> Dict[str, Any]:
             "coalescer": coalescer_stats if coalescer_stats is not None else None,
         },
         "risk": {
-            "risk_per_trade_pct": getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.25),
-            "daily_stop_r": getattr(getattr(s, "risk", object()), "daily_stop_r", -10.0),
-            "daily_target_r": getattr(getattr(s, "risk", object()), "daily_target_r", 15.0),
-            "max_consec_losses": getattr(getattr(s, "risk", object()), "max_consec_losses", 3),
-            "cooldown_after_sl_s": getattr(getattr(s, "risk", object()), "cooldown_after_sl_s", 120),
-            "min_risk_usd_floor": getattr(getattr(s, "risk", object()), "min_risk_usd_floor", 0.25),
+            "risk_per_trade_pct": getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.30),
+            "daily_stop_r": getattr(getattr(s, "risk", object()), "daily_stop_r", -3.0),
+            "daily_target_r": getattr(getattr(s, "risk", object()), "daily_target_r", 8.0),
+            "max_consec_losses": getattr(getattr(s, "risk", object()), "max_consec_losses", 2),
+            "cooldown_after_sl_s": getattr(getattr(s, "risk", object()), "cooldown_after_sl_s", 300),
+            "min_risk_usd_floor": getattr(getattr(s, "risk", object()), "min_risk_usd_floor", 1.0),
         },
         "safety": {
-            "max_spread_ticks": getattr(getattr(s, "safety", object()), "max_spread_ticks", 3),
+            "max_spread_ticks": getattr(getattr(s, "safety", object()), "max_spread_ticks", 6),
             "min_top5_liquidity_usd": getattr(getattr(s, "safety", object()), "min_top5_liquidity_usd", 300000.0),
             "skip_funding_minute": getattr(getattr(s, "safety", object()), "skip_funding_minute", True),
             "skip_minute_zero": getattr(getattr(s, "safety", object()), "skip_minute_zero", True),
             "min_liq_buffer_sl_mult": getattr(getattr(s, "safety", object()), "min_liq_buffer_sl_mult", 3.0),
         },
         "strategy": {
+            "auto_signal_enabled": getattr(strat, "auto_signal_enabled", True),
+            "min_range_bps": getattr(strat, "min_range_bps", 2.0),
+            "min_range_ticks": getattr(strat, "min_range_ticks", 3),
+            "warmup_ms": getattr(strat, "warmup_ms", 45000),
+            "stale_ms": getattr(strat, "stale_ms", 3000),
+            "auto_min_flat_ms": getattr(strat, "auto_min_flat_ms", 900),
+            "ev_guard_kR": getattr(strat, "ev_guard_kR", 0.30),
             "regime": {
-                "vol_window_s": getattr(getattr(getattr(s, "strategy", object()), "regime", object()), "vol_window_s", 60),
+                "vol_window_s": getattr(regime, "vol_window_s", 60),
             },
             "momentum": {
-                "obi_t": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "obi_t", 0.12),
-                "tp_r": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "tp_r", 1.6),
-                "stop_k_sigma": getattr(getattr(getattr(s, "strategy", object()), "momentum", object()), "stop_k_sigma", 1.1),
+                "obi_t": getattr(mom, "obi_t", 0.003),
+                "tp_r": getattr(mom, "tp_r", 1.9),
+                "stop_k_sigma": getattr(mom, "stop_k_sigma", 1.2),
             },
             "reversion": {
-                "bb_z": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "bb_z", 2.0),
-                "rsi": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "rsi", 70),
-                "tp_to_vwap": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "tp_to_vwap", True),
-                "tp_r": getattr(getattr(getattr(s, "strategy", object()), "reversion", object()), "tp_r", 1.3),
+                "bb_z": getattr(rev, "bb_z", 0.9),
+                "rsi": getattr(rev, "rsi", 62),
+                "tp_to_vwap": getattr(rev, "tp_to_vwap", True),
+                "tp_r": getattr(rev, "tp_r", 1.6),
+            },
+            "cross_guard": {
+                "enabled": getattr(cross, "enabled", True),
+                "lookback_s": getattr(cross, "lookback_s", 60),
+                "align_tolerance_bp": getattr(cross, "align_tolerance_bp", 2.5),
+                "dominance_min_bp": getattr(cross, "dominance_min_bp", 4.0),
+                "single_candidate": getattr(cross, "single_candidate", True),
             },
         },
-        "execution": {
-            "limit_offset_ticks": getattr(getattr(s, "execution", object()), "limit_offset_ticks", 1),
-            "limit_timeout_ms": getattr(getattr(s, "execution", object()), "limit_timeout_ms", 900),
-            "max_slippage_bp": getattr(getattr(s, "execution", object()), "max_slippage_bp", 6.0),
-            "time_in_force": getattr(getattr(s, "execution", object()), "time_in_force", "GTX"),
-            "fee_bps_maker": getattr(getattr(s, "execution", object()), "fee_bps_maker", 2.0),
-            "fee_bps_taker": getattr(getattr(s, "execution", object()), "fee_bps_taker", 4.0),
-            "post_only": getattr(getattr(s, "execution", object()), "post_only", True),
-            "on_timeout": getattr(getattr(s, "execution", object()), "on_timeout", "market"),
-            "min_stop_ticks": getattr(getattr(s, "execution", object()), "min_stop_ticks", 6),
-        },
+        "execution": exec_out,
         "ml": {
             "enabled": getattr(getattr(s, "ml", object()), "enabled", False),
             "p_threshold_mom": getattr(getattr(s, "ml", object()), "p_threshold_mom", 0.55),
@@ -481,9 +617,8 @@ def status() -> Dict[str, Any]:
             "model_path": getattr(getattr(s, "ml", object()), "model_path", "./ml_artifacts/model.bin"),
         },
         "fees": {
-            "maker_bps": getattr(getattr(getattr(s, "execution", object()), "fee_bps_maker", object()), "__float__", lambda: None)() if False else getattr(getattr(s, "execution", object()), "fee_bps_maker", 2.0),
+            "maker_bps": getattr(getattr(s, "execution", object()), "fee_bps_maker", 2.0),
             "taker_bps": getattr(getattr(s, "execution", object()), "fee_bps_taker", 4.0),
-            # если задано отдельным разделом:
             "binance_usdtm": getattr(getattr(s, "fees", object()), "binance_usdtm", None),
         },
         "account": {
@@ -772,14 +907,14 @@ def _spread_ticks(bid: float, ask: float, tick: float) -> float:
 @app.post("/control/test-entry")
 async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     """
-    Тестовый вход (превью + опциональное исполнение) с улучшениями:
-      • Общая SL-дистанция от волатильности/спреда + min_stop_ticks.
+    Тестовый вход (превью + опциональное исполнение):
+      • Свежесть тика (stale_ms), пауза между сделками (auto_min_flat_ms).
       • Квантование qty + проверка min_notional.
-      • План SL/TP с целевым RR из конфига (fallback = 1.8).
+      • План SL/TP с целевым RR (fallback 1.8).
       • Safety-check (pre/post) через risk.filters.
-      • Fee-aware расчёты и EV-guard: чистая ожидаемая прибыль > порога.
-      • Respect post_only/GTX — считаем, что вход maker, если так сконфигурировано.
-      • dry=true — только превью без исполнения.
+      • Fee-aware EV-guard: чистая ожидаемая прибыль ≥ kR * риск.
+      • Вход maker-friendly: GTX + post_only, on_timeout="abort".
+      • dry=true — только превью, без исполнения.
     """
     from risk.filters import MicroCtx, TimeCtx, PositionalCtx, check_entry_safety
     from exec.sltp import compute_sltp
@@ -788,7 +923,7 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     sym = _normalize_symbol(req.symbol, w.symbols)
     side = _normalize_side(req.side)
 
-    # ---- 1) последний тик (сейф) ----
+    # ---- 1) последний тик + staleness guard ----
     last = _worker_latest_tick(w, sym)
     if not last:
         return JSONResponse({"ok": False, "error": f"no ticks for {sym}"}, status_code=503)
@@ -796,77 +931,103 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     price = float(last.get("price") or 0.0)
     bid = float(last.get("bid") or price)
     ask = float(last.get("ask") or price)
+    last_ts = int(last.get("ts_ms", _now_ms()))
+    now_ts = _now_ms()
+
+    s = get_settings()
+    try:
+        stale_ms = int(getattr(getattr(s, "strategy", object()), "stale_ms", 3000))
+    except Exception:
+        stale_ms = 3000
+    if now_ts - last_ts > stale_ms:
+        return {
+            "ok": False,
+            "reason": "stale_tick",
+            "stale_ms": now_ts - last_ts,
+            "stale_threshold_ms": stale_ms,
+            "symbol": sym
+        }
+
     if price <= 0.0:
-        price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
-    if price <= 0.0:
-        return JSONResponse({"ok": False, "error": f"no valid price for {sym}"}, status_code=503)
+        if bid > 0 and ask > 0:
+            price = (bid + ask) / 2.0
+        else:
+            return JSONResponse({"ok": False, "error": f"no valid price for {sym}"}, status_code=503)
 
     # ---- 2) шаги ----
     price_step, qty_step = _get_symbol_steps_from_worker(w, sym)
 
-    # ---- 3) конфиги/флаги исполнения ----
-    s = get_settings()
+    # ---- 3) execution-параметры (maker-friendly превью) ----
     exec_cfg = _exec_cfg()
+    time_in_force = "GTX"
+    post_only = True
+    on_timeout = "abort"
+    limit_offset_ticks = int(req.limit_offset_ticks) if req.limit_offset_ticks is not None else int(exec_cfg.get("limit_offset_ticks", 0))
 
-    # базовые параметры исполнения из конфига (с дефолтами)
-    time_in_force = str(exec_cfg.get("time_in_force", "GTX")).upper()
-    limit_offset_ticks = (
-        int(req.limit_offset_ticks) if req.limit_offset_ticks is not None
-        else int(exec_cfg.get("limit_offset_ticks", 0))
-    )
-
-    # execution (он же fallback для комиссий и политики)
     e = getattr(s, "execution", object())
     fee_maker_bps = float(getattr(e, "fee_bps_maker", 2.0))
     fee_taker_bps = float(getattr(e, "fee_bps_taker", 4.0))
-    on_timeout = str(getattr(e, "on_timeout", "cancel")).lower()
-    post_only = bool(getattr(e, "post_only", True))
 
-    # если воркер знает реальные комиссии по символу — используем их как эффективные
     try:
         if hasattr(w, "_fees_for_symbol"):
-            eff_maker, eff_taker = w._fees_for_symbol(sym)  # может бросать исключения
+            eff_maker, eff_taker = w._fees_for_symbol(sym)
             fee_maker_bps = float(eff_maker)
             fee_taker_bps = float(eff_taker)
     except Exception:
         pass
 
-    # "taker-like" вход — только если НЕ GTX и НЕ post_only
-    taker_like_entry = not (time_in_force == "GTX" or post_only is True)
+    taker_like_entry = False  # превью считаем maker-ходом
 
-    # RR-таргет из стратегии (моментум) или фолбэк 1.8 (и пол не ниже 1.8)
+    # ---- 4) таргеты RR и EV-guard ----
     rr_target = 1.8
     try:
         strat = getattr(s, "strategy", object())
         mom = getattr(strat, "momentum", object())
         rr_target = float(getattr(mom, "tp_r", rr_target))
-        rr_target = max(rr_target, 1.8)
     except Exception:
-        rr_target = 1.8
+        pass
+    rr_target = max(rr_target, 1.8)
 
-    # EV guard — минимальная чистая прибыль ≥ k * риск (в R)
-    # допускаем возможную настройку в конфиге стратегии, иначе по умолчанию 0.25
-    ev_guard_kR = 0.25
+    ev_guard_kR = 0.30  # мягче, чем 0.35, чтобы сделки не подавить
     try:
         ev_guard_kR = float(getattr(strat, "ev_guard_kR", ev_guard_kR))
         if not (0.05 <= ev_guard_kR <= 2.0):
-            ev_guard_kR = 0.25
+            ev_guard_kR = 0.30
     except Exception:
-        ev_guard_kR = 0.25
+        ev_guard_kR = 0.30
 
-    # аккаунт/риск (как раньше)
+    # ---- 5) аккаунт/риск ----
     acc = _account_cfg()
     rsk = _risk_cfg()
 
-    # Для превью принудительно придерживаемся maker-friendly логики,
-    # чтобы не «протекать» в такеровые входы оценкой EV.
-    # Это не меняет глобальные настройки, только локальные расчёты превью.
-    time_in_force = "GTX"
-    post_only = True
-    on_timeout = "abort"       # превью без скрытого маркета
-    taker_like_entry = False   # считаем вход maker-like для комиссий/EV
+    # ---- 6) flat-cooldown между сделками ----
+    try:
+        auto_min_flat_ms = int(getattr(getattr(s, "strategy", object()), "auto_min_flat_ms", 900))
+    except Exception:
+        auto_min_flat_ms = 900
+    last_trade_ts = 0
+    try:
+        d_diag = w.diag() or {}
+        store = d_diag.get("trades", {})
+        if isinstance(store, dict):
+            for arr in store.values():
+                for t in arr or []:
+                    last_trade_ts = max(last_trade_ts, int(t.get("closed_ts", 0) or 0), int(t.get("opened_ts", 0) or 0))
+        elif isinstance(store, list):
+            for t in store:
+                last_trade_ts = max(last_trade_ts, int(t.get("closed_ts", 0) or 0), int(t.get("opened_ts", 0) or 0))
+    except Exception:
+        pass
+    if last_trade_ts > 0 and (now_ts - last_trade_ts) < auto_min_flat_ms:
+        return {
+            "ok": False,
+            "reason": "flat_cooldown",
+            "since_last_ms": now_ts - last_trade_ts,
+            "min_flat_ms": auto_min_flat_ms,
+            "symbol": sym
+        }
 
-    # ---- 4) волатильностная SL-дистанция ----
+    # ---- 7) волатильностная SL-дистанция (fallback к min_stop_ticks и спреду) ----
     try:
         sl_distance_px = float(w._compute_vol_stop_distance_px(sym, mid_px=price))
     except Exception:
@@ -876,7 +1037,7 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             min_stop_ticks = 12
         spread = max(0.0, ask - bid)
         sl_distance_px = max(
-            price_step * max(6, min_stop_ticks),  # чуть строже пола
+            price_step * max(6, min_stop_ticks),
             spread * 2.0,
             price_step * 6,
         )
@@ -884,7 +1045,7 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
     if sl_distance_px <= 0:
         return {"ok": False, "reason": "bad_sl_distance_px", "symbol": sym, "side": side}
 
-    # ---- 5) qty: ручной или авто ----
+    # ---- 8) qty: ручной или авто, затем квантование и min_notional ----
     if req.qty is not None and req.qty > 0:
         qty = float(req.qty)
     else:
@@ -893,7 +1054,6 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "reason": "auto_qty_failed", "symbol": sym, "side": side, "error": str(e)}
 
-    # ---- 6) квантование + min_notional ----
     qty = float(_quantize(qty, qty_step))
     if qty <= 0.0:
         return {
@@ -907,12 +1067,26 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "hint": f"min notional ${acc['min_notional']} → try qty ≥ {min_qty}",
         }
 
-    # ---- 7) превью лимит-цены (maker friendly) ----
+    # ---- 9) превью лимит-цены (maker friendly) ----
+    def _preview_limit_px(bid_val: float, ask_val: float, side_val: str, tick: float, off_ticks: int) -> float:
+        try:
+            off = max(0, int(off_ticks)) * float(max(tick, 0.0))
+        except Exception:
+            off = 0.0
+        px = 0.0
+        if side_val == "BUY" and ask_val > 0:
+            px = ask_val - off if off > 0 else ask_val
+        elif side_val == "SELL" and bid_val > 0:
+            px = bid_val + off if off > 0 else bid_val
+        if px <= 0.0 and bid_val > 0 and ask_val > 0:
+            px = (bid_val + ask_val) / 2.0
+        return float(px or 0.0)
+
     preview_px = _preview_limit_px(bid, ask, side, price_step, limit_offset_ticks)
     if preview_px <= 0.0:
         preview_px = price
 
-    # ---- 8) SL/TP план под ту же дистанцию и rr_target ----
+    # ---- 10) SL/TP план с RR ----
     try:
         plan = compute_sltp(
             side=side,
@@ -928,13 +1102,17 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         plan = None
         sl_px, tp_px = None, None
 
-    # ---- 9) safety-check (pre/post) ----
+    # ---- 11) safety-check (pre/post) ----
+    def _spread_ticks(bid_val: float, ask_val: float, tick: float) -> float:
+        if bid_val > 0 and ask_val > 0 and tick > 0:
+            return max(0.0, (ask_val - bid_val) / tick)
+        return 0.0
+
     spr_ticks = _spread_ticks(bid, ask, price_step)
     micro = MicroCtx(spread_ticks=spr_ticks, top5_liq_usd=1e12)
     tctx = TimeCtx(ts_ms=w._now_ms(), server_time_offset_ms=getattr(w, "_server_time_offset_ms", 0))
 
     pre_ok = check_entry_safety(side, micro, tctx, pos_ctx=None, safety=w._safety_cfg)
-
     post_ok = pre_ok
     if sl_px is not None:
         pos_ctx = PositionalCtx(
@@ -944,17 +1122,16 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         )
         post_ok = check_entry_safety(side, micro=micro, time_ctx=tctx, pos_ctx=pos_ctx, safety=w._safety_cfg)
 
-    # ---- 10) риск/комиссии/EV guard ----
+    # ---- 12) риск/комиссии/EV ----
     notional = price * qty
     expected_risk_usd = sl_distance_px * qty
 
-    est_fees_usd_conservative = _estimate_fees_usd(
-        notional_entry=notional,
-        notional_exit=notional,
-        maker_bps=fee_maker_bps,
-        taker_bps=fee_taker_bps,  
-        taker_like_entry=taker_like_entry,
-    )
+    def _estimate_fees_usd(notional_entry: float, notional_exit: float, maker_bps: float, taker_bps: float, taker_like: bool) -> float:
+        bps_entry = taker_bps if taker_like else maker_bps
+        bps_exit = taker_bps
+        return (notional_entry * bps_entry + notional_exit * bps_exit) / 10_000.0
+
+    est_fees_usd_conservative = _estimate_fees_usd(notional, notional, fee_maker_bps, fee_taker_bps, taker_like_entry)
     est_fees_usd_maker_only = (notional * (fee_maker_bps / 10_000.0)) * 2.0
 
     warnings: List[str] = []
@@ -962,63 +1139,15 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         warnings.append(f"expected_risk_usd({expected_risk_usd:.4f}) < min_risk_floor({rsk['min_risk_floor']:.4f})")
     if est_fees_usd_maker_only > 0 and expected_risk_usd < (0.8 * est_fees_usd_maker_only):
         warnings.append(f"risk({expected_risk_usd:.4f}) < 0.8×maker_only_fees({est_fees_usd_maker_only:.4f})")
-    if est_fees_usd_conservative > 0 and expected_risk_usd < (0.5 * est_fees_usd_conservative):
-        warnings.append(f"risk({expected_risk_usd:.4f}) < 0.5×conservative_fees({est_fees_usd_conservative:.4f})")
 
     rr_used = rr_target
-    if plan and getattr(plan, "sl_px", None) is not None and getattr(plan, "tp_px", None) is not None:
-        rr_used = max(rr_target, 1.0 * rr_target)
-
     expected_profit_usd_est = expected_risk_usd * rr_used
     net_profit_usd_est = expected_profit_usd_est - est_fees_usd_conservative
     ev_ok = (net_profit_usd_est >= (ev_guard_kR * expected_risk_usd)) and (rr_used >= 1.8)
 
     safety_block = (not pre_ok.allow) or (not post_ok.allow)
 
-    # ---- 10b) Cross-guard vs BTC + один кандидат ----
-    # Подтянем последние цены для BTC и целевого символа за lookback окно
-    from strategy.cross_guard import CrossCfg, decide_cross_guard, pick_best_symbol_by_speed
-
-    LOOKBACK_S = 60
-    def _last_prices(sym: str, secs: int) -> List[float]:
-        tnow = w._now_ms()
-        arr = _worker_history_ticks(w, sym, since_ms=tnow - secs * 1000, limit=1024)
-        return [float(it.get("price") or it.get("mark_price") or 0.0) for it in arr if (it.get("price") or it.get("mark_price"))]
-
-    try:
-        btc_prices = _last_prices("BTCUSDT", LOOKBACK_S)
-    except Exception:
-        btc_prices = []
-
-    sym_prices = _last_prices(sym, LOOKBACK_S)
-
-    cross_allow, cross_reason, btc_drift_bp, sym_drift_bp = decide_cross_guard(
-        side=side, btc_prices=btc_prices, sym_prices=sym_prices, cfg=CrossCfg(lookback_s=LOOKBACK_S)
-    )
-
-    # Если cross_guard против — блокируем (добавляем reason для фронта)
-    if not cross_allow:
-        safety_block = True
-        warnings.append(f"cross_guard:{cross_reason}:btc={btc_drift_bp:.2f}bp sym={sym_drift_bp:.2f}bp")
-
-    # «Один кандидат»: если включены BTC и ETH — берём более «быстрый» по модулю
-    # (работает только в превью/ручном входе; автологика остаётся в Worker)
-    try:
-        avail = [s for s in w.symbols if s in ("BTCUSDT", "ETHUSDT")]
-        if len(avail) == 2:
-            a, b = avail[0], avail[1]
-            pa = _last_prices(a, LOOKBACK_S)
-            pb = _last_prices(b, LOOKBACK_S)
-            best_sym = pick_best_symbol_by_speed(
-                btc_prices=btc_prices or pa, sym_a=(a, pa), sym_b=(b, pb), lookback_s=LOOKBACK_S
-            )
-            if sym != best_sym:
-                safety_block = True
-                warnings.append(f"single_candidate:{best_sym}")
-    except Exception:
-        pass
-
-    # ---- 11) DRY превью ----
+    # ---- 13) dry превью ----
     if req.dry:
         return {
             "ok": (not safety_block) and ev_ok,
@@ -1052,8 +1181,27 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "warnings": warnings or None,
         }
 
-    # ---- 12) Реальное исполнение с теми же параметрами ----
+    # ---- 14) реальный запуск (опционально) с принудительной abort-политикой на время вызова ----
+    old_policy = None
+    try:
+        if hasattr(w, "exec") and hasattr(w.exec, "get_policy") and hasattr(w.exec, "set_policy"):
+            old_policy = dict(w.exec.get_policy())
+            w.exec.set_policy(
+                time_in_force="GTX",
+                post_only=True,
+                on_timeout="abort",
+                limit_timeout_ms=int(exec_cfg.get("limit_timeout_ms", 900)),
+                max_slippage_bp=float(exec_cfg.get("max_slippage_bp", 4.0)),
+            )
+    except Exception:
+        warnings.append("force_abort_policy_failed")
+
     if safety_block:
+        if old_policy is not None:
+            try:
+                w.exec.set_policy(**old_policy)
+            except Exception:
+                pass
         return {
             "ok": False, "reason": "safety_pre_block", "symbol": sym, "side": side,
             "warnings": warnings or None,
@@ -1064,6 +1212,11 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         }
 
     if not ev_ok:
+        if old_policy is not None:
+            try:
+                w.exec.set_policy(**old_policy)
+            except Exception:
+                pass
         return {
             "ok": False, "reason": "ev_guard_block",
             "symbol": sym, "side": side,
@@ -1073,11 +1226,8 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "rr_used": float(rr_used),
         }
 
-    # Пытаемся вызвать place_entry с limit_offset_ticks и sl_distance_px (совместимость со старыми сигнатурами).
     try:
-        report = await w.place_entry(
-            sym, side, float(qty), int(limit_offset_ticks), sl_distance_px=float(sl_distance_px)
-        )
+        report = await w.place_entry(sym, side, float(qty), int(limit_offset_ticks), sl_distance_px=float(sl_distance_px))
     except TypeError:
         try:
             report = await w.place_entry(sym, side, float(qty), int(limit_offset_ticks))
@@ -1086,6 +1236,12 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
                 report = await w.place_entry_auto(sym, side)
             else:
                 report = await w.place_entry(sym, side, float(qty))
+
+    if old_policy is not None:
+        try:
+            w.exec.set_policy(**old_policy)
+        except Exception:
+            pass
 
     out: Dict[str, Any] = {
         "ok": True,
