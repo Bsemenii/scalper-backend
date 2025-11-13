@@ -1,10 +1,9 @@
+# risk/filters.py
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
+from typing import List, Optional
 
 # --------- Конфиг (минимум, без зависимостей от Pydantic) ---------
 
@@ -70,36 +69,52 @@ class RiskDecision:
 
 # --------- Вспомогательные проверки ---------
 
-def _is_minute_zero(ts_ms: int) -> bool:
-    """True, если секунда в минуте близка к 0 (±5с), чтобы пропускать «:00»."""
-    s = (ts_ms // 1000) % 60
-    return s <= 5 or s >= 55
-
-
-def _is_funding_minute_utc(ts_ms: int) -> bool:
+def _is_minute_zero(ts_ms: int, window_s: int = 5) -> bool:
     """
-    Упрощённая эвристика funding minute для Binance Perp: каждые 8 часов в XX:00 UTC.
-    Считаем «опасным» интервал ±60 секунд вокруг отметки.
+    True, если секунда в минуте близка к 0 в окне ±window_s.
     """
-    sec = (ts_ms // 1000)
-    minutes = (sec // 60) % (8 * 60)  # цикл 8h
-    # ближе чем 60с к :00
-    return minutes == 0 and (sec % 60) < 60
+    if window_s <= 0:
+        window_s = 1
+    sec = (ts_ms // 1000) % 60
+    return (sec <= window_s) or (sec >= 60 - window_s)
 
+def _is_funding_minute_utc(ts_ms: int, window_s: int = 60) -> bool:
+    """
+    Эвристика funding minute для Binance Perp: каждые 8 часов в XX:00 UTC.
+    Считаем «опасным» интервал ±window_s секунд вокруг отметки.
+    """
+    if window_s <= 0:
+        window_s = 30
+    total_sec = ts_ms // 1000
+    # цикл 8 часов
+    minutes_in_cycle = (total_sec // 60) % (8 * 60)
+    seconds_in_minute = total_sec % 60
+    # близко к :00 и внутри funding-часа
+    return (minutes_in_cycle == 0) and (seconds_in_minute < window_s)
+
+def _safe_offset(ts_ms: int, offset_ms: int) -> int:
+    # ограничим offset разумными пределами, чтобы «время» не улетало
+    try:
+        off = int(offset_ms)
+    except Exception:
+        off = 0
+    off = max(-300_000, min(300_000, off))
+    return ts_ms + off
 
 def _liq_price(entry_px: float, side: str, leverage: float) -> float:
     """
-    Очень грубая оценка уровня ликвидации: приблизим как entry / (1 ± 1/leverage).
-    Это эвристика для paper-фильтра (реальную формулу даёт биржа).
+    Очень грубая оценка уровня ликвидации: entry / (1 ± 1/leverage).
+    Эвристика для paper-фильтра (реальную формулу даёт биржа).
     """
     lev = max(1.0, float(leverage))
-    if side.upper() == "BUY":
+    if str(side).upper() == "BUY":
         return entry_px * (1.0 - 1.0 / lev)
     return entry_px * (1.0 + 1.0 / lev)
 
-
 def _liq_buffer_mult(entry_px: float, sl_px: float, side: str, leverage: float) -> float:
-    """Во сколько раз ликвидация дальше от входа, чем SL (чем больше — тем безопаснее)."""
+    """
+    Во сколько раз ликвидация дальше от входа, чем SL (чем больше — тем безопаснее).
+    """
     liq = _liq_price(entry_px, side, leverage)
     dist_liq = abs(liq - entry_px)
     dist_sl = abs(sl_px - entry_px)
@@ -123,24 +138,31 @@ def check_entry_safety(
     """
     reasons: List[str] = []
 
-    # spread / liquidity
-    if micro.spread_ticks > safety.max_spread_ticks:
-        reasons.append(f"spread>{safety.max_spread_ticks}")
-    if micro.top5_liq_usd < safety.min_top5_liquidity_usd:
-        reasons.append(f"liq<{int(safety.min_top5_liquidity_usd)}")
+    # 1) spread / liquidity
+    try:
+        if float(micro.spread_ticks) > float(safety.max_spread_ticks):
+            reasons.append(f"spread>{int(safety.max_spread_ticks)}")
+    except Exception:
+        reasons.append("spread:bad_value")
 
-    # time gates
-    ts = time_ctx.ts_ms + max(-300_000, min(300_000, time_ctx.server_time_offset_ms))
-    if safety.skip_minute_zero and _is_minute_zero(ts):
+    try:
+        if float(micro.top5_liq_usd) < float(safety.min_top5_liquidity_usd):
+            reasons.append(f"liq<{int(safety.min_top5_liquidity_usd)}")
+    except Exception:
+        reasons.append("liq:bad_value")
+
+    # 2) time gates (с аккуратным server_time_offset)
+    ts = _safe_offset(int(time_ctx.ts_ms), int(time_ctx.server_time_offset_ms))
+    if bool(safety.skip_minute_zero) and _is_minute_zero(ts, window_s=5):
         reasons.append("minute_zero")
-    if safety.skip_funding_minute and _is_funding_minute_utc(ts):
+    if bool(safety.skip_funding_minute) and _is_funding_minute_utc(ts, window_s=60):
         reasons.append("funding_minute")
 
-    # liquidation buffer vs SL
+    # 3) liquidation buffer vs SL
     if pos_ctx is not None:
         buf = _liq_buffer_mult(pos_ctx.entry_px, pos_ctx.sl_px, side, pos_ctx.leverage)
-        if buf < safety.min_liq_buffer_sl_mult:
-            reasons.append(f"liq_buffer<{safety.min_liq_buffer_sl_mult:g}")
+        if buf < float(safety.min_liq_buffer_sl_mult):
+            reasons.append(f"liq_buffer<{float(safety.min_liq_buffer_sl_mult):g}")
 
     return RiskDecision(allow=(len(reasons) == 0), reasons=reasons)
 
@@ -172,6 +194,9 @@ def normalize_r(pnl_usd: float, entry_px: float, sl_px: float, qty: float, risk:
     """
     Пересчёт PnL в R: делим на фактический риск (|entry-sl|*qty), но не ниже пола min_risk_usd_floor.
     """
-    risk_usd = abs(entry_px - sl_px) * max(qty, 0.0)
-    risk_usd = max(risk_usd, max(1e-9, risk.min_risk_usd_floor))
-    return pnl_usd / risk_usd
+    try:
+        risk_usd = abs(float(entry_px) - float(sl_px)) * max(float(qty), 0.0)
+    except Exception:
+        risk_usd = 0.0
+    risk_usd = max(risk_usd, max(1e-9, float(risk.min_risk_usd_floor)))
+    return float(pnl_usd) / risk_usd

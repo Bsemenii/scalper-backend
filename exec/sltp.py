@@ -5,7 +5,6 @@ from typing import Literal, Optional
 
 Side = Literal["BUY", "SELL"]
 
-
 # =========================
 # Public data structures
 # =========================
@@ -28,35 +27,37 @@ class SLTPPlan:
 # =========================
 
 def _is_long(side: Side) -> bool:
-    return (side or "BUY") == "BUY"
+    return str(side or "BUY").upper() == "BUY"
 
-
-def _round_to_step(x: float, step: float) -> float:
-    """Симметричное квантування к ближайшему шагу цены (чистый round)."""
-    if step <= 0:
-        return float(x)
-    return float(round(round(x / step) * step, 10))
-
-
-def _round_down(x: float, step: float) -> float:
-    """Округлить вниз (используется для SL long и TP short)."""
-    if step <= 0:
+def _q_down(x: float, step: float) -> float:
+    if step <= 0: 
         return float(x)
     import math
     return float(math.floor(x / step) * step)
 
-
-def _round_up(x: float, step: float) -> float:
-    """Округлить вверх (используется для TP long и SL short)."""
+def _q_up(x: float, step: float) -> float:
     if step <= 0:
         return float(x)
     import math
-    return float(math.ceil(x / step) * step)
+    # небольшой эпсилон, чтобы исключить совпадение с границей
+    return float(math.ceil((x - 1e-15) / step) * step)
 
+def _q_near(x: float, step: float) -> float:
+    if step <= 0:
+        return float(x)
+    # симметричное округление к ближайшему шагу
+    import math
+    return float(round(x / step) * step)
 
-def _clamp_positive(x: float) -> float:
-    return float(x if x > 0 else 0.0)
+def _clamp_pos(x: float) -> float:
+    return float(x) if x > 0 else 0.0
 
+def _bp(v: float) -> float:
+    # безопасно перевести bps в коэффициент
+    try:
+        return float(v) / 10_000.0
+    except Exception:
+        return 0.0
 
 def _ensure_min_sl_distance_px(
     *,
@@ -73,21 +74,22 @@ def _ensure_min_sl_distance_px(
     - не меньше min_stop_ticks * tick,
     - не меньше spread_px * spread_mult,
     - не меньше min_sl_bps (в бипсах) от референсной цены (entry/мид).
+    Дистанция квантуется ВВЕРХ по тик-шагу, чтобы не оказаться слишком близко.
     """
     tick = float(price_tick if price_tick > 0 else 0.1)
-    floor_ticks = max(int(min_stop_ticks), 1) * tick
+    floor_ticks = max(int(min_stop_ticks or 0), 1) * tick
     floor_spread = float(spread_px) * float(spread_mult) if spread_px > 0 else 0.0
-    floor_bps = float(ref_price) * (float(min_sl_bps) / 10_000.0) if ref_price > 0 else 0.0
+    floor_bps = float(ref_price) * _bp(min_sl_bps) if (ref_price > 0 and min_sl_bps > 0) else 0.0
 
     dist = max(float(raw_sl_dist_px), floor_ticks, floor_spread, floor_bps, tick)
-    # квантуем вверх по шагу, чтобы точно не «завалиться» внутрь шума
+    # квантуем вверх
     import math
     dist = math.ceil(dist / tick) * tick
     return float(dist)
 
 
 # ===========================================================
-# Fee-aware целеуказание для Take Profit с решением в замкнутой форме
+# Fee-aware целеуказание для TP с решением в замкнутой форме
 # ===========================================================
 
 def _solve_tp_price_for_min_net_rr_long(
@@ -99,24 +101,19 @@ def _solve_tp_price_for_min_net_rr_long(
     entry_fee_bps: float,
 ) -> float:
     """
-    Для лонга решаем неравенство:
+    Для лонга решаем:
       (tp - E) - (E*m + tp*n) >= R*(E - S)
-    где:
-      E=entry_px, S=sl_px, m=entry_fee_bps/1e4, n=exit_fee_bps_eff/1e4, R=min_net_rr.
+    где: E=entry, S=sl, m=entry_fee_bps/1e4, n=exit_fee_bps_eff/1e4, R=min_net_rr.
     Решение:
       tp >= [ R*(E - S) + E*(1 + m) ] / (1 - n)
     """
-    E = float(entry_px)
-    S = float(sl_px)
-    R = float(min_net_rr)
-    m = float(entry_fee_bps) / 10_000.0
-    n = float(exit_fee_bps_eff) / 10_000.0
+    E, S, R = float(entry_px), float(sl_px), float(min_net_rr)
+    m, n = _bp(entry_fee_bps), _bp(exit_fee_bps_eff)
     denom = (1.0 - n)
-    if denom <= 1e-12:  # крайне консервативный случай — ставим далеко
+    if denom <= 1e-12:  # патологический случай, ставим далеко
         denom = 1e-12
     num = R * (E - S) + E * (1.0 + m)
     return float(num / denom)
-
 
 def _solve_tp_price_for_min_net_rr_short(
     *,
@@ -129,13 +126,11 @@ def _solve_tp_price_for_min_net_rr_short(
     """
     Для шорта решаем:
       (E - tp) - (E*m + tp*n) >= R*(S - E)
-    => tp <= [ E*(1 - m) - R*(S - E) ] / (1 + n)
+    =>
+      tp <= [ E*(1 - m) - R*(S - E) ] / (1 + n)
     """
-    E = float(entry_px)
-    S = float(sl_px)
-    R = float(min_net_rr)
-    m = float(entry_fee_bps) / 10_000.0
-    n = float(exit_fee_bps_eff) / 10_000.0
+    E, S, R = float(entry_px), float(sl_px), float(min_net_rr)
+    m, n = _bp(entry_fee_bps), _bp(exit_fee_bps_eff)
     denom = (1.0 + n)
     if denom <= 1e-12:
         denom = 1.0
@@ -161,7 +156,7 @@ def compute_sltp_fee_aware(
     taker_bps: float = 4.0,
     entry_taker_like: bool = True,
     exit_taker_like: bool = True,
-    addl_exit_bps: float = 0.0,  # сюда можно подать половину спреда+ожид. проскальзывание в бипсах
+    addl_exit_bps: float = 0.0,  # половинка спреда/ожидаемое проскальзывание в bps
     # --- «ограждения» для SL ---
     min_stop_ticks: int = 10,
     spread_px: float = 0.0,
@@ -170,27 +165,22 @@ def compute_sltp_fee_aware(
     # --- требования к чистому R ---
     min_net_rr: float = 1.2,
     allow_expand_tp: bool = True,
-    # --- опционально задать готовый SL (если уже посчитан) ---
+    # --- опционально заданный SL ---
     sl_px_hint: Optional[float] = None,
 ) -> SLTPPlan:
     """
     Строит SL/TP так, чтобы:
-      1) Stop имел адекватную дистанцию (тики/спред/вола/минимум в bps),
-      2) TP удовлетворял *чистому* R (после комиссий и доп. бипсов) не ниже min_net_rr,
-      3) и при этом не был хуже целевого rr_target (по gross), если это возможно.
+      1) SL имел адекватную дистанцию (тики/спред/минимум в bps),
+      2) TP удовлетворял *чистому* R (после комиссий/надбавок) не ниже `min_net_rr`,
+      3) не был хуже целевого `rr_target` (gross), если это возможно.
 
-    Параметры:
-    - entry_taker_like / exit_taker_like — выставлять консервативные комиссии как для taker на вход/выход;
-      если вход делался maker (лимитом), передай entry_taker_like=False.
-    - addl_exit_bps — добавочная надбавка в бипсах на выход (скольжение, half-spread и т.п.).
-    - allow_expand_tp — разрешить сдвигать TP дальше, если это нужно, чтобы пройти min_net_rr.
-
-    Возвращает SLTPPlan с полным объёмом на SL/TP (sl_qty=tp_qty=qty).
+    Возвращает SLTPPlan (полный объём на SL/TP).
     """
     # sanity
-    assert entry_px > 0 and qty > 0 and sl_distance_px > 0 and price_tick > 0
+    if not (entry_px > 0 and qty > 0 and sl_distance_px > 0 and price_tick > 0):
+        raise ValueError("invalid inputs for compute_sltp_fee_aware")
 
-    # 1) нормализуем SL-дистанцию с ограждениями
+    # 1) нормализуем SL дистанцию с «ограждениями»
     sl_dist_px = _ensure_min_sl_distance_px(
         raw_sl_dist_px=float(sl_distance_px),
         price_tick=float(price_tick),
@@ -201,38 +191,38 @@ def compute_sltp_fee_aware(
         ref_price=float(entry_px),
     )
 
-    # 2) построим SL из entry и дистанции, с корректным направленным округлением
+    # 2) SL из entry и дистанции, направленное округление
     if _is_long(side):
-        sl_px = _round_down(max(0.0, entry_px - sl_dist_px), price_tick)
+        sl_px = _q_down(max(0.0, entry_px - sl_dist_px), price_tick)
     else:
-        sl_px = _round_up(entry_px + sl_dist_px, price_tick)
+        sl_px = _q_up(entry_px + sl_dist_px, price_tick)
 
-    # если дали подсказку sl_px_hint — уважаем её, но не ближе «минимума»
+    # можно уважить внешний hint, но не ближе минимума
     if isinstance(sl_px_hint, (int, float)) and sl_px_hint > 0:
         if _is_long(side):
-            min_ok = _round_down(max(0.0, entry_px - sl_dist_px), price_tick)
-            sl_px = min(sl_px_hint, entry_px)  # SL ниже entry
-            sl_px = max(sl_px, min_ok)         # но не ближе минимально допустимого
-            sl_px = _round_down(sl_px, price_tick)
+            min_ok = _q_down(max(0.0, entry_px - sl_dist_px), price_tick)
+            sl_px = max(min_ok, min(sl_px_hint, entry_px))
+            sl_px = _q_down(sl_px, price_tick)
         else:
-            min_ok = _round_up(entry_px + sl_dist_px, price_tick)
-            sl_px = max(sl_px_hint, entry_px)  # SL выше entry
-            sl_px = max(sl_px, min_ok)
-            sl_px = _round_up(sl_px, price_tick)
+            min_ok = _q_up(entry_px + sl_dist_px, price_tick)
+            sl_px = max(min_ok, max(sl_px_hint, entry_px))
+            sl_px = _q_up(sl_px, price_tick)
 
-    # 3) базовый TP по gross RR (цель rr_target)
+    # 3) базовый TP по gross RR
+    rr_target = max(float(rr_target or 0.0), 1.2)
     if _is_long(side):
         base_tp = entry_px + rr_target * (entry_px - sl_px)
-        tp_gross = _round_up(base_tp, price_tick)
+        tp_gross = _q_up(base_tp, price_tick)
     else:
         base_tp = entry_px - rr_target * (sl_px - entry_px)
-        tp_gross = _round_down(base_tp, price_tick)
+        tp_gross = _q_down(base_tp, price_tick)
 
-    # 4) учёт комиссий/скольжения → эффективные бипсы на вход/выход
+    # 4) комиссии и надбавки
     entry_bps = float(taker_bps if entry_taker_like else maker_bps)
     exit_bps_eff = float(taker_bps if exit_taker_like else maker_bps) + float(addl_exit_bps)
 
-    # 5) минимальный TP для соблюдения *чистого* R (алгебраическое решение)
+    # 5) минимальный TP под min_net_rr (алгебраическое решение)
+    min_net_rr = max(float(min_net_rr or 0.0), 1.0)
     if _is_long(side):
         tp_min_net = _solve_tp_price_for_min_net_rr_long(
             entry_px=entry_px,
@@ -241,9 +231,10 @@ def compute_sltp_fee_aware(
             exit_fee_bps_eff=exit_bps_eff,
             entry_fee_bps=entry_bps,
         )
-        tp_min_net = _round_up(tp_min_net, price_tick)
-        # выбираем больший из (gross-цели) и (min_net_rr)
-        tp_px = max(tp_gross, tp_min_net) if allow_expand_tp else max(tp_gross, _round_up(entry_px, price_tick))
+        tp_min_net = _q_up(tp_min_net, price_tick)
+        tp_px = max(tp_gross, tp_min_net) if allow_expand_tp else max(tp_gross, _q_up(entry_px, price_tick))
+        # safety: TP ДОЛЖЕН быть выше entry
+        tp_px = max(tp_px, _q_up(entry_px + price_tick, price_tick))
     else:
         tp_min_net = _solve_tp_price_for_min_net_rr_short(
             entry_px=entry_px,
@@ -252,19 +243,14 @@ def compute_sltp_fee_aware(
             exit_fee_bps_eff=exit_bps_eff,
             entry_fee_bps=entry_bps,
         )
-        tp_min_net = _round_down(tp_min_net, price_tick)
-        # для шорта TP ниже → берём минимум из двух (дальше = меньше)
-        tp_px = min(tp_gross, tp_min_net) if allow_expand_tp else min(tp_gross, _round_down(entry_px, price_tick))
-
-    # safety: TP не должен «перевалить» на неверную сторону
-    if _is_long(side):
-        tp_px = max(tp_px, _round_up(entry_px + price_tick, price_tick))
-    else:
-        tp_px = min(tp_px, _round_down(entry_px - price_tick, price_tick))
+        tp_min_net = _q_down(tp_min_net, price_tick)
+        tp_px = min(tp_gross, tp_min_net) if allow_expand_tp else min(tp_gross, _q_down(entry_px, price_tick))
+        # safety: TP ДОЛЖЕН быть ниже entry
+        tp_px = min(tp_px, _q_down(entry_px - price_tick, price_tick))
 
     return SLTPPlan(
-        sl_px=float(_clamp_positive(sl_px)),
-        tp_px=float(_clamp_positive(tp_px)),
+        sl_px=float(_clamp_pos(sl_px)),
+        tp_px=float(_clamp_pos(tp_px)),
         sl_qty=float(qty),
         tp_qty=float(qty),
     )
@@ -286,18 +272,17 @@ def compute_sltp(
     """
     Простой планировщик (обратная совместимость).
 
-    Что улучшено относительно старой версии:
-    - SL-дистанция приводится к «разумному минимуму» (тики, спред, 12 bps),
-    - округления направленные (SL long — вниз, TP long — вверх; для short наоборот),
-    - TP целится в rr (gross), но при этом не даёт SL/TP «слипнуться» с entry.
+    Улучшения:
+    - SL-дистанция приводится к «разумному минимуму» (тики, 12 bps).
+    - Направленные округления: SL long — вниз, TP long — вверх (и наоборот для short).
+    - TP целится в rr (gross) и не «липнет» к entry.
 
-    Для полной «экономической» корректности (учёт комиссий/скольжения/минимального net-R)
-    используй compute_sltp_fee_aware().
+    Для учёта комиссий и чистого R используй compute_sltp_fee_aware().
     """
-    assert entry_px > 0 and qty > 0 and sl_distance_px > 0
-    tick = float(price_tick if price_tick > 0 else 0.1)
+    if not (entry_px > 0 and qty > 0 and sl_distance_px > 0):
+        raise ValueError("invalid inputs for compute_sltp")
 
-    # базовые ограждения SL (минимальные предположения про спред)
+    tick = float(price_tick if price_tick > 0 else 0.1)
     sl_dist = _ensure_min_sl_distance_px(
         raw_sl_dist_px=float(sl_distance_px),
         price_tick=tick,
@@ -308,15 +293,15 @@ def compute_sltp(
         ref_price=float(entry_px),
     )
 
+    rr = max(float(rr or 0.0), 1.2)
     if _is_long(side):
-        sl = _round_down(max(0.0, entry_px - sl_dist), tick)
-        tp = _round_up(entry_px + rr * sl_dist, tick)
-        # минимальные разнесения от entry
-        tp = max(tp, _round_up(entry_px + tick, tick))
+        sl = _q_down(max(0.0, entry_px - sl_dist), tick)
+        tp = _q_up(entry_px + rr * (entry_px - sl), tick)
+        tp = max(tp, _q_up(entry_px + tick, tick))
     else:
-        sl = _round_up(entry_px + sl_dist, tick)
-        tp = _round_down(entry_px - rr * sl_dist, tick)
-        tp = min(tp, _round_down(entry_px - tick, tick))
+        sl = _q_up(entry_px + sl_dist, tick)
+        tp = _q_down(entry_px - rr * (sl - entry_px), tick)
+        tp = min(tp, _q_down(entry_px - tick, tick))
 
     return SLTPPlan(sl_px=float(sl), tp_px=float(tp), sl_qty=float(qty), tp_qty=float(qty))
 
@@ -353,7 +338,7 @@ def retarget_tp_for_min_net_rr(
             exit_fee_bps_eff=exit_bps_eff,
             entry_fee_bps=entry_bps,
         )
-        return _round_up(tp, float(price_tick))
+        return _q_up(tp, float(price_tick))
     else:
         tp = _solve_tp_price_for_min_net_rr_short(
             entry_px=float(entry_px),
@@ -362,4 +347,4 @@ def retarget_tp_for_min_net_rr(
             exit_fee_bps_eff=exit_bps_eff,
             entry_fee_bps=entry_bps,
         )
-        return _round_down(tp, float(price_tick))
+        return _q_down(tp, float(price_tick))
