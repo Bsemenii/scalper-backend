@@ -1139,6 +1139,18 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
         warnings.append(f"expected_risk_usd({expected_risk_usd:.4f}) < min_risk_floor({rsk['min_risk_floor']:.4f})")
     if est_fees_usd_maker_only > 0 and expected_risk_usd < (0.8 * est_fees_usd_maker_only):
         warnings.append(f"risk({expected_risk_usd:.4f}) < 0.8×maker_only_fees({est_fees_usd_maker_only:.4f})")
+    fees_ratio = est_fees_usd_conservative / max(expected_risk_usd, 1e-9)
+
+    if fees_ratio > 0.4:  # комиссии > 40% от риска — запретить
+        return {
+            "ok": False,
+            "reason": "fees_vs_risk_too_high",
+            "symbol": sym,
+            "side": side,
+            "expected_risk_usd": round(float(expected_risk_usd), 6),
+            "fees_usd_conservative": round(float(est_fees_usd_conservative), 6),
+            "fees_ratio": round(float(fees_ratio), 3),
+        }
 
     rr_used = rr_target
     expected_profit_usd_est = expected_risk_usd * rr_used

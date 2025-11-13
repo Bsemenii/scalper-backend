@@ -682,11 +682,28 @@ class Worker:
                     best_all = d.get("best") or {}
                     history_meta = d.get("history") or {}
 
+                    # --- глобальный лимит по числу позиций (MVP: максимум 1) ---
+                    open_cnt = 0
+                    for _ps in (positions or {}).values():
+                        try:
+                            st_p = str((_ps or {}).get("state", "")).upper()
+                        except Exception:
+                            st_p = ""
+                        if st_p in ("OPEN", "ENTERING", "EXITING"):
+                            open_cnt += 1
+
                     for sym in symbols:
                         try:
                             pos = positions.get(sym) or {}
                             st = str(pos.get("state", "")).upper()
                             if st in ("OPEN", "ENTERING", "EXITING"):
+                                # по этому символу уже что-то есть
+                                continue
+
+                            # если где-то уже есть открытая/входящая/выходящая позиция —
+                            # новые входы по другим символам не даём
+                            if open_cnt >= 1:
+                                _inc_block(f"{sym}:global_pos_limit")
                                 continue
 
                             if now - last_entry_ts.get(sym, 0) < cooldown_ms:
@@ -977,40 +994,50 @@ class Worker:
     
     def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
         """
-        Плановая дистанция до SL для сайзинга и нормализации:
-        - не ставим стоп внутри спреда/шума,
-        - учитываем тики, спред, волу и минимум в bps.
+        Единый источник плановой SL-дистанции:
+        просто обёртка над _compute_vol_stop_distance_px с оценкой mid.
+        Параметр spread_ticks оставлен для совместимости, но не критичен.
         """
-        spec = self.specs[symbol]
-        tick = float(spec.price_tick) or 0.1
+        sym = symbol.upper()
 
-        # минимум по тикам
-        base_min_ticks = max(self._min_stop_ticks_default(), 8.0)
-        min_ticks_px = base_min_ticks * tick
+        # оцениваем mid по best bid/ask, фолбэк – по последнему тику
+        try:
+            bid, ask = self.best_bid_ask(sym)
+        except Exception:
+            bid, ask = 0.0, 0.0
 
-        # от спреда: не меньше 1.5 * спреда и 2 тиков
-        if spread_ticks > 0.0:
-            spread_px = max(spread_ticks * tick * 1.5, 2.0 * tick)
-        else:
-            spread_px = 2.0 * tick
+        mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else 0.0
+        if mid <= 0.0:
+            last = self.latest_tick(sym) or {}
+            try:
+                mid = float(last.get("price") or last.get("mark_price") or 0.0)
+            except Exception:
+                mid = 0.0
 
-        # волатильность за 60s
-        vol_px = 0.0
-        sigma = self._recent_volatility(symbol, window_ms=60_000)
-        if sigma > 0.0:
-            vol_px = 0.6 * float(sigma)
+        # если совсем нет цены – fallback на старый минимальный тик
+        if mid <= 0.0:
+            step = self._get_price_step(sym)
+            if step <= 0.0:
+                step = 0.1
+            base_min_ticks = max(self._min_stop_ticks_default(), 8.0)
+            return float(base_min_ticks * step)
 
-        # минимум в bps: 0.12% (12 bps)
-        last = self.latest_tick(symbol) or {}
-        price = float(last.get("price") or 0.0)
-        min_sl_bps = 12.0  # можно вынести в конфиг
-        bps_px = price * (min_sl_bps / 10_000.0) if price > 0.0 else 0.0
+        # min_stop_ticks из exec_cfg или дефолта
+        try:
+            min_stop_ticks_cfg = int(
+                (getattr(self, "_exec_cfg", {}) or {}).get(
+                    "min_stop_ticks", self._min_stop_ticks_default()
+                )
+            )
+        except Exception:
+            min_stop_ticks_cfg = int(self._min_stop_ticks_default())
 
-        sl_px = max(min_ticks_px, spread_px, vol_px, bps_px)
-        if sl_px <= 0.0:
-            sl_px = 10.0 * tick
-
-        return float(sl_px)
+        dist = self._compute_vol_stop_distance_px(
+            sym,
+            mid_px=float(mid),
+            min_stop_ticks_cfg=min_stop_ticks_cfg,
+        )
+        return float(dist)
     
     def _build_sltp_plan(
         self,
@@ -1502,20 +1529,16 @@ class Worker:
             self._inc_block_reason(f"{sym}:edge_too_small")
             return {"ok": False, "reason": "edge_too_small", "edge_diag": edge_info}
 
-        # --- account snapshot / risk target ---
+         # --- account snapshot / risk target ---
         try:
             equity_now = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
         except Exception:
             equity_now = float(getattr(self, "_starting_equity_usd", 1000.0))
 
-        # leverage: per-symbol override
-        lev = float(getattr(self, "_leverage", 20.0))
-        try:
-            per_lev = (getattr(self, "_account_cfg", {}) or {}).get("per_symbol_leverage", {})
-            if sym in per_lev:
-                lev = float(per_lev[sym])
-        except Exception:
-            pass
+        # leverage: per-symbol override через хелпер
+        lev = float(self._leverage_for_symbol(sym))
+        if lev < 1.0:
+            lev = 1.0
 
         min_notional = float(getattr(self, "_min_notional_usd", 5.0))
         risk_cfg = getattr(self, "_risk_cfg", None)
@@ -1541,8 +1564,7 @@ class Worker:
             return {"ok": False, "reason": "below_min_notional", "hint": f"min ${min_notional} → qty ≥ {min_qty}"}
 
         # --- SL/TP план (fee-aware, maker-first вход/TP, SL=market) ---
-        maker_bps = float(getattr(self, "_fee_bps_maker", 2.0))
-        taker_bps = float(getattr(self, "_fee_bps_taker", 4.0))
+        maker_bps, taker_bps = self._fees_for_symbol(sym)
         spread_bps = (spread / mid) * 1e4 if mid > 0 else 0.0
         addl_exit_bps = 0.5 * max(spread_bps, 0.1)
 
@@ -1613,6 +1635,23 @@ class Worker:
                 "edge_diag": edge_meta2, "entry_px": float(mid2),
                 "sl_px": float(sl_px), "tp_px": float(tp_px)
             }
+        # --- liq-buffer: не входим, если SL слишком близко к ликвидации ---
+        try:
+            lb_mult = self._liq_buffer_mult(float(mid2), float(sl_px), s, lev)
+            min_mult = float(
+                getattr(self, "_safety_cfg", "min_liq_buffer_sl_mult")
+                if hasattr(self, "_safety_cfg") else 3.0
+            )
+            if not math.isfinite(lb_mult) or lb_mult < max(1.5, float(min_mult or 3.0)):
+                self._inc_block_reason(f"{sym}:liq_buffer_too_small")
+                return {
+                    "ok": False,
+                    "reason": "liq_buffer_too_small",
+                    "liq_buffer_mult": float(lb_mult),
+                }
+        except Exception:
+            # диагностику liq-buffer не считаем критичной
+            pass
 
         # --- submit (executor читает maker-first из конфига) ---
         try:
@@ -2804,9 +2843,9 @@ class Worker:
         su = str(symbol).upper()
         floor = 0.0
         if su == "BTCUSDT":
-            floor = 1.8    # мягкий минимум TP/SL на BTC
+            floor = 2.0    # мягкий минимум TP/SL на BTC
         elif su == "ETHUSDT":
-            floor = 1.4    # можно оставить 1.4–1.6
+            floor = 1.6    # можно оставить 1.4–1.6
         # SOL / прочее — без флоора
 
         try:
@@ -3358,32 +3397,64 @@ class Worker:
     # --- sizing helpers ---
 
     def _compute_auto_qty(self, symbol: str, side: Side, sl_distance_px: float) -> float:
-        """Размер позиции от процента риска и SL-дистанции. Учёт шага лота, плеча, минимальной нотионали."""
-        spec = self.specs[symbol]
-        risk_pct = float(self._risk_cfg.risk_per_trade_pct)  # трактуем как процент
-        equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
-        risk_usd_target = max(self._risk_cfg.min_risk_usd_floor, equity * (risk_pct / 100.0))
+        """
+        Размер позиции от процента риска и SL-дистанции.
 
-        if sl_distance_px <= 0:
+        Учитываем:
+        - risk_per_trade_pct и min_risk_usd_floor;
+        - фактическое плечо по символу (_leverage_for_symbol);
+        - min_notional;
+        - шаг лота;
+        - liq-buffer (чтобы SL был далеко от ликвидации).
+        """
+        sym = symbol.upper()
+        spec = self.specs[sym]
+
+        # --- риск-таргет в USD ---
+        try:
+            risk_pct = float(self._risk_cfg.risk_per_trade_pct)
+        except Exception:
+            risk_pct = 0.0
+
+        try:
+            equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
+        except Exception:
+            equity = float(self._starting_equity_usd)
+
+        try:
+            min_floor = float(self._risk_cfg.min_risk_usd_floor)
+        except Exception:
+            min_floor = 1.0
+
+        risk_usd_target = max(min_floor, equity * (risk_pct / 100.0)) if risk_pct > 0.0 else min_floor
+        if sl_distance_px <= 0.0 or risk_usd_target <= 0.0:
             return 0.0
 
-        qty_raw = risk_usd_target / sl_distance_px
-
-        # ограничение по плечу (max notional)
-        bid, ask = self.hub.best_bid_ask(symbol)
+        # --- рынок и цена ---
+        bid, ask = self.hub.best_bid_ask(sym)
         px = ask if side == "BUY" else bid
-        if px <= 0:
+        if px <= 0.0:
             return 0.0
 
-        max_notional = equity * max(self._leverage, 1.0)
-        max_qty_by_lev = max_notional / px
+        # --- плечо и лимит по нотионалу ---
+        lev = float(self._leverage_for_symbol(sym))
+        if lev < 1.0:
+            lev = 1.0
+        max_notional = equity * lev
+        max_qty_by_lev = max_notional / px if px > 0.0 else 0.0
+        if max_qty_by_lev <= 0.0:
+            return 0.0
+
+        # --- сырой сайзинг от риска ---
+        qty_raw = risk_usd_target / sl_distance_px
         qty = min(qty_raw, max_qty_by_lev)
 
-        # минимальная нотиональ
-        min_qty_by_notional = self._min_notional_usd / px
+        # --- минимальная нотиональ ---
+        min_notional = float(getattr(self, "_min_notional_usd", 5.0))
+        min_qty_by_notional = min_notional / px if px > 0.0 else 0.0
 
-        # привести к шагу лота (вниз)
-        step = max(spec.qty_step, 1e-12)
+        # --- шаг лота ---
+        step = max(float(getattr(spec, "qty_step", 0.001)), 1e-12)
 
         def floor_to_step(x: float, st: float) -> float:
             return (int(x / st)) * st
@@ -3391,11 +3462,25 @@ class Worker:
         qty = max(min_qty_by_notional, qty)
         qty = floor_to_step(qty, step)
 
-        # если после округления получилось 0 — попробуем хотя бы шаг, если укладывается в лимиты
-        if qty <= 0:
+        # если после округления всё равно 0 — пробуем минимум, если он валиден
+        if qty <= 0.0:
             qty = step
-            if qty * px < self._min_notional_usd or qty > max_qty_by_lev:
+            if qty * px < min_notional or qty > max_qty_by_lev:
                 return 0.0
+
+        # --- liq-buffer: SL не должен быть рядом с ликвидацией ---
+        try:
+            sl_px = px - sl_distance_px if side == "BUY" else px + sl_distance_px
+            lb_mult = self._liq_buffer_mult(px, sl_px, side, lev)
+            min_mult = float(
+                getattr(self._safety_cfg, "min_liq_buffer_sl_mult", 3.0) or 3.0
+            )
+            # мягко, но жёстко: если буфер меньше требуемого — лучше не входить
+            if lb_mult < max(1.5, min_mult):
+                return 0.0
+        except Exception:
+            # если что-то пошло не так — не блокируем, но и не падаем
+            pass
 
         return float(qty)
 
