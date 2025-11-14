@@ -24,9 +24,10 @@ class OrderReq:
     """
     Унифицированный запрос на ордер.
 
-    Поля совместимы с adapters.binance_rest.{OrderReq,OrderResp},
+    Поля совместимы с adapters.binance_rest.OrderReq,
     чтобы PaperAdapter / реальный адаптер работали без правок.
     """
+
     symbol: str
     side: Side
     type: Literal["LIMIT", "MARKET"]
@@ -35,6 +36,15 @@ class OrderReq:
     time_in_force: Optional[str] = None
     reduce_only: bool = False
     client_order_id: Optional[str] = None
+
+    # Дополнительно — для STOP/TP ордеров (чтобы не было рассинхрона с адаптером)
+    stop_price: Optional[float] = None
+    close_position: bool = False
+
+    @property
+    def stop_px(self) -> Optional[float]:
+        """Мягкий алиас, если где-то в коде используют stop_px."""
+        return self.stop_price
 
 
 @dataclass
@@ -50,18 +60,27 @@ class ExecAdapter(Protocol):
     """
     Минимальный контракт адаптера.
 
-    PaperAdapter его удовлетворяет.
-    Реальный биржевой адаптер должен вести себя аналогично.
+    Важно: это только type-hint, в рантайме используется duck-typing.
+    BinanceUSDTMAdapter и PaperAdapter удовлетворяют этому контракту.
     """
 
-    async def create_order(self, req: OrderReq) -> OrderResp:
+    async def create_order(self, req: Any) -> Any:
         ...
 
-    async def cancel_order(self, symbol: str, client_order_id: str) -> OrderResp:
+    async def cancel_order(self, symbol: str, client_order_id: str) -> Any:
+        """
+        Для BinanceUSDTMAdapter фактическая сигнатура:
+          cancel_order(symbol, order_id=None, client_order_id=None)
+        Мы вызываем её как cancel_order(symbol, client_order_id=coid).
+        """
         ...
 
-    # Необязательный метод: если есть — используем для опроса лимитки.
-    async def get_order(self, symbol: str, client_order_id: str) -> OrderResp:  # type: ignore[override]
+    async def get_order(self, symbol: str, client_order_id: str) -> Any:
+        """
+        Для BinanceUSDTMAdapter фактическая сигнатура:
+          get_order(symbol, order_id=None, client_order_id=None)
+        Мы вызываем её как get_order(symbol, client_order_id=coid).
+        """
         ...
 
 
@@ -194,8 +213,8 @@ class Executor:
         tif = (self.c.time_in_force or "").upper()
         if tif in ("GTX", "PO", "POST_ONLY") and not self.c.prefer_maker:
             self.c.prefer_maker = True
-    
-        # ---------------------------------------------------------- Resp normalizer --
+
+    # ---------------------------------------------------------- Resp normalizer --
 
     def _to_order_resp(self, raw: Any, *, coid: Optional[str] = None) -> OrderResp:
         """
@@ -557,7 +576,8 @@ class Executor:
             while time.monotonic() < deadline:
                 await asyncio.sleep(max(0.0, (self.c.poll_ms or 50) / 1000.0))
                 try:
-                    state_raw = await get_order(symbol, limit_coid)  # type: ignore[misc]
+                    # КЛЮЧЕВОЕ: опрашиваем по clientOrderId
+                    state_raw = await get_order(symbol, client_order_id=limit_coid)  # type: ignore[misc]
                     state = self._to_order_resp(state_raw, coid=limit_coid)
                 except Exception:
                     continue
@@ -612,7 +632,8 @@ class Executor:
         if filled_qty < qty_rounded - 1e-12:
             steps.append("limit_cancel")
             with contextlib.suppress(Exception):
-                cancel_raw = await self.a.cancel_order(symbol, limit_coid)
+                # КЛЮЧЕВОЕ: отмена по clientOrderId
+                cancel_raw = await self.a.cancel_order(symbol, client_order_id=limit_coid)  # type: ignore[arg-type]
                 cancel_resp = self._to_order_resp(cancel_raw, coid=limit_coid)
                 part = _safe_float(cancel_resp.filled_qty)
                 avg = _safe_float(cancel_resp.avg_px)
@@ -728,6 +749,9 @@ class Executor:
                     status="REJECTED",
                     updated_ms=m.ts,
                 )
+
+        else:
+            market_oid = None
 
         # --- 8. Финальный статус и отчёт ---
         if filled_qty > 1e-12:

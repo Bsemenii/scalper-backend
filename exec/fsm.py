@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from bot.core.types import PosState, PositionState, Side
 
@@ -36,7 +36,7 @@ class PositionFSM:
     Совместимость:
     - API методов не ломает старый код (аргументы расширены только опционально).
     - Если модуль storage.repo недоступен — запись в БД тихо пропускается.
-    - Типы берём из bot.core.types (PosState/PositionState/Side).
+    - Типы берём из bot.core.types (PosState / PositionState / Side).
 
     Поведение:
     - on_open(...) при наличии symbol/side попробует создать запись сделки (open_trade).
@@ -50,23 +50,36 @@ class PositionFSM:
     # ---------- helpers ----------
 
     @staticmethod
-    def _calc_r(side: Optional[Side], entry_px: float, exit_px: float, sl_px: Optional[float]) -> float:
+    def _calc_r(
+        side: Optional[Side],
+        entry_px: float,
+        exit_px: float,
+        sl_px: Optional[float],
+    ) -> float:
         """
         Унифицированный расчёт R:
         R = PnL / |Entry - SL|
-        Для SHORT denom = (SL - Entry), для LONG denom = (Entry - SL).
+
+        Для LONG:
+            denom = (entry - sl)
+            R = (exit - entry) / denom
+
+        Для SHORT:
+            denom = (sl - entry)
+            R = (entry - exit) / denom
+
         Фолбэки: если SL неизвестен или denom==0 — R=0.
         """
         if side is None or sl_px is None:
             return 0.0
         try:
             if side == Side.BUY:
-                denom = (entry_px - sl_px)
+                denom = entry_px - sl_px
                 if denom == 0:
                     return 0.0
                 return (exit_px - entry_px) / denom
             else:
-                denom = (sl_px - entry_px)
+                denom = sl_px - entry_px
                 if denom == 0:
                     return 0.0
                 return (entry_px - exit_px) / denom
@@ -74,11 +87,17 @@ class PositionFSM:
             return 0.0
 
     @staticmethod
-    def _calc_pnl_usd(side: Optional[Side], entry_px: float, exit_px: float, qty: float) -> float:
+    def _calc_pnl_usd(
+        side: Optional[Side],
+        entry_px: float,
+        exit_px: float,
+        qty: float,
+    ) -> float:
         """
         Валютный PnL без учёта комиссий (их учитывает верхний уровень).
-        Для LONG: (exit - entry) * qty
-        Для SHORT: (entry - exit) * qty
+
+        LONG:  (exit - entry) * qty
+        SHORT: (entry - exit) * qty
         """
         if side is None:
             return 0.0
@@ -116,7 +135,7 @@ class PositionFSM:
         self,
         entry_px: float,
         qty: float,
-        sl: float,
+        sl: Optional[float],
         tp: Optional[float],
         rr: float,
         opened_ts: int,
@@ -125,11 +144,12 @@ class PositionFSM:
         symbol: Optional[str] = None,
         side: Optional[Side] = None,
         reason_open: str = "auto",
-        meta: Optional[dict] = None,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Фиксация открытия позиции.
-        Если symbol и side переданы — пытаемся записать сделку в SQLite (если доступен storage.repo).
+        Если symbol и side переданы — пытаемся записать сделку в SQLite
+        (если доступен storage.repo).
         """
         async with self._lock:
             self.pos.state = PosState.OPEN
@@ -150,6 +170,7 @@ class PositionFSM:
             if self.pos.symbol and self.pos.side:
                 try:
                     from storage.repo import TradeOpenCtx, open_trade  # type: ignore
+
                     side_ls = "LONG" if self.pos.side == Side.BUY else "SHORT"
                     tid = open_trade(
                         TradeOpenCtx(
@@ -157,8 +178,16 @@ class PositionFSM:
                             side=side_ls,
                             qty=float(self.pos.qty),
                             entry_px=float(self.pos.entry_px),
-                            sl_px=(float(self.pos.sl) if self.pos.sl is not None else None),
-                            tp_px=(float(self.pos.tp) if self.pos.tp is not None else None),
+                            sl_px=(
+                                float(self.pos.sl)
+                                if self.pos.sl is not None
+                                else None
+                            ),
+                            tp_px=(
+                                float(self.pos.tp)
+                                if self.pos.tp is not None
+                                else None
+                            ),
                             reason_open=(reason_open or ""),
                             meta=(meta or {}),
                         )
@@ -200,14 +229,33 @@ class PositionFSM:
 
             if self.pos.trade_id:
                 try:
-                    from storage.repo import close_trade, upsert_daily_stats, day_utc_from_ms  # type: ignore
-                    close_trade(self.pos.trade_id, exit_px=float(exit_px), r=float(r), pnl_usd=float(pnl_usd), reason_close=reason_close)
+                    from storage.repo import (  # type: ignore
+                        close_trade,
+                        upsert_daily_stats,
+                        day_utc_from_ms,
+                    )
 
-                    ts_ms = int(closed_ts if closed_ts is not None else time.time() * 1000)
+                    close_trade(
+                        self.pos.trade_id,
+                        exit_px=float(exit_px),
+                        r=float(r),
+                        pnl_usd=float(pnl_usd),
+                        reason_close=reason_close,
+                    )
+
+                    ts_ms = int(
+                        closed_ts if closed_ts is not None else time.time() * 1000
+                    )
                     day_utc = day_utc_from_ms(ts_ms)
-                    # win флаг используем как r > 0 (комиссии уже учтёт верхний слой, если нужно)
-                    upsert_daily_stats(day_utc, delta_r=float(r), delta_usd=float(pnl_usd), win=(r > 0.0))
+                    # win-флаг используем как r > 0 (комиссии уже учтёт верхний слой, если нужно)
+                    upsert_daily_stats(
+                        day_utc,
+                        delta_r=float(r),
+                        delta_usd=float(pnl_usd),
+                        win=(r > 0.0),
+                    )
                 except ModuleNotFoundError:
+                    # нет SQLite-хранилища — просто пропускаем запись
                     pass
                 except Exception as e:
                     print(f"[sqlite] close_trade/upsert_daily failed: {e}")
@@ -227,7 +275,9 @@ class PositionFSM:
     def snapshot(self) -> PositionState:
         """
         Наружный снепшот в типе bot.core.types.PositionState (как и раньше).
-        Внимание: symbol здесь не заполняем — его проставляет верхний уровень (per-symbol map).
+
+        Внимание: symbol здесь не заполняем — его проставляет верхний уровень
+        (per-symbol map).
         """
         return PositionState(
             symbol="",
@@ -239,3 +289,11 @@ class PositionFSM:
             rr=float(self.pos.rr),
             opened_ts=int(self.pos.opened_ts or 0),
         )
+
+    # Небольшой утилитарный метод для дебага (опционален, контракт не ломает)
+    def debug_runtime(self) -> PosRuntime:
+        """
+        Вернуть внутренний runtime-объект (только для локального дебага).
+        Не использовать в прод-логике снаружи.
+        """
+        return self.pos

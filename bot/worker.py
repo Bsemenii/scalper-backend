@@ -2191,13 +2191,6 @@ class Worker:
                         #     and pos.sl_px is not None and px > 0.0):
                         #     ... (оставлено намеренно выключенным)
 
-                        # шаг цены (для допуска по тикaм)
-                        try:
-                            spec = (self.specs or {}).get(sym)
-                            price_tick = float(getattr(spec, "price_step", getattr(spec, "price_tick", 0.1)))
-                        except Exception:
-                            price_tick = 0.1
-
                         side_now = (pos.side or "BUY").upper()
                         qty_now  = float(pos.qty or 0.0)
                         tp_px    = float(pos.tp_px) if pos.tp_px is not None else None
@@ -2247,22 +2240,14 @@ class Worker:
                             else:
                                 # ушли от TP — обнуляем окно grace
                                 self._tp_first_hit_ms[sym] = 0
-
-                        # 4) strict SL/TP triggering
-                        side = pos.side or "BUY"
-                        if side == "BUY":
-                            if pos.sl_px is not None and px <= pos.sl_px:
-                                await self._close_position(sym, pos, reason="sl_hit")
-                                continue
-                            if pos.tp_px is not None and px >= pos.tp_px:
-                                await self._close_position(sym, pos, reason="tp_hit")
-                                continue
-                        else:  # SELL
-                            if pos.sl_px is not None and px >= pos.sl_px:
-                                await self._close_position(sym, pos, reason="sl_hit")
-                                continue
-                            if pos.tp_px is not None and px <= pos.tp_px:
-                                await self._close_position(sym, pos, reason="tp_hit")
+                                
+                            # --- fallback: price-touch check через best bid/ask ---
+                            touched, which = self._price_touch_check(sym, side_now, sl_px, tp_px)
+                            if touched:
+                                reason = "sl_hit" if which == "sl" else "tp_hit"
+                                await self._close_position(sym, pos, reason=reason)
+                                if which == "tp":
+                                    self._tp_first_hit_ms[sym] = 0
                                 continue
         except asyncio.CancelledError:
             return
@@ -3493,7 +3478,7 @@ class Worker:
         фолбэки: mark_price -> mid(bid/ask) -> entry_px.
         """
         try:
-            bid, ask = self.hub.best_bid_ask(symbol)
+            bid, ask = self.best_bid_ask(symbol)
         except Exception:
             bid, ask = 0.0, 0.0
 
@@ -3531,7 +3516,7 @@ class Worker:
             return False, ""
 
         try:
-            bid, ask = self.hub.best_bid_ask(symbol)
+            bid, ask = self.best_bid_ask(symbol)
         except Exception:
             bid, ask = 0.0, 0.0
 
@@ -3737,19 +3722,6 @@ class Worker:
                 dist_bps = max(15.0, min(dist_bps, 30.0))
 
             dist = (dist_bps / 1e4) * mid_px
-
-        # --- NEW: жёсткий пол в USD по символам (чтобы expected_risk_usd >= fees)
-        usd_floor_by_sym = {
-            "BTCUSDT": 70.0,   # ~0.075% при ~106k
-            "ETHUSDT": 6.0,   # ~0.28% при ~3.6k
-            "SOLUSDT": 0.25,   # под шум/спред
-        }
-        try:
-            usd_floor = float(usd_floor_by_sym.get(str(sym).upper(), 0.0))
-            if usd_floor > 0:
-                dist = max(dist, usd_floor)
-        except Exception:
-            pass
 
         # квантуем по шагу и уважаем min_stop_ticks
         if dist < step:
