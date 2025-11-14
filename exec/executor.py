@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Literal, Optional, Protocol, Tuple
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 
 logger = logging.getLogger(__name__)
 
@@ -114,14 +115,27 @@ def _round_to_step(
     step: float,
     mode: Literal["down", "up", "nearest"] = "down",
 ) -> float:
+    """
+    Аккуратное квантование до шага step с помощью Decimal, чтобы не ловить
+    0.12300000000000001 и ошибки precision на Binance.
+    """
     if step is None or step <= 0:
         return float(val)
-    v = float(val)
+
+    d = Decimal(str(val))
+    s = Decimal(str(step))
+
     if mode == "down":
-        return math.floor(v / step) * step
-    if mode == "up":
-        return math.ceil(v / step) * step
-    return round(v / step) * step
+        q = (d / s).to_integral_value(rounding=ROUND_DOWN) * s
+    elif mode == "up":
+        q = (d / s).to_integral_value(rounding=ROUND_UP) * s
+    else:  # "nearest"
+        q = (d / s).to_integral_value(rounding=ROUND_HALF_UP) * s
+
+    # гарантируем, что результат кратен шагу и имеет корректное число знаков
+    q = q.quantize(s)
+
+    return float(q)
 
 
 def _round_price_to_tick(px: float, tick: float, side: Side) -> float:
@@ -180,6 +194,72 @@ class Executor:
         tif = (self.c.time_in_force or "").upper()
         if tif in ("GTX", "PO", "POST_ONLY") and not self.c.prefer_maker:
             self.c.prefer_maker = True
+    
+        # ---------------------------------------------------------- Resp normalizer --
+
+    def _to_order_resp(self, raw: Any, *, coid: Optional[str] = None) -> OrderResp:
+        """
+        Унифицируем ответ адаптера:
+        - если уже OrderResp — возвращаем как есть;
+        - если dict — вытаскиваем нужные поля с безопасными фолбэками.
+        Поддерживает и paper, и реальные binance-стайловые ответы.
+        """
+        if isinstance(raw, OrderResp):
+            return raw
+
+        if isinstance(raw, dict):
+            oid = (
+                raw.get("order_id")
+                or raw.get("orderId")
+                or raw.get("client_order_id")
+                or raw.get("clientOrderId")
+                or coid
+                or ""
+            )
+
+            status = str(raw.get("status") or raw.get("origStatus") or "NEW")
+
+            filled = _safe_float(
+                raw.get("filled_qty")
+                or raw.get("executedQty")
+                or raw.get("cumQty")
+                or 0.0
+            )
+
+            avg_px_val = raw.get("avg_px")
+            if avg_px_val is None:
+                # попробуем собрать среднюю из quoteQty, если есть
+                quote_qty = _safe_float(
+                    raw.get("cummulativeQuoteQty")
+                    or raw.get("cumQuote")
+                    or raw.get("quoteQty")
+                    or 0.0
+                )
+                if filled > 0 and quote_qty > 0:
+                    avg_px_val = quote_qty / filled
+
+            avg_px: Optional[float]
+            if avg_px_val is None:
+                avg_px = None
+            else:
+                avg_px = _safe_float(avg_px_val, default=0.0)
+
+            ts = int(
+                raw.get("ts")
+                or raw.get("transactTime")
+                or raw.get("updateTime")
+                or _now_ms()
+            )
+
+            return OrderResp(
+                order_id=str(oid),
+                status=status,  # type: ignore[arg-type]
+                filled_qty=float(filled),
+                avg_px=avg_px,
+                ts=ts,
+            )
+
+        raise TypeError(f"Unsupported order resp type: {type(raw)}")
 
     # ------------------------------------------------------------------ Repo I/O
 
@@ -415,7 +495,8 @@ class Executor:
             + (" reduce_only" if reduce_only else "")
         )
 
-        lim = await self.a.create_order(limit_req)
+        lim_raw = await self.a.create_order(limit_req)
+        lim = self._to_order_resp(lim_raw, coid=limit_coid)
         limit_oid: Optional[str] = lim.order_id
         market_oid: Optional[str] = None
 
@@ -476,7 +557,8 @@ class Executor:
             while time.monotonic() < deadline:
                 await asyncio.sleep(max(0.0, (self.c.poll_ms or 50) / 1000.0))
                 try:
-                    state: OrderResp = await get_order(symbol, limit_coid)  # type: ignore[misc]
+                    state_raw = await get_order(symbol, limit_coid)  # type: ignore[misc]
+                    state = self._to_order_resp(state_raw, coid=limit_coid)
                 except Exception:
                     continue
 
@@ -530,7 +612,8 @@ class Executor:
         if filled_qty < qty_rounded - 1e-12:
             steps.append("limit_cancel")
             with contextlib.suppress(Exception):
-                cancel_resp = await self.a.cancel_order(symbol, limit_coid)
+                cancel_raw = await self.a.cancel_order(symbol, limit_coid)
+                cancel_resp = self._to_order_resp(cancel_raw, coid=limit_coid)
                 part = _safe_float(cancel_resp.filled_qty)
                 avg = _safe_float(cancel_resp.avg_px)
 
@@ -594,7 +677,8 @@ class Executor:
                 status="NEW",
             )
 
-            m = await self.a.create_order(mreq)
+            m_raw = await self.a.create_order(mreq)
+            m = self._to_order_resp(m_raw, coid=market_coid)
             market_oid = m.order_id
 
             if m.status in ("PARTIALLY_FILLED", "FILLED") and m.filled_qty > 0:

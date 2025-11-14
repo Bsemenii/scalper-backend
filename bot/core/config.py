@@ -4,8 +4,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Optional
-
+from typing import Optional, Dict
 from pydantic import BaseModel, Field
 
 
@@ -74,6 +73,11 @@ class AccountCfg(BaseModel):
     starting_equity_usd: float = 1000.0
     leverage: float = 15.0
     min_notional_usd: float = 5.0
+    mode: str = "paper"                     # "paper" или "live"
+    exchange: str = "binance_usdtm"         
+
+    # опционально, чтобы не терять per_symbol_leverage из settings.json
+    per_symbol_leverage: Dict[str, float] = Field(default_factory=dict)
 
 
 class Settings(BaseModel):

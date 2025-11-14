@@ -1,5 +1,5 @@
 {
-  "mode": "paper",
+  "mode": "live",
 
   "symbols": ["BTCUSDT", "ETHUSDT"],
 
@@ -35,7 +35,9 @@
 
     "ev_guard_kR": 0.35,
 
-    "regime": { "vol_window_s": 60 },
+    "regime": {
+      "vol_window_s": 60
+    },
 
     "momentum": {
       "obi_t": 0.003,
@@ -53,9 +55,9 @@
     "cross_guard": {
       "enabled": true,
       "lookback_s": 60,
-      "align_tolerance_bp": 2.5,
-      "dominance_min_bp": 4.0,
-      "single_candidate": true
+      "min_btc_strength_bp": 4.0,
+      "block_on_divergence": true,
+      "prefer_symbol_with_higher_speed": true
     }
   },
 
@@ -90,6 +92,8 @@
   "account": {
     "starting_equity_usd": 1000.0,
     "leverage": 15,
+    "mode": "live",
+    "exchange": "binance_usdtm",
     "per_symbol_leverage": {
       "BTCUSDT": 15,
       "ETHUSDT": 12
@@ -98,7 +102,17 @@
   },
 
   "fees": {
-    "binance_usdtm": { "maker_bps": 2.0, "taker_bps": 4.0 }
+    "binance_usdtm": {
+      "maker_bps": 2.0,
+      "taker_bps": 4.0
+    }
+  },
+
+  "binance_usdtm": {
+    "api_key_env": "BINANCE_API_KEY",
+    "api_secret_env": "BINANCE_API_SECRET",
+    "base_url_env": "BINANCE_FUTURES_BASE_URL",
+    "testnet": false
   },
 
   "log_dir": "./logs",

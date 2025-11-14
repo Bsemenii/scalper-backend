@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+from dotenv import load_dotenv
 import time
 import math
 from dataclasses import dataclass
@@ -12,10 +14,11 @@ from collections import deque
 from typing import Deque
 from contextlib import contextmanager
 from strategy.cross_guard import decide_cross_guard, CrossCfg, pick_best_symbol_by_speed
-
+from adapters.binance_rest import PaperAdapter, BinanceUSDTMAdapter
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
+from bot.core.config import get_settings
 
 from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
@@ -56,6 +59,61 @@ except Exception:
     get_settings = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+load_dotenv()
+
+def _make_executor_for_symbol(sym: str):
+    """
+    Единая точка: решаем, какой исполнитель использовать для символа.
+    mode="paper" -> PaperExecutor
+    mode="live"  -> BinanceUSDTMExecutor (testnet/mainnet зависит от config).
+    """
+    s = get_settings()
+    acc = getattr(s, "account", None)
+    if acc is None:
+        raise RuntimeError("settings.account is not configured")
+
+    mode = getattr(acc, "mode", "paper")
+    exch_name = getattr(acc, "exchange", "binance_usdtm")
+
+    # ---- PAPER MODE ----
+    if str(mode).lower() == "paper":
+        from execution.paper import PaperExecutor  # пример, подставь свой класс
+        logger.info("[exec] %s -> PaperExecutor (mode=paper)", sym)
+        return PaperExecutor(symbol=sym)
+
+    # ---- LIVE BINANCE USDT-M FUTURES ----
+    if exch_name == "binance_usdtm":
+        from execution.binance_usdtm import BinanceUSDTMExecutor  # подставь реальный путь
+
+        bcfg = getattr(s, "binance_usdtm", None)
+        if bcfg is None:
+            raise RuntimeError("settings.binance_usdtm is missing for live mode")
+
+        api_key = os.getenv(getattr(bcfg, "api_key_env", "BINANCE_API_KEY"))
+        api_secret = os.getenv(getattr(bcfg, "api_secret_env", "BINANCE_API_SECRET"))
+        base_url = os.getenv(
+            getattr(bcfg, "base_url_env", "BINANCE_FUTURES_BASE_URL"),
+            "https://fapi.binance.com",
+        )
+        use_testnet = bool(getattr(bcfg, "testnet", False))
+
+        if not api_key or not api_secret:
+            raise RuntimeError("Binance API key/secret are not set in env")
+
+        logger.info(
+            "[exec] %s -> BinanceUSDTMExecutor (mode=live, testnet=%s, base_url=%s)",
+            sym, use_testnet, base_url,
+        )
+
+        return BinanceUSDTMExecutor(
+            symbol=sym,
+            api_key=api_key,
+            api_secret=api_secret,
+            base_url=base_url,
+            testnet=use_testnet,
+        )
+
+    raise RuntimeError(f"Unknown exchange in settings.account.exchange={exch_name!r}")
 
 Side = Literal["BUY", "SELL"]
 
@@ -252,18 +310,26 @@ class Worker:
     # ---------- lifecycle ----------
 
     async def start(self) -> None:
+        """
+        Старт воркера:
+        - читает settings + ENV;
+        - решает, paper или live;
+        - инициализирует Executor'ы с нужным адаптером (PaperAdapter / BinanceUSDTMAdapter);
+        - поднимает WS, коалесер, watchdog и strategy_loop.
+        """
         if self._started:
             return
         self._started = True
 
+        # ---------------------------------------------------
+        # 0. Helper: best bid/ask для Exec'уторов
+        # ---------------------------------------------------
         def _best(sym: str) -> tuple[float, float]:
             return self.hub.best_bid_ask(sym)
-        
-        if self._strat_task is None or self._strat_task.done():
-            loop = asyncio.get_running_loop()
-            self._strat_task = loop.create_task(self._strategy_loop(), name="strategy_loop")
 
-        # --- base defaults ---
+        # ---------------------------------------------------
+        # 1. Базовые дефолты исполнения
+        # ---------------------------------------------------
         limit_offset_ticks = 1
         limit_timeout_ms = 500
         time_in_force = "GTC"
@@ -273,9 +339,14 @@ class Worker:
         fee_bps_taker = 4.0
         prefer_maker = False
 
-        # --- read settings once (if available) ---
+       # ---------------------------------------------------
+        # 2. Читаем settings + режим трейдинга (ТОЛЬКО при старте)
+        # ---------------------------------------------------
         s = None
         exec_cfg = None
+        account_cfg = None
+        binance_cfg = None
+
         if get_settings:
             try:
                 s = get_settings()
@@ -283,8 +354,33 @@ class Worker:
                 s = None
 
         if s is not None:
+            account_cfg = getattr(s, "account", None)
+            binance_cfg = getattr(s, "binance_usdtm", None)
             exec_cfg = getattr(s, "execution", None)
-            if exec_cfg is not None:
+
+        # mode: ТОЛЬКО из settings.account.mode, fallback = "paper"
+        mode = "paper"
+        if account_cfg is not None:
+            try:
+                mode = str(getattr(account_cfg, "mode", "paper") or "paper").lower()
+            except Exception:
+                mode = "paper"
+
+        # exchange: settings.account.exchange или "binance_usdtm"
+        exch_name = "binance_usdtm"
+        if account_cfg is not None:
+            try:
+                exch_name = str(getattr(account_cfg, "exchange", "binance_usdtm") or "binance_usdtm").lower()
+            except Exception:
+                exch_name = "binance_usdtm"
+
+        logger.info("[worker.start] mode=%s, exchange=%s (from settings.json)", mode, exch_name)
+
+        # ---------------------------------------------------
+        # 3. execution-конфиг (лимиты, комиссии, TIF и т.д.)
+        # ---------------------------------------------------
+        if exec_cfg is not None:
+            try:
                 limit_offset_ticks = int(getattr(exec_cfg, "limit_offset_ticks", limit_offset_ticks))
                 limit_timeout_ms   = int(getattr(exec_cfg, "limit_timeout_ms",   limit_timeout_ms))
                 max_slippage_bp    = float(getattr(exec_cfg, "max_slippage_bp",  max_slippage_bp))
@@ -293,32 +389,84 @@ class Worker:
                 fee_bps_maker      = float(getattr(exec_cfg, "fee_bps_maker",    fee_bps_maker))
                 fee_bps_taker      = float(getattr(exec_cfg, "fee_bps_taker",    fee_bps_taker))
                 prefer_maker       = bool(getattr(exec_cfg, "prefer_maker",      prefer_maker))
+            except Exception:
+                logger.exception("[worker.start] failed to read execution config, using defaults")
 
-            # авто-сигналы (обратная совместимость)
+        # auto-сигналы (обратная совместимость)
+        if s is not None:
             strat_cfg = getattr(s, "strategy", None)
             if strat_cfg is not None:
                 self._auto_enabled     = bool(getattr(strat_cfg, "auto_signal_enabled", self._auto_enabled))
                 self._auto_cooldown_ms = int(getattr(strat_cfg, "auto_cooldown_ms",     self._auto_cooldown_ms))
                 self._auto_min_flat_ms = int(getattr(strat_cfg, "auto_min_flat_ms",     self._auto_min_flat_ms))
 
-        # prefer maker if post-only TIF requested
+        # prefer maker, если TIF = post-only
         tif_upper = (time_in_force or "").upper()
         if tif_upper in ("GTX", "PO", "POST_ONLY"):
             prefer_maker = True
 
-        # --- persist flat exec cfg used by helpers (after settings are applied) ---
+        # min_stop_ticks (для стопов / волы)
         try:
-            min_stop_ticks_cfg = int(getattr(exec_cfg, "min_stop_ticks", self._min_stop_ticks_default())) if exec_cfg else self._min_stop_ticks_default()
+            min_stop_ticks_cfg = int(
+                getattr(exec_cfg, "min_stop_ticks", self._min_stop_ticks_default())
+            ) if exec_cfg else self._min_stop_ticks_default()
         except Exception:
             min_stop_ticks_cfg = self._min_stop_ticks_default()
 
+        # сохраняем уплощённый exec_cfg для других методов
         self._exec_cfg = {
             "min_stop_ticks": int(min_stop_ticks_cfg),
             "limit_timeout_ms": int(limit_timeout_ms),
             "time_in_force": str(time_in_force),
         }
 
-        # --- init executors & per-symbol engines ---
+        # ---------------------------------------------------
+        # 4. Настройки Binance из settings + ENV (как в test_binance_testnet)
+        # ---------------------------------------------------
+        # ENV-имена по умолчанию (как в твоём тесте)
+        api_key_env_default = "BINANCE_API_KEY"
+        api_secret_env_default = "BINANCE_API_SECRET"
+        base_url_env_default = "BINANCE_FUTURES_BASE_URL"
+
+        # Если есть binance_usdtm в settings — можно кастомизировать имена env
+        if binance_cfg is not None:
+            api_key_env = getattr(binance_cfg, "api_key_env", api_key_env_default)
+            api_secret_env = getattr(binance_cfg, "api_secret_env", api_secret_env_default)
+            base_url_env = getattr(binance_cfg, "base_url_env", base_url_env_default)
+        else:
+            api_key_env = api_key_env_default
+            api_secret_env = api_secret_env_default
+            base_url_env = base_url_env_default
+
+        # Читаем реальные значения
+        api_key = os.getenv(api_key_env)
+        api_secret = os.getenv(api_secret_env)
+        base_url = os.getenv(base_url_env, "https://demo-fapi.binance.com")
+
+        # testnet-флаг (если нужен дальше в коде)
+        env_testnet_raw = os.getenv("BINANCE_FUTURES_TESTNET", "")
+        use_testnet = False
+        if binance_cfg is not None:
+            # settings.binance_usdtm.testnet имеет приоритет
+            use_testnet = bool(getattr(binance_cfg, "testnet", False))
+        elif env_testnet_raw.lower() in ("1", "true", "yes"):
+            use_testnet = True
+
+        logger.info(
+            "[worker.start] binance cfg: api_key_env=%s, base_url_env=%s, base_url=%s, testnet=%s",
+            api_key_env, base_url_env, base_url, use_testnet,
+        )
+
+        # ---------------------------------------------------
+        # 5. Старт strategy_loop (до инициализации потоков ОК)
+        # ---------------------------------------------------
+        if self._strat_task is None or self._strat_task.done():
+            loop = asyncio.get_running_loop()
+            self._strat_task = loop.create_task(self._strategy_loop(), name="strategy_loop")
+
+        # ---------------------------------------------------
+        # 6. Инициализация executors и движков по символам
+        # ---------------------------------------------------
         for sym in self.symbols:
             spec = self.specs[sym]
 
@@ -334,24 +482,58 @@ class Worker:
                 fee_bps_taker=fee_bps_taker,
             )
 
-            adapter = PaperAdapter(_best, max_slippage_bp=max_slippage_bp)
-            self.execs[sym] = Executor(adapter=adapter, cfg=cfg, get_best=_best)
+            def _best_local(sym_local: str, _self=self):
+                return _self.hub.best_bid_ask(sym_local)
 
-            # стратегия и фичи по символу
+            # --- выбор адаптера ---
+            if mode == "live" and exch_name == "binance_usdtm":
+                if not api_key or not api_secret:
+                    raise RuntimeError(
+                        f"Binance live mode: API key/secret not set "
+                        f"(env {api_key_env} / {api_secret_env})"
+                    )
+
+                from adapters.binance_rest import BinanceUSDTMAdapter
+
+                adapter = BinanceUSDTMAdapter(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    base_url=base_url,
+                )
+                logger.info(
+                    "[worker] %s executor: LIVE binance_usdtm (base_url=%s)",
+                    sym, base_url,
+                )
+            else:
+                from adapters.binance_rest import PaperAdapter
+                adapter = PaperAdapter()
+                logger.info("[worker] %s executor: PAPER mode", sym)
+
+            self.execs[sym] = Executor(
+                adapter=adapter,
+                cfg=cfg,
+                get_best=_best_local,
+            )
+
+            # стратегия / фичи по символу
             self._cand[sym] = self._make_candidate_engine(sym, spec)
 
             if MicroFeatureEngine is not None:
                 self._micro_eng[sym] = MicroFeatureEngine(
                     tick_size=spec.price_tick,
-                    lot_usd=50_000.0,  # можно вынести в конфиг
+                    lot_usd=50_000.0,
                 )
             if IndiEngine is not None:
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
-        # --- start streams/tasks ---
+        # ---------------------------------------------------
+        # 7. Старт WS + коалесер + watchdog
+        # ---------------------------------------------------
         await self.ws.connect(self._on_ws_raw)
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
+
+        logger.info("[worker.start] started with symbols=%s, mode=%s, exchange=%s", self.symbols, mode, exch_name)
 
     async def stop(self) -> None:
         if not self._started:
@@ -2436,8 +2618,6 @@ class Worker:
         try:
             if hasattr(self, "_exec_cfg"):
                 exec_cfg.update(getattr(self, "_exec_cfg") or {})
-            if hasattr(self, "exec") and hasattr(self.exec, "get_policy"):
-                exec_cfg.update(dict(self.exec.get_policy()))
         except Exception:
             pass
         out["exec_cfg"] = exec_cfg
