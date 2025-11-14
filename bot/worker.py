@@ -61,62 +61,6 @@ except Exception:
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-def _make_executor_for_symbol(sym: str):
-    """
-    Единая точка: решаем, какой исполнитель использовать для символа.
-    mode="paper" -> PaperExecutor
-    mode="live"  -> BinanceUSDTMExecutor (testnet/mainnet зависит от config).
-    """
-    s = get_settings()
-    acc = getattr(s, "account", None)
-    if acc is None:
-        raise RuntimeError("settings.account is not configured")
-
-    mode = getattr(acc, "mode", "paper")
-    exch_name = getattr(acc, "exchange", "binance_usdtm")
-
-    # ---- PAPER MODE ----
-    if str(mode).lower() == "paper":
-        from execution.paper import PaperExecutor  # пример, подставь свой класс
-        logger.info("[exec] %s -> PaperExecutor (mode=paper)", sym)
-        return PaperExecutor(symbol=sym)
-
-    # ---- LIVE BINANCE USDT-M FUTURES ----
-    if exch_name == "binance_usdtm":
-        from execution.binance_usdtm import BinanceUSDTMExecutor  # подставь реальный путь
-
-        bcfg = getattr(s, "binance_usdtm", None)
-        if bcfg is None:
-            raise RuntimeError("settings.binance_usdtm is missing for live mode")
-
-        api_key = os.getenv(getattr(bcfg, "api_key_env", "BINANCE_API_KEY"))
-        api_secret = os.getenv(getattr(bcfg, "api_secret_env", "BINANCE_API_SECRET"))
-        base_url = os.getenv(
-            getattr(bcfg, "base_url_env", "BINANCE_FUTURES_BASE_URL"),
-            "https://fapi.binance.com",
-        )
-        use_testnet = bool(getattr(bcfg, "testnet", False))
-
-        if not api_key or not api_secret:
-            raise RuntimeError("Binance API key/secret are not set in env")
-
-        logger.info(
-            "[exec] %s -> BinanceUSDTMExecutor (mode=live, testnet=%s, base_url=%s)",
-            sym, use_testnet, base_url,
-        )
-
-        return BinanceUSDTMExecutor(
-            symbol=sym,
-            api_key=api_key,
-            api_secret=api_secret,
-            base_url=base_url,
-            testnet=use_testnet,
-        )
-
-    raise RuntimeError(f"Unknown exchange in settings.account.exchange={exch_name!r}")
-
-Side = Literal["BUY", "SELL"]
-
 
 # --- вспомогательные структуры ---
 
@@ -305,6 +249,7 @@ class Worker:
         self._tasks: List[asyncio.Task] = []
         self._wd_task: Optional[asyncio.Task] = None   # watchdog / health
         self._strat_task: Optional[asyncio.Task] = None  # авто-стратегия
+        self._exchange_task: Optional[asyncio.Task] = None  # live-guard: консистентность с биржей
         self._started: bool = False
 
     # ---------- lifecycle ----------
@@ -527,6 +472,27 @@ class Worker:
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
         # ---------------------------------------------------
+        # 6.5 Live Binance: sanity-check + margin/leverage + guard-loop
+        # ---------------------------------------------------
+        if mode == "live" and exch_name == "binance_usdtm":
+            # 1) жёсткая проверка, что аккаунт пустой по нашим символам
+            await self._sanity_check_live_start(account_cfg)
+
+            # 2) проставляем marginType и leverage по каждому символу
+            try:
+                await self._apply_margin_and_leverage_live(account_cfg)
+            except Exception as e:
+                logger.warning("[worker.start] apply_margin_and_leverage_live failed: %s", e)
+
+            # 3) запускаем фонового «охранника» консистентности
+            loop = asyncio.get_running_loop()
+            if self._exchange_task is None or self._exchange_task.done():
+                self._exchange_task = loop.create_task(
+                    self._exchange_consistency_loop(),
+                    name="exchange_guard",
+                )
+
+        # ---------------------------------------------------
         # 7. Старт WS + коалесер + watchdog
         # ---------------------------------------------------
         await self.ws.connect(self._on_ws_raw)
@@ -540,28 +506,28 @@ class Worker:
             return
         self._started = False
 
-        if self._strat_task is not None:
-            self._strat_task.cancel()
-            try:
-                await self._strat_task
-            except asyncio.CancelledError:
-                pass
-            self._strat_task = None
-
         # Остановить стратегию
         if self._strat_task:
             self._strat_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._strat_task
             self._strat_task = None
 
         # Остановить watchdog
         if self._wd_task:
             self._wd_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._wd_task
             self._wd_task = None
+        
+        # Остановить exchange-guard
+        if self._exchange_task:
+            self._exchange_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._exchange_task
+            self._exchange_task = None
 
+        # Старое имя таска (если вдруг где-то ещё создаётся) — мягко гасим
         try:
             t = getattr(self, "_watchdog_task", None)
             if t:
@@ -569,7 +535,7 @@ class Worker:
         except Exception:
             pass
 
-        # Остановить коалесцер и WS
+        # Остановить коалесер и WS
         with contextlib.suppress(Exception):
             await self.coal.close()
         with contextlib.suppress(Exception):
@@ -644,6 +610,212 @@ class Worker:
         except Exception:
             # индикаторы не критичны — не роняем пайплайн
             pass
+
+        # ---------- exchange helpers (live Binance integration) ----------
+
+    def _get_live_adapter(self):
+        """
+        Возвращает первый попавшийся BinanceUSDTMAdapter из executors
+        (если мы в live binance_usdtm режиме). Если нет — None.
+        """
+        from adapters.binance_rest import BinanceUSDTMAdapter  # локальный импорт, чтобы не ломать тесты
+
+        for ex in self.execs.values():
+            # в Executor адаптер обычно хранится как .a или .adapter
+            a = getattr(ex, "a", None) or getattr(ex, "adapter", None)
+            if isinstance(a, BinanceUSDTMAdapter):
+                return a
+        return None
+    
+    async def _sanity_check_live_start(self, account_cfg: Any) -> None:
+        """
+        Жёсткая проверка перед стартом live:
+        - по всем self.symbols проверяем, что на Binance НЕТ открытых позиций и ордеров;
+        - если что-то есть — выбрасываем RuntimeError и НЕ стартуем воркер.
+
+        Это гарантирует, что бот никогда не начнёт торговать поверх старого мусора.
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            return  # не live-binance, не о чем говорить
+
+        # --- позиции ---
+        try:
+            if hasattr(adapter, "get_positions"):
+                raw_positions = await adapter.get_positions()
+            else:
+                raw_positions = []
+        except Exception as e:
+            logger.error("[worker.sanity] failed to fetch positions from Binance: %s", e)
+            # в проде лучше упасть, чем торговать вслепую
+            raise RuntimeError(f"Failed to fetch positions from Binance: {e}") from e
+
+        non_flat: List[str] = []
+        sym_set = set(self.symbols)
+        try:
+            for p in raw_positions or []:
+                sym = str(p.get("symbol", "")).upper()
+                if sym not in sym_set:
+                    continue
+                try:
+                    amt = float(p.get("positionAmt") or 0.0)
+                except Exception:
+                    amt = 0.0
+                if abs(amt) > 1e-9:
+                    non_flat.append(f"{sym} amt={amt}")
+        except Exception as e:
+            logger.warning("[worker.sanity] error parsing positions: %s", e)
+
+        # --- открытые ордера ---
+        open_orders_meta: List[str] = []
+        try:
+            if hasattr(adapter, "get_open_orders"):
+                raw_orders = await adapter.get_open_orders()
+            else:
+                raw_orders = []
+        except Exception as e:
+            logger.error("[worker.sanity] failed to fetch open orders from Binance: %s", e)
+            raise RuntimeError(f"Failed to fetch open orders from Binance: {e}") from e
+
+        try:
+            for o in raw_orders or []:
+                sym = str(o.get("symbol", "")).upper()
+                if sym not in sym_set:
+                    continue
+                status = str(o.get("status", "")).upper()
+                if status not in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                    open_orders_meta.append(f"{sym}#{o.get('orderId')}/{status}")
+        except Exception as e:
+            logger.warning("[worker.sanity] error parsing open orders: %s", e)
+
+        if non_flat or open_orders_meta:
+            msg = (
+                "Live start blocked: Binance account is not flat.\n"
+                f"  positions: {', '.join(non_flat) or 'none'}\n"
+                f"  open_orders: {', '.join(open_orders_meta) or 'none'}"
+            )
+            logger.error("[worker.sanity] %s", msg)
+            raise RuntimeError(msg)
+        
+    async def _apply_margin_and_leverage_live(self, account_cfg: Any) -> None:
+        """
+        Для live-binance:
+        - выставляет marginType (ISOLATED/CROSSED) по каждому символу;
+        - выставляет leverage по каждому символу согласно конфигу.
+        Любые ошибки логируются, но не останавливают бота.
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            return
+
+        # margin_mode из settings.account.margin_mode, по умолчанию ISOLATED
+        try:
+            margin_mode = str(getattr(account_cfg, "margin_mode", "ISOLATED") or "ISOLATED").upper()
+        except Exception:
+            margin_mode = "ISOLATED"
+
+        for sym in self.symbols:
+            # --- leverage: per-symbol если есть метод _leverage_for_symbol, иначе общий ---
+            try:
+                if hasattr(self, "_leverage_for_symbol"):
+                    lev = int(self._leverage_for_symbol(sym))
+                else:
+                    lev = int(getattr(self, "_leverage", 10))
+            except Exception:
+                lev = 10
+
+            # marginType
+            try:
+                if hasattr(adapter, "set_margin_type"):
+                    await adapter.set_margin_type(sym, margin_mode)
+            except Exception as e:
+                logger.warning("[worker.live] set_margin_type(%s, %s) failed: %s", sym, margin_mode, e)
+
+            # leverage
+            try:
+                if hasattr(adapter, "set_leverage"):
+                    await adapter.set_leverage(sym, lev)
+            except Exception as e:
+                logger.warning("[worker.live] set_leverage(%s, %s) failed: %s", sym, lev, e)
+
+    async def _exchange_consistency_loop(self) -> None:
+        """
+        Live-guard:
+        - периодически опрашивает Binance позиции (positionRisk);
+        - если по торгуемым символам есть расхождения с self._pos,
+          отключает авто и добавляет блок-реизон.
+        Ничего не чинит автоматически, только стопорит автоторговлю.
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            return
+
+        try:
+            interval_s = 12.0  # можно вынести в конфиг
+            sym_set = set(self.symbols)
+
+            while True:
+                await asyncio.sleep(interval_s)
+
+                # если воркер уже остановлен — выходим
+                if not self._started:
+                    return
+
+                try:
+                    if not hasattr(adapter, "get_positions"):
+                        continue
+                    raw_positions = await adapter.get_positions()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("[exchange_guard] failed to fetch positions: %s", e)
+                    continue
+
+                external_amt: Dict[str, float] = {}
+                try:
+                    for p in raw_positions or []:
+                        sym = str(p.get("symbol", "")).upper()
+                        if sym not in sym_set:
+                            continue
+                        try:
+                            amt = float(p.get("positionAmt") or 0.0)
+                        except Exception:
+                            amt = 0.0
+                        external_amt[sym] = amt
+                except Exception as e:
+                    logger.warning("[exchange_guard] error parsing positions: %s", e)
+                    continue
+
+                mismatches: List[str] = []
+                for sym in self.symbols:
+                    ext_amt = float(external_amt.get(sym, 0.0))
+                    local = self._pos.get(sym)
+                    local_open = bool(local and local.state != "FLAT" and local.qty and local.qty > 0.0)
+
+                    if abs(ext_amt) > 1e-9 and not local_open:
+                        mismatches.append(f"{sym}: ext={ext_amt}, local=FLAT")
+                    # при желании можно проверять и обратный случай:
+                    # local_open, ext_amt ≈ 0 — но это обычно transient.
+
+                if mismatches:
+                    # выключаем авто
+                    if getattr(self, "_auto_enabled", False):
+                        logger.error(
+                            "[exchange_guard] exchange/worker mismatch, disabling auto: %s",
+                            "; ".join(mismatches),
+                        )
+                    self._auto_enabled = False
+                    try:
+                        self._inc_block_reason("GLOBAL:exchange_mismatch")
+                    except Exception:
+                        pass
+
+        except asyncio.CancelledError:
+            logger.info("[exchange_guard] loop cancelled")
+            return
+        except Exception:
+            logger.exception("[exchange_guard] fatal error")
+
 
     # ---------- strategy loop (авто-сигналы) ----------
 
@@ -1984,7 +2156,7 @@ class Worker:
                         # 1) fail-safe timeout if no SL/TP at all
                         if pos.sl_px is None and pos.tp_px is None:
                             if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
-                                await self._paper_close(sym, pos, reason="no_protection")
+                                await self._close_position(sym, pos, reason="no_protection")
                             continue
 
                         # 2) latest price + best bid/ask (для исполнимости)
@@ -2037,7 +2209,7 @@ class Worker:
                             tol = max(price_tick, self._tp_tol_ticks * price_tick)  # тот же толеранс
                             sl_hit = (ask <= sl_px + tol) if side_now == "BUY" else (bid >= sl_px - tol)
                             if sl_hit:
-                                await self._paper_close(sym, pos, reason="sl_hit")
+                                await self._close_position(sym, pos, reason="sl_hit")
                                 self._tp_first_hit_ms[sym] = 0
                                 continue
 
@@ -2067,10 +2239,10 @@ class Worker:
                                             if isinstance(rep, dict) and rep.get("ok"):
                                                 # причина закрытия — tp_hit (а не flatten_forced),
                                                 # чтобы дневная метрика была «чистой»
-                                                await self._paper_close(sym, pos, reason="tp_hit")
+                                                await self._close_position(sym, pos, reason="tp_hit")
                                                 continue
                                         # на всякий: если не получилось — просто закрываем как tp_hit
-                                        await self._paper_close(sym, pos, reason="tp_hit")
+                                        await self._close_position(sym, pos, reason="tp_hit")
                                         continue
                             else:
                                 # ушли от TP — обнуляем окно grace
@@ -2080,23 +2252,80 @@ class Worker:
                         side = pos.side or "BUY"
                         if side == "BUY":
                             if pos.sl_px is not None and px <= pos.sl_px:
-                                await self._paper_close(sym, pos, reason="sl_hit")
+                                await self._close_position(sym, pos, reason="sl_hit")
                                 continue
                             if pos.tp_px is not None and px >= pos.tp_px:
-                                await self._paper_close(sym, pos, reason="tp_hit")
+                                await self._close_position(sym, pos, reason="tp_hit")
                                 continue
                         else:  # SELL
                             if pos.sl_px is not None and px >= pos.sl_px:
-                                await self._paper_close(sym, pos, reason="sl_hit")
+                                await self._close_position(sym, pos, reason="sl_hit")
                                 continue
                             if pos.tp_px is not None and px <= pos.tp_px:
-                                await self._paper_close(sym, pos, reason="tp_hit")
+                                await self._close_position(sym, pos, reason="tp_hit")
                                 continue
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception("watchdog loop error")
+    
+    async def flatten_exchange(self) -> Dict[str, Any]:
+        """
+        Полное аварийное закрытие всех позиций на бирже (Binance USDT-M) по нашим символам.
+        Использует MARKET reduceOnly ордера через адаптер.
+        Использовать осторожно: это прямой слив всех поз по аккаунту.
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            return {"ok": False, "reason": "not_live_binance"}
 
+        try:
+            if not hasattr(adapter, "get_positions"):
+                return {"ok": False, "reason": "adapter_has_no_get_positions"}
+            raw_positions = await adapter.get_positions()
+        except Exception as e:
+            logger.error("[flatten_exchange] failed to fetch positions: %s", e)
+            return {"ok": False, "error": f"failed_to_fetch_positions: {e}"}
+
+        sym_set = set(self.symbols)
+        results: Dict[str, Any] = {}
+
+        for p in raw_positions or []:
+            sym = str(p.get("symbol", "")).upper()
+            if sym not in sym_set:
+                continue
+
+            try:
+                amt = float(p.get("positionAmt") or 0.0)
+            except Exception:
+                amt = 0.0
+
+            if abs(amt) <= 1e-9:
+                continue
+
+            side = "SELL" if amt > 0 else "BUY"
+            qty = abs(amt)
+
+            try:
+                # сигнатуру create_order подстрой под свой адаптер:
+                if hasattr(adapter, "create_order"):
+                    await adapter.create_order(
+                        symbol=sym,
+                        side=side,
+                        type="MARKET",
+                        qty=qty,
+                        reduce_only=True,
+                    )
+                    results[sym] = {"ok": True, "closed_qty": qty, "side": side}
+                else:
+                    results[sym] = {"ok": False, "error": "adapter_has_no_create_order"}
+            except Exception as e:
+                logger.error("[flatten_exchange] close failed for %s: %s", sym, e)
+                results[sym] = {"ok": False, "error": str(e)}
+
+        all_ok = all(v.get("ok", False) for v in results.values()) if results else True
+        return {"ok": all_ok, "results": results}
+        
     async def flatten(self, symbol: str) -> Dict[str, Any]:
         symbol = symbol.upper()
         lock = self._locks[symbol]
@@ -2112,7 +2341,7 @@ class Worker:
                     await self._fsm[symbol].on_flat()
                 return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "no_open_position"}
 
-            await self._paper_close(symbol, pos, reason="flatten_forced")
+            await self._close_position(symbol, pos, reason="flatten_forced")
             return {"ok": True, "symbol": symbol, "state": "FLAT", "reason": "flatten_forced"}
 
     def set_timeout_ms(self, symbol: str, timeout_ms: int) -> Dict[str, Any]:
@@ -2120,16 +2349,17 @@ class Worker:
         self._pos[symbol].timeout_ms = max(5_000, int(timeout_ms))
         return {"ok": True, "symbol": symbol, "timeout_ms": self._pos[symbol].timeout_ms}
 
-    async def _paper_close(self, sym: str, pos: PositionState, *, reason: str) -> None:
+    async def _close_position(self, sym: str, pos: PositionState, *, reason: str) -> None:
         """
-        Безопасное закрытие позиции в paper-режиме.
+        Безопасное закрытие позиции (paper + live).
 
         Правила:
-        - Для sl_hit / tp_hit выходим по уровню SL/TP (строго, без переоценки в -30R).
-        - Для flatten/timeout/no_protection — по консервативной рыночной цене.
-        - Executor.place_exit используем только для получения steps/аудита,
-          но не даём ему ломать целевой уровень SL/TP.
-        - В любом случае в конце приводим состояние к FLAT и обновляем last_flat_ms.
+        - Для sl_hit / tp_hit в учёте PnL используем плановый уровень SL/TP
+          (чтобы не ловить -30R из-за хвоста).
+        - Для flatten/timeout/no_protection — берём консервативную рыночную цену.
+        - Executor.place_exit вызывается всегда (если есть), поэтому на live реально
+          отправляется ордер на выход, а эта функция отвечает за приведение
+          локального стейта к FLAT и корректный учёт сделки.
         """
         side = pos.side
         qty = float(pos.qty or 0.0)
@@ -2647,6 +2877,18 @@ class Worker:
 
         out["strategy_last_error"] = getattr(self, "_last_strategy_error", None)
         out["strategy_heartbeat_ms"] = int(getattr(self, "_strategy_heartbeat_ms", 0) or 0)
+
+        # --- режим торговли / биржа ---
+        try:
+            if get_settings:
+                s = get_settings()
+                acc = getattr(s, "account", object())
+                out["trading_mode"] = str(getattr(acc, "mode", "paper"))
+                out["exchange"] = str(getattr(acc, "exchange", "binance_usdtm"))
+        except Exception:
+            # дефолты, если конфиг не читается
+            out.setdefault("trading_mode", "paper")
+            out.setdefault("exchange", "binance_usdtm")
 
         return out
     

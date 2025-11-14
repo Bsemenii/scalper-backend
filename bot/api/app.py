@@ -57,43 +57,33 @@ def _worker_required() -> Worker:
     return w
 
 def _apply_execution_settings_to_worker(w, s):
-    exec_s = getattr(s, "execution", None)
-    if not exec_s or not w:
+    """
+    Единая точка применения runtime-конфига:
+    просто дергаем Worker.reload_runtime_cfg(), который сам:
+      - перечитывает execution/safety/risk/account из settings,
+      - обновляет _exec_cfg,
+      - разносит политики по всем Executor'ам в w.execs.
+    """
+    if not w:
         return {}
 
-    # что было до
-    before = dict(getattr(w, "_exec_cfg", {}))
-
-    # аккуратно собрать новый exec_cfg
-    new_exec = {
-        "limit_offset_ticks": int(getattr(exec_s, "limit_offset_ticks", before.get("limit_offset_ticks", 0))),
-        "limit_timeout_ms": int(getattr(exec_s, "limit_timeout_ms", before.get("limit_timeout_ms", 500))),
-        "max_slippage_bp": float(getattr(exec_s, "max_slippage_bp", before.get("max_slippage_bp", 4.0))),
-        "time_in_force": str(getattr(exec_s, "time_in_force", before.get("time_in_force", "GTX"))).upper(),
-        "fee_bps_maker": float(getattr(exec_s, "fee_bps_maker", before.get("fee_bps_maker", 2.0))),
-        "fee_bps_taker": float(getattr(exec_s, "fee_bps_taker", before.get("fee_bps_taker", 4.0))),
-        "post_only": bool(getattr(exec_s, "post_only", before.get("post_only", True))),
-        "on_timeout": str(getattr(exec_s, "on_timeout", before.get("on_timeout", "abort"))).lower(),
-        "min_stop_ticks": int(getattr(exec_s, "min_stop_ticks", before.get("min_stop_ticks", 8))),
-    }
-
-    # применить внутрь воркера
-    if hasattr(w, "update_exec_cfg"):
-        w.update_exec_cfg(new_exec)  # если есть метод
-    else:
-        w._exec_cfg = new_exec       # иначе просто положим
-
-    # если есть отдельный исполнитель, синхронизировать и его
-    if hasattr(w, "exec") and hasattr(w.exec, "set_policy"):
-        w.exec.set_policy(
-            time_in_force=new_exec["time_in_force"],
-            post_only=new_exec["post_only"],
-            on_timeout=new_exec["on_timeout"],
-            limit_timeout_ms=new_exec["limit_timeout_ms"],
-            max_slippage_bp=new_exec["max_slippage_bp"],
+    try:
+        snap = w.reload_runtime_cfg()
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning(
+            f"[apply-exec] reload_runtime_cfg failed: {e}"
         )
+        return {}
 
-    return {"execution": {"before": before, "after": new_exec}}
+    # для /status и отладки вернём только exec_cfg из diag()
+    diag = {}
+    if isinstance(snap, dict):
+        diag = snap.get("diag") or snap  # reload_runtime_cfg уже может вернуть diag()
+    exec_cfg = {}
+    if isinstance(diag, dict):
+        exec_cfg = diag.get("exec_cfg", {})
+
+    return {"execution": {"exec_cfg": exec_cfg}}
 
 def _normalize_symbol(symbol: str, allowed: Iterable[str]) -> str:
     sym = symbol.upper()
@@ -523,9 +513,9 @@ def status() -> Dict[str, Any]:
     exec_worker: Optional[Dict[str, Any]] = None
     if w:
         try:
-            exec_worker = dict(getattr(w, "_exec_cfg", {}) or {})
-            if hasattr(w, "exec") and hasattr(w.exec, "get_policy"):
-                exec_worker = {**exec_worker, **dict(w.exec.get_policy())}
+            d_diag = w.diag() or {}
+            # приоритет: то, что вернул diag(), потом — приватное поле
+            exec_worker = dict(d_diag.get("exec_cfg", {}) or getattr(w, "_exec_cfg", {}) or {})
         except Exception:
             exec_worker = None
 
@@ -1193,51 +1183,6 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
             "warnings": warnings or None,
         }
 
-    # ---- 14) реальный запуск (опционально) с принудительной abort-политикой на время вызова ----
-    old_policy = None
-    try:
-        if hasattr(w, "exec") and hasattr(w.exec, "get_policy") and hasattr(w.exec, "set_policy"):
-            old_policy = dict(w.exec.get_policy())
-            w.exec.set_policy(
-                time_in_force="GTX",
-                post_only=True,
-                on_timeout="abort",
-                limit_timeout_ms=int(exec_cfg.get("limit_timeout_ms", 900)),
-                max_slippage_bp=float(exec_cfg.get("max_slippage_bp", 4.0)),
-            )
-    except Exception:
-        warnings.append("force_abort_policy_failed")
-
-    if safety_block:
-        if old_policy is not None:
-            try:
-                w.exec.set_policy(**old_policy)
-            except Exception:
-                pass
-        return {
-            "ok": False, "reason": "safety_pre_block", "symbol": sym, "side": side,
-            "warnings": warnings or None,
-            "safety": {
-                "pre": {"allow": bool(pre_ok.allow), "reasons": pre_ok.reasons},
-                "post": {"allow": bool(post_ok.allow), "reasons": post_ok.reasons},
-            },
-        }
-
-    if not ev_ok:
-        if old_policy is not None:
-            try:
-                w.exec.set_policy(**old_policy)
-            except Exception:
-                pass
-        return {
-            "ok": False, "reason": "ev_guard_block",
-            "symbol": sym, "side": side,
-            "net_profit_usd_est": round(float(net_profit_usd_est), 6),
-            "expected_risk_usd": round(float(expected_risk_usd), 6),
-            "fees_usd_conservative": round(float(est_fees_usd_conservative), 6),
-            "rr_used": float(rr_used),
-        }
-
     try:
         report = await w.place_entry(sym, side, float(qty), int(limit_offset_ticks), sl_distance_px=float(sl_distance_px))
     except TypeError:
@@ -1248,12 +1193,6 @@ async def control_test_entry(req: TestEntryReq) -> Dict[str, Any]:
                 report = await w.place_entry_auto(sym, side)
             else:
                 report = await w.place_entry(sym, side, float(qty))
-
-    if old_policy is not None:
-        try:
-            w.exec.set_policy(**old_policy)
-        except Exception:
-            pass
 
     out: Dict[str, Any] = {
         "ok": True,
