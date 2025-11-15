@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-import asyncio  # <<< нужно для asyncio.TimeoutError
-import hmac
+import asyncio
 import hashlib
-import time
+import hmac
+import json
+import logging
 import ssl
+import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlencode
 
 import aiohttp
 import certifi
-from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------
@@ -25,8 +29,10 @@ class OrderReq:
     Структура запроса на создание ордера.
     Совместима с Binance Futures USDT-M.
 
-    ВАЖНО: exeсutor может передавать сюда объект с полем
-    либо stop_price, либо stop_px — адаптер это учитывает.
+    ВАЖНО:
+    - executor может передавать сюда объект с полем stop_price или stop_px,
+      адаптер это учитывает мягко.
+    - client_order_id используется как newClientOrderId.
     """
 
     symbol: str
@@ -40,9 +46,9 @@ class OrderReq:
     stop_price: Optional[float] = None   # для STOP/TP ордеров
     close_position: bool = False         # для STOP_MARKET / TP_MARKET closePosition=true
 
-    # Мягкий алиас: если кто-то спросит stop_px — вернуть stop_price.
     @property
     def stop_px(self) -> Optional[float]:
+        """Алиас: stop_px == stop_price (для обратной совместимости)."""
         return self.stop_price
 
 
@@ -72,7 +78,7 @@ class BinanceRestError(RuntimeError):
 
 
 # -----------------------------
-#  Binance USDT-M Adapter
+#  Binance USDT-M REST Adapter
 # -----------------------------
 
 
@@ -80,10 +86,9 @@ class BinanceUSDTMAdapter:
     """
     REST-адаптер для Binance USDT-M Futures.
 
-    - Использует aiohttp с SSL-контекстом на базе certifi
-    - Подписывает приватные запросы (ордеры, баланс, аккаунт и т.п.)
-    - Поддерживает основные методы, нужные для прод-бота:
-      баланс, аккаунт, позиции, ордера, плечо, маржин-тип.
+    - aiohttp + SSL-контекст на базе certifi
+    - подписанные запросы (ордеры, аккаунт, позиции, userTrades)
+    - базовые методы: баланс, аккаунт, позиции, ордера, маржа, плечо.
     """
 
     def __init__(
@@ -91,9 +96,16 @@ class BinanceUSDTMAdapter:
         api_key: str,
         api_secret: str,
         base_url: str = "https://fapi.binance.com",
-        recv_window: int = 5_000,
+        recv_window: int = 60_000,
         request_timeout: int = 10,
     ) -> None:
+        """
+        recv_window поднят до 60_000 мс, чтобы уменьшить чувствительность
+        к небольшим расхождениям по времени.
+
+        base_url по умолчанию — основной фьючерсный endpoint.
+        Для тестнета можно передать другой URL извне.
+        """
         self._api_key = api_key
         self._api_secret = api_secret.encode("utf-8")
         self._base_url = base_url.rstrip("/")
@@ -105,12 +117,18 @@ class BinanceUSDTMAdapter:
         # SSL-контекст c certifi, чтобы не было CERTIFICATE_VERIFY_FAILED
         self._ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
+        # Смещение локального времени относительно serverTime Binance (мс)
+        self._time_offset_ms: int = 0
+        # Когда в последний раз синхали время (локальное время, мс)
+        self._last_time_sync_ms: int = 0
+        # Как часто обновлять время (по умолчанию раз в минуту)
+        self._time_sync_interval_ms: int = 60_000
+
     # ---------- Внутренняя инфраструктура ----------
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """
-        Гарантируем, что есть один живой ClientSession
-        с правильным SSL-контекстом.
+        Гарантируем один живой ClientSession с правильным SSL-контекстом.
         """
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(ssl=self._ssl_ctx)
@@ -125,18 +143,76 @@ class BinanceUSDTMAdapter:
             await self._session.close()
             self._session = None
 
+    async def _sync_time(self) -> None:
+        """
+        Жёсткая синхронизация времени с /fapi/v1/time.
+        """
+        url = f"{self._base_url}/fapi/v1/time"
+        sess = await self._ensure_session()
+
+        try:
+            async with sess.get(url, timeout=self._request_timeout) as resp:
+                text = await resp.text()
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning("[binance_rest] time sync non-JSON response: %s", text)
+                    return
+
+                server_time = int(data.get("serverTime"))
+        except Exception as e:
+            logger.warning("[binance_rest] failed to sync time: %s", e)
+            return
+
+        local_ms = int(time.time() * 1000)
+        self._time_offset_ms = server_time - local_ms
+        self._last_time_sync_ms = local_ms
+        logger.info(
+            "[binance_rest] time sync: server=%s local=%s offset_ms=%s",
+            server_time,
+            local_ms,
+            self._time_offset_ms,
+        )
+
+    async def _ensure_time_synced(self) -> None:
+        """
+        Периодически обновляет смещение времени.
+        Вызывается перед важными подписанными запросами и при -1021.
+        """
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_time_sync_ms > self._time_sync_interval_ms:
+            await self._sync_time()
+
     def _sign_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Добавить timestamp, recvWindow и signature к параметрам.
+        Timestamp берётся с учётом _time_offset_ms.
+        ВНИМАНИЕ: не мутирует исходный dict.
         """
         p = dict(params)
-        p.setdefault("timestamp", int(time.time() * 1000))
-        p.setdefault("recvWindow", self._recv_window)
+
+        if "timestamp" not in p:
+            local_ms = int(time.time() * 1000)
+            p["timestamp"] = local_ms + int(self._time_offset_ms)
+
+        if "recvWindow" not in p and self._recv_window:
+            p["recvWindow"] = self._recv_window
 
         query = urlencode(p, doseq=True)
         sig = hmac.new(self._api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
         p["signature"] = sig
         return p
+
+    @staticmethod
+    def _fmt_decimal(x: float) -> str:
+        """
+        Форматирование числа без экспоненты, с сохранением точности.
+        """
+        d = Decimal(str(x))
+        # normalize() убирает лишние нули / экспоненту
+        d = d.normalize()
+        # иногда normalize() может дать экспоненту, форматируем ещё раз
+        return format(d, "f")
 
     async def _request(
         self,
@@ -148,104 +224,141 @@ class BinanceUSDTMAdapter:
         """
         Базовый REST-запрос к Binance Futures.
 
-        - Если signed=True — добавляем подпись (timestamp, recvWindow, signature).
+        - Если signed=True — ensure_time_synced() + подпись.
         - Для GET/DELETE параметры идут в query.
-        - Для POST используем query-параметры (совместимо с Binance).
+        - Для POST тоже используем query-параметры (совместимо с Binance).
+        - При code = -1021 один раз синхронизируем время и повторяем запрос.
+        - При таймаутах/сетевых ошибках — до 2 попыток.
         """
         url = f"{self._base_url}{path}"
         sess = await self._ensure_session()
-        params = params or {}
+        base_params: Dict[str, Any] = dict(params or {})
 
-        if signed:
-            params = self._sign_params(params)
-
-        headers = {}
-        if signed:
+        headers: Dict[str, str] = {}
+        # API-ключ можно слать и для публичных методов — безопасно и удобно
+        if self._api_key:
             headers["X-MBX-APIKEY"] = self._api_key
-        else:
-            if self._api_key:
-                headers["X-MBX-APIKEY"] = self._api_key
 
-        try:
-            async with sess.request(
-                method,
-                url,
-                params=params,
-                headers=headers,
-                timeout=self._request_timeout,
-            ) as resp:
-                text = await resp.text()
-                # Пытаемся распарсить JSON всегда, даже при ошибке
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = None
+        def _prepare_kwargs(p: Dict[str, Any]) -> Dict[str, Any]:
+            # Binance предпочитает query-параметры и для POST/DELETE
+            if method.upper() in ("GET", "DELETE", "POST", "PUT"):
+                return {"params": p}
+            return {"params": p}
 
-                if resp.status != 200:
-                    code = None
-                    msg = None
+        attempt = 0
+        max_attempts = 2  # основная попытка + один ретрай (например, после -1021)
+
+        while True:
+            attempt += 1
+
+            # Подпись/время делаем на КАЖДОМ ретрае, чтобы timestamp всегда был свежий
+            params_to_send = dict(base_params)
+            if signed:
+                await self._ensure_time_synced()
+                params_to_send = self._sign_params(params_to_send)
+
+            kwargs = _prepare_kwargs(params_to_send)
+
+            try:
+                async with sess.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=self._request_timeout,
+                    **kwargs,
+                ) as resp:
+                    text = await resp.text()
+
+                    try:
+                        data: Union[Dict[str, Any], List[Any], str] = json.loads(text)
+                    except json.JSONDecodeError:
+                        data = text
+
+                    if 200 <= resp.status < 300:
+                        # успех
+                        return data  # type: ignore[return-value]
+
+                    # обработка ошибок Binance
+                    binance_code: Optional[int] = None
+                    binance_msg: Optional[str] = None
                     if isinstance(data, dict):
-                        code = data.get("code")
-                        msg = data.get("msg")
+                        try:
+                            binance_code = int(data.get("code")) if "code" in data else None
+                        except Exception:
+                            binance_code = None
+                        if "msg" in data:
+                            binance_msg = str(data.get("msg"))
+
+                    # спец-случай: -1021 (timestamp)
+                    if binance_code == -1021 and attempt < max_attempts:
+                        logger.warning(
+                            "[binance_rest] timestamp error (-1021), syncing time and retrying: %s",
+                            binance_msg,
+                        )
+                        await self._sync_time()
+                        continue
+
+                    msg = f"Binance REST error: {data}"
                     raise BinanceRestError(
-                        message=f"Binance REST error: {text}",
+                        message=msg,
                         http_status=resp.status,
-                        binance_code=code,
-                        binance_msg=msg,
+                        binance_code=binance_code,
+                        binance_msg=binance_msg,
                     )
 
-                if data is None:
-                    raise BinanceRestError(
-                        message=f"Binance REST non-JSON response: {text}",
-                        http_status=resp.status,
-                    )
-
-                return data
-
-        except asyncio.TimeoutError:
-            raise BinanceRestError(
-                message="Binance REST request timeout",
-                http_status=0,
-            )
-
-    @staticmethod
-    def _fmt_decimal(x: float) -> str:
-        """
-        Форматирование числа без экспоненты, с сохранением точности.
-        """
-        d = Decimal(str(x))
-        return format(d.normalize(), "f")
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "[binance_rest] request timeout %s %s params=%s attempt=%s: %s",
+                    method,
+                    path,
+                    base_params,
+                    attempt,
+                    e,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                raise BinanceRestError(
+                    message="Binance REST request timeout",
+                    http_status=0,
+                ) from e
+            except (aiohttp.ClientError, OSError) as e:
+                logger.warning(
+                    "[binance_rest] network error %s %s params=%s attempt=%s: %s",
+                    method,
+                    path,
+                    base_params,
+                    attempt,
+                    e,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                raise BinanceRestError(
+                    message=f"Binance REST network error: {e}",
+                    http_status=0,
+                ) from e
 
     # ---------- Публичные методы адаптера (аккаунт / позиции) ----------
 
     async def get_balance(self) -> List[Dict[str, Any]]:
         """
         /fapi/v2/balance — баланс по активам.
-
-        Обычно интересен USDT:
-          [
-            {
-              "accountAlias": ...,
-              "asset": "USDT",
-              "balance": "1000.00000000",
-              "availableBalance": "1000.00000000",
-              ...
-            },
-            ...
-          ]
+        Возвращает СЫРОЙ ответ Binance (список dict).
         """
         return await self._request("GET", "/fapi/v2/balance", signed=True)  # type: ignore[return-value]
 
     async def get_account(self) -> Dict[str, Any]:
         """
-        /fapi/v2/account — сводная информация по аккаунту:
-        балансы, позиции, маржа, PnL и т.п.
+        /fapi/v2/account — сводная информация по аккаунту.
+        Возвращает СЫРОЙ dict Binance.
         """
         return await self._request("GET", "/fapi/v2/account", signed=True)  # type: ignore[return-value]
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         """
         /fapi/v2/positionRisk — список позиций по всем символам.
+        Возвращает СЫРОЙ список dict.
         """
         return await self._request("GET", "/fapi/v2/positionRisk", signed=True)  # type: ignore[return-value]
 
@@ -260,27 +373,39 @@ class BinanceUSDTMAdapter:
         - STOP_MARKET / TAKE_PROFIT_MARKET (через stopPrice)
         - reduceOnly / closePosition
 
-        ВАЖНО: req может быть любым объектом с нужными атрибутами
-        (qty, price, stop_price/stop_px, и т.д.), не обязательно именно OrderReq.
+        ВАЖНО:
+        - req может быть любым объектом с нужными атрибутами
+          (qty, price, stop_price/stop_px, и т.д.), не обязательно OrderReq.
+        - Возвращает СЫРОЙ ответ Binance.
         """
+        symbol = getattr(req, "symbol")
+        side = getattr(req, "side")
+        otype = getattr(req, "type")
+
         params: Dict[str, Any] = {
-            "symbol": getattr(req, "symbol"),
-            "side": getattr(req, "side"),
-            "type": getattr(req, "type"),
+            "symbol": symbol,
+            "side": side,
+            "type": otype,
         }
 
         qty = getattr(req, "qty", None)
         if qty is not None:
             params["quantity"] = self._fmt_decimal(float(qty))
 
+        # Цена и TIF: корректно обрабатываем, чтобы не слать лишнее
         price = getattr(req, "price", None)
-        if price is not None:
-            params["price"] = self._fmt_decimal(float(price))
-
         tif = getattr(req, "time_in_force", None)
-        if tif is not None:
-            params["timeInForce"] = tif
 
+        otype_upper = str(otype).upper()
+
+        # Для LIMIT и триггерных ордеров указываем price/timeInForce
+        if otype_upper in ("LIMIT", "STOP", "TAKE_PROFIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            if price is not None and otype_upper == "LIMIT":
+                params["price"] = self._fmt_decimal(float(price))
+            if tif is not None and otype_upper == "LIMIT":
+                params["timeInForce"] = tif
+
+        # Для MARKET-ордеров price/TIF не отправляем
         reduce_only = bool(getattr(req, "reduce_only", False))
         if reduce_only:
             params["reduceOnly"] = "true"
@@ -289,19 +414,18 @@ class BinanceUSDTMAdapter:
         if coid:
             params["newClientOrderId"] = coid
 
-        # --- КРИТИЧЕСКОЕ МЕСТО: stop_price / stop_px ---
+        # stop_price / stop_px
         stop_px = getattr(req, "stop_price", None)
         if stop_px is None:
             stop_px = getattr(req, "stop_px", None)
-
         if stop_px is not None:
             params["stopPrice"] = self._fmt_decimal(float(stop_px))
 
         close_position = bool(getattr(req, "close_position", False))
         if close_position:
-            # для STOP_MARKET / TAKE_PROFIT_MARKET
             params["closePosition"] = "true"
 
+        logger.debug("[binance_rest] create_order params=%s", params)
         return await self._request("POST", "/fapi/v1/order", params=params, signed=True)  # type: ignore[return-value]
 
     async def cancel_order(
@@ -313,10 +437,10 @@ class BinanceUSDTMAdapter:
         """
         DELETE /fapi/v1/order — отмена ордера.
         Можно указать либо orderId, либо origClientOrderId.
+
+        Возвращает СЫРОЙ ответ Binance.
         """
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-        }
+        params: Dict[str, Any] = {"symbol": symbol}
 
         if order_id is not None:
             params["orderId"] = order_id
@@ -324,6 +448,7 @@ class BinanceUSDTMAdapter:
         if client_order_id is not None:
             params["origClientOrderId"] = client_order_id
 
+        logger.debug("[binance_rest] cancel_order params=%s", params)
         return await self._request("DELETE", "/fapi/v1/order", params=params, signed=True)  # type: ignore[return-value]
 
     async def get_order(
@@ -334,6 +459,8 @@ class BinanceUSDTMAdapter:
     ) -> Dict[str, Any]:
         """
         GET /fapi/v1/order — получить информацию по конкретному ордеру.
+
+        Возвращает СЫРОЙ dict Binance.
         """
         params: Dict[str, Any] = {"symbol": symbol}
 
@@ -342,6 +469,7 @@ class BinanceUSDTMAdapter:
         if client_order_id is not None:
             params["origClientOrderId"] = client_order_id
 
+        logger.debug("[binance_rest] get_order params=%s", params)
         return await self._request("GET", "/fapi/v1/order", params=params, signed=True)  # type: ignore[return-value]
 
     async def get_open_orders(
@@ -351,12 +479,47 @@ class BinanceUSDTMAdapter:
         """
         GET /fapi/v1/openOrders — список открытых ордеров.
         Можно ограничить одним символом.
+
+        Возвращает СЫРОЙ список dict.
         """
         params: Dict[str, Any] = {}
         if symbol is not None:
             params["symbol"] = symbol
 
+        logger.debug("[binance_rest] get_open_orders params=%s", params)
         return await self._request("GET", "/fapi/v1/openOrders", params=params, signed=True)  # type: ignore[return-value]
+
+    async def get_trades_for_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        from_id: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """
+        GET /fapi/v1/userTrades — список трейдов по символу.
+        Если order_id передан — фильтруем по нему на клиенте.
+
+        Это основной источник правды по комиссиям (commission, commissionAsset)
+        и фактическому PnL.
+
+        Возвращает СЫРОЙ список dict Binance.
+        """
+        params: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+        if from_id is not None:
+            params["fromId"] = from_id
+
+        trades = await self._request("GET", "/fapi/v1/userTrades", params=params, signed=True)  # type: ignore[assignment]
+        if order_id is not None:
+            filtered: List[Dict[str, Any]] = []
+            for t in trades:
+                try:
+                    if int(t.get("orderId", -1)) == int(order_id):
+                        filtered.append(t)
+                except Exception:
+                    continue
+            trades = filtered
+        return trades  # type: ignore[return-value]
 
     # ---------- Публичные методы адаптера (маржа / плечо) ----------
 
@@ -365,21 +528,27 @@ class BinanceUSDTMAdapter:
         POST /fapi/v1/marginType — установка типа маржи для символа.
 
         margin_type: "ISOLATED" или "CROSSED"
+
+        Возвращает СЫРОЙ dict Binance.
         """
         params = {
             "symbol": symbol,
             "marginType": margin_type.upper(),
         }
+        logger.debug("[binance_rest] set_margin_type params=%s", params)
         return await self._request("POST", "/fapi/v1/marginType", params=params, signed=True)  # type: ignore[return-value]
 
     async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """
         POST /fapi/v1/leverage — установка плеча для символа.
+
+        Возвращает СЫРОЙ dict Binance.
         """
         params = {
             "symbol": symbol,
             "leverage": leverage,
         }
+        logger.debug("[binance_rest] set_leverage params=%s", params)
         return await self._request("POST", "/fapi/v1/leverage", params=params, signed=True)  # type: ignore[return-value]
 
 
@@ -392,6 +561,11 @@ class PaperAdapter:
     """
     Простейший paper-адаптер с тем же интерфейсом, что у BinanceUSDTMAdapter.
     Ничего никуда не шлёт, всё в памяти, но имитирует основные ответы.
+
+    ВАЖНО:
+    - Формат ответов максимально похож на Binance.
+    - get_trades_for_order сейчас возвращает пустой список —
+      executor в таком случае fallback'ается на расчёт комиссий по bps.
     """
 
     def __init__(self) -> None:
@@ -451,6 +625,7 @@ class PaperAdapter:
     async def create_order(self, req: Any) -> Dict[str, Any]:
         """
         Paper-версия create_order: имитирует структуру ответа Binance.
+        Для простоты ордера остаются в статусе NEW — исполнением занимается executor.
         """
         self._last_id += 1
         oid = self._last_id
@@ -538,6 +713,22 @@ class PaperAdapter:
                 if symbol is None or od.get("symbol") == symbol:
                     result.append(od)
         return result
+
+    async def get_trades_for_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        from_id: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Paper-версия userTrades: сейчас ничего не эмулируем и возвращаем пустой список.
+
+        Executor, увидев пустой список, сможет fallback'нуться на расчёт комиссий
+        по фиксированным bps. При желании сюда можно прикрутить полноценную симуляцию.
+        """
+        _ = (symbol, order_id, from_id, limit)
+        return []
 
     # ---------- Маржа / плечо ----------
 

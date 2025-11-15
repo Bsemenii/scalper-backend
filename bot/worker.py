@@ -15,6 +15,7 @@ from typing import Deque
 from contextlib import contextmanager
 from strategy.cross_guard import decide_cross_guard, CrossCfg, pick_best_symbol_by_speed
 from adapters.binance_rest import PaperAdapter, BinanceUSDTMAdapter
+from typing import Optional, Dict, Any, Deque, List, Literal
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
@@ -89,14 +90,29 @@ class MarketHub:
 
 @dataclass
 class PositionState:
-    state: str            # "FLAT" | "ENTERING" | "OPEN" | "EXITING"
-    side: Optional[Side]  # BUY/SELL
+    """
+    Runtime-состояние позиции по символу.
+
+    ВАЖНО:
+    - Поля и имена используются по всему Worker'у.
+    - sl_order_id / tp_order_id — это clientOrderId защитных ордеров,
+      которые возвращает Executor.place_bracket().
+    """
+    state: Literal["FLAT", "OPEN", "EXITING"]
+    side: Optional[Side]
     qty: float
     entry_px: float
     sl_px: Optional[float]
     tp_px: Optional[float]
     opened_ts_ms: int
-    timeout_ms: int       # 3–5 мин
+    timeout_ms: int = 180_000
+
+    # id активной сделки в БД (если когда-то начнёшь связывать ордера/трейды)
+    trade_id: Optional[str] = None
+
+    # id защитных ордеров (clientOrderId), чтобы Worker мог их отменять
+    sl_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
 
 
 class Worker:
@@ -1723,130 +1739,276 @@ class Worker:
         tp_px: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Unified entry (prod): сохраняем совместимость.
-        - Если SL/TP не переданы — строим (вола/тик/спред-aware).
-        - Соблюдаем qty step, min notional.
-        - Executor возьмёт maker-first/GTX из конфига, SL reduceOnly STOP_MARKET, TP reduceOnly post-only.
+        Unified entry (LIVE + PAPER).
+
+        Что делает:
+        - нормализует side/qty;
+        - проверяет best bid/ask и min notional;
+        - при необходимости строит SL/TP-план через self._build_sltp_plan();
+        - вызывает Executor.place_entry() (лимит + маркет догон);
+        - при наличии live-адаптера перепроверяет факт входа по Binance
+          через /positionRisk и корректирует filled/price;
+        - навешивает реальные SL/TP-брекеты через Executor.place_bracket();
+        - обновляет runtime-позицию self._pos[symbol] и FSM.
+
+        Возвращает dict:
+        {
+            "ok": bool,
+            "reason": str | None,
+            "symbol": str,
+            "side": "BUY"/"SELL",
+            "qty": float,          # фактически исполненный объём
+            "entry_px": float|None,
+            "sl_px": float|None,
+            "tp_px": float|None,
+            "status": str,         # ExecutionReport.status
+            "steps": list[str],
+        }
         """
-        import contextlib, logging
-        logger = logging.getLogger(__name__ + ".place_entry")
+        import logging, contextlib as _ctx, time
+        from typing import Tuple, Optional, Dict, Any
 
-        sym = symbol.upper()
-        s = side.upper()
+        log = logging.getLogger(__name__ + ".place_entry")
+
+        sym = str(symbol).upper()
+        s = str(side).upper()
         if s not in ("BUY", "SELL"):
-            return {"ok": False, "reason": "bad_side"}
+            return {"ok": False, "reason": "bad_side", "side": side}
 
+        # --- sanity qty ---
+        try:
+            qty = float(qty)
+        except Exception:
+            return {"ok": False, "reason": "bad_qty", "qty": qty}
+        if qty <= 0.0:
+            return {"ok": False, "reason": "qty_le_zero", "qty": qty}
+
+        # --- executor ---
         ex = self.execs.get(sym)
         if ex is None:
-            return {"ok": False, "reason": "no_executor"}
+            return {"ok": False, "reason": "no_executor", "symbol": sym}
 
-        # steps for later fee accounting
-        self._entry_steps.pop(sym, None)
+        # --- best bid/ask и last для приблизительной цены входа ---
+        try:
+            bid, ask = self.best_bid_ask(sym)
+            bid = float(bid or 0.0)
+            ask = float(ask or 0.0)
+        except Exception:
+            bid = ask = 0.0
 
-        # market snapshot
-        bid, ask = self.best_bid_ask(sym)
-        if bid <= 0 or ask <= 0:
-            return {"ok": False, "reason": "no_best_bid_ask"}
-        entry_px = (bid + ask) / 2.0
-        if entry_px <= 0:
-            return {"ok": False, "reason": "bad_entry_px"}
+        last = self.latest_tick(sym) or {}
+        try:
+            last_px = float(last.get("price") or 0.0)
+            last_mark = float(last.get("mark_price") or 0.0)
+        except Exception:
+            last_px = last_mark = 0.0
 
-        # qty step & min notional
-        spec = self.specs.get(sym) if hasattr(self, "specs") else None
-        step = max(float(getattr(spec, "qty_step", 0.001) if spec else 0.001), 1e-12)
-        qty = (int(qty / step)) * step
-        if qty <= 0:
-            return {"ok": False, "reason": "qty_rounded_to_zero"}
+        mid = 0.0
+        if bid > 0.0 and ask > 0.0:
+            mid = (bid + ask) / 2.0
+        elif last_px > 0.0:
+            mid = last_px
+        elif last_mark > 0.0:
+            mid = last_mark
 
+        if mid <= 0.0:
+            # вообще нет цены — лучше безопасно не входить
+            self._inc_block_reason(f"{sym}:no_best")
+            return {"ok": False, "reason": "no_best"}
+
+        # --- проверка minimal notional (в USD) ---
         min_notional = float(getattr(self, "_min_notional_usd", 5.0))
-        if qty * entry_px < min_notional:
-            return {"ok": False, "reason": "below_min_notional", "hint": f"need ≥ ${min_notional}"}
+        notional = abs(qty * mid)
+        if notional < min_notional:
+            return {
+                "ok": False,
+                "reason": "below_min_notional",
+                "notional": float(notional),
+                "min_notional": float(min_notional),
+            }
 
-        # Build SL/TP if needed
-        if sl_px is None or tp_px is None:
+        # --- если SL/TP не заданы явно — строим план через _build_sltp_plan() ---
+        entry_px_plan = mid
+        if (sl_px is None or tp_px is None) and hasattr(self, "_build_sltp_plan"):
             try:
                 plan = self._build_sltp_plan(
                     symbol=sym,
-                    side=s,           # "BUY" / "SELL"
-                    entry_px=entry_px,
-                    qty=qty,
+                    side=s,
+                    entry_px=entry_px_plan,
+                    qty=float(qty),
                     micro=self._last_micro.get(sym),
                     indi=self._last_indi.get(sym),
-                    decision=None,    # или сюда можно передавать info о типе сигнала
+                    decision=None,
                 )
-                sl_px = float(plan.sl_px)
-                tp_px = float(plan.tp_px)
-            except Exception:
-                # старый фолбэк, чтобы не упасть
-                spec = self.specs.get(sym) if hasattr(self, "specs") else None
-                price_tick = float(getattr(spec, "price_tick", 0.1) if spec else 0.1)
-                spread = max(0.0, ask - bid)
-                try:
-                    if sl_distance_px is None or sl_distance_px <= 0:
-                        sl_distance_px = float(
-                            self._compute_vol_stop_distance_px(sym, mid_px=entry_px)
-                        )
-                except Exception:
-                    sl_distance_px = max(12 * price_tick, 2.0 * spread, 6.0 * price_tick)
+                if sl_px is None:
+                    sl_px = float(plan.sl_px)
+                if tp_px is None:
+                    tp_px = float(plan.tp_px)
+            except Exception as e:
+                log.exception("[place_entry] _build_sltp_plan failed for %s %s: %s", sym, s, e)
+                return {"ok": False, "reason": "sltp_plan_failed", "error": str(e)}
 
-                rr = float(self._tp_rr_from_decision(None) or 1.6)
-                if s == "BUY":
-                    sl_px = entry_px - sl_distance_px
-                    tp_px = entry_px + rr * sl_distance_px
-                else:
-                    sl_px = entry_px + sl_distance_px
-                    tp_px = entry_px - rr * sl_distance_px
-
-            # нормализация/округление (если есть утилита)
+        # --- helper: snapshot позиции на бирже (если мы в live-режиме) ---
+        async def _exchange_snapshot() -> Tuple[float, Optional[float]]:
+            """
+            Возвращает (positionAmt, entryPrice) для sym по Binance.
+            Если адаптер не live — (0.0, None).
+            """
+            adapter = self._get_live_adapter()
+            if adapter is None:
+                return 0.0, None
             try:
-                plan_norm = self._normalize_sltp(sym, s, entry_px, SLTPPlan(sl_px=sl_px, tp_px=tp_px, sl_qty=qty, tp_qty=qty))
-                sl_px, tp_px = float(plan_norm.sl_px), float(plan_norm.tp_px)
-            except Exception:
-                pass
+                raw_positions = await adapter.get_positions()
+            except Exception as e:
+                log.warning("[place_entry] get_positions failed for %s: %s", sym, e)
+                return 0.0, None
 
-        # executor overrides (безопасно, опционально)
-        try:
-            ctx_mgr = self._temporary_exec_overrides(sym, limit_offset_ticks=limit_offset_ticks if limit_offset_ticks is not None else None)
-        except Exception:
-            @contextlib.contextmanager
-            def _dummy(): yield
-            ctx_mgr = _dummy()
+            try:
+                for p in raw_positions or []:
+                    psym = str(p.get("symbol", "")).upper()
+                    if psym != sym:
+                        continue
+                    amt = float(p.get("positionAmt") or 0.0)
+                    entry_price = float(p.get("entryPrice") or 0.0)
+                    return amt, (entry_price if entry_price > 0.0 else None)
+            except Exception as e:
+                log.warning("[place_entry] error parsing positionRisk for %s: %s", sym, e)
+            return 0.0, None
 
-        # submit
-        try:
-            with ctx_mgr:
-                rep: ExecutionReport = await ex.place_entry(sym, s, float(qty))
-                self._accumulate_exec_counters(getattr(rep, "steps", []))
-                self._entry_steps[sym] = list(getattr(rep, "steps", []) or [])
-        except Exception as e:
-            logger.exception("[place_entry] executor error for %s %s: %s", sym, s, e)
-            return {"ok": False, "reason": "exec_error", "error": str(e)}
+        # состояние позиции до входа (для live-режима)
+        ext_amt_before, _ = await _exchange_snapshot()
 
-        # update runtime position
+        # --- вызываем Executor.place_entry с временными override-ами конфига ---
+        with self._temporary_exec_overrides(
+            sym,
+            limit_offset_ticks=limit_offset_ticks,
+        ):
+            try:
+                rep = await ex.place_entry(sym, s, qty, reduce_only=False)
+            except Exception as e:
+                log.exception("[place_entry] executor failed for %s %s: %s", sym, s, e)
+                self._inc_block_reason(f"{sym}:entry_error")
+                return {"ok": False, "reason": "entry_error", "error": str(e)}
+
+        # --- steps для метрик ---
+        steps = list(getattr(rep, "steps", []) or [])
+        self._entry_steps[sym] = steps
+        with _ctx.suppress(Exception):
+            self._accumulate_exec_counters(steps)
+
+        # --- разбор ExecutionReport ---
+        filled = float(getattr(rep, "filled_qty", 0.0) or 0.0)
+        status = str(getattr(rep, "status", "CANCELED") or "CANCELED")
+        avg_px = getattr(rep, "avg_px", None)
+
+        limit_oid = getattr(rep, "limit_oid", None)
+        market_oid = getattr(rep, "market_oid", None)
+
+        log.debug(
+            "[place_entry] exec report %s %s: status=%s filled=%.6f avg_px=%s limit_oid=%s market_oid=%s steps=%s",
+            sym, s, status, filled, avg_px, limit_oid, market_oid, steps,
+        )
+
+        # --- дополнительная проверка по Binance: берём правду с биржи, если есть ---
+        ext_amt_after, ext_entry_px = await _exchange_snapshot()
+        delta_ext = abs(ext_amt_after) - abs(ext_amt_before)
+
+        if abs(ext_amt_after) > 1e-9 and abs(delta_ext) > 1e-9:
+            # Биржа говорит, что позиция открыта / увеличена — доверяем ей.
+            real_side = "BUY" if ext_amt_after > 0 else "SELL"
+            real_qty = abs(ext_amt_after)
+            filled = real_qty
+            status = "FILLED"
+            if ext_entry_px is not None and ext_entry_px > 0.0:
+                avg_px = ext_entry_px
+            s = real_side
+
+            log.info(
+                "[place_entry] corrected from exchange for %s: side=%s qty=%.6f entry_px=%s",
+                sym, s, real_qty, avg_px,
+            )
+
+        # если реально ничего не исполнилось — считаем вход отменённым
+        if filled <= 0.0 and status == "CANCELED":
+            self._inc_block_reason(f"{sym}:entry_canceled_no_fill")
+            return {
+                "ok": False,
+                "reason": "entry_canceled_no_fill",
+                "status": status,
+                "steps": steps,
+            }
+
+        # фактически исполненный объём и цена входа
+        filled_qty = float(filled)
+        entry_px_effective = float(avg_px or entry_px_plan or mid)
+
+        # --- обновляем runtime-позицию и навешиваем SL/TP-брекеты ---
+        now_ms = int(time.time() * 1000)
         lock = self._locks[sym]
         async with lock:
+            prev = self._pos.get(sym)
+            timeout_ms = int(getattr(prev, "timeout_ms", 180_000))
+
+            sl_oid: Optional[str] = None
+            tp_oid: Optional[str] = None
+
+            # навешиваем защитные ордера, только если есть что защищать
+            if filled_qty > 0.0 and (sl_px is not None or tp_px is not None):
+                try:
+                    br = await ex.place_bracket(
+                        symbol=sym,
+                        side=s,
+                        qty=filled_qty,
+                        sl_px=sl_px,
+                        tp_px=tp_px,
+                    )
+                    if isinstance(br, dict):
+                        if not br.get("ok", True):
+                            log.warning(
+                                "[place_entry] place_bracket failed for %s %s: %s",
+                                sym, s, br,
+                            )
+                        sl_oid = br.get("sl_order_id") or None
+                        tp_oid = br.get("tp_order_id") or None
+                except Exception as e:
+                    log.warning(
+                        "[place_entry] place_bracket error for %s %s: %s",
+                        sym,
+                        s,
+                        e,
+                    )
+
+            # обновляем runtime-позицию
             self._pos[sym] = PositionState(
                 state="OPEN",
                 side=s,
-                qty=float(qty),
-                entry_px=float(entry_px),
+                qty=filled_qty,
+                entry_px=entry_px_effective,
                 sl_px=float(sl_px) if sl_px is not None else None,
                 tp_px=float(tp_px) if tp_px is not None else None,
-                opened_ts_ms=self._now_ms(),
-                timeout_ms=self._pos[sym].timeout_ms,
+                opened_ts_ms=now_ms,
+                timeout_ms=timeout_ms,
+                trade_id=getattr(prev, "trade_id", None),
+                sl_order_id=sl_oid,
+                tp_order_id=tp_oid,
             )
-            with contextlib.suppress(Exception):
-                await self._fsm[sym].on_open()
+
+            # FSM: переводим в OPEN (best-effort)
+            with _ctx.suppress(Exception):
+                fsm = self._fsm.get(sym)
+                if fsm is not None:
+                    await fsm.on_open()
 
         return {
             "ok": True,
             "symbol": sym,
             "side": s,
-            "qty": float(qty),
-            "entry_px": float(entry_px),
+            "qty": filled_qty,
+            "entry_px": entry_px_effective,
             "sl_px": float(sl_px) if sl_px is not None else None,
             "tp_px": float(tp_px) if tp_px is not None else None,
-            "steps": self._entry_steps.get(sym, [])
+            "status": status,
+            "steps": steps,
         }
 
     async def place_entry_auto(self, symbol: str, side: str) -> dict:
@@ -2132,6 +2294,65 @@ class Worker:
             )
         return rep if isinstance(rep, dict) else {"ok": False, "reason": "bad_report"}
     
+    async def _enter_with_bracket(
+        self,
+        sym: str,
+        side: Side,
+        qty: float,
+        entry_px: float,
+        sl_px: Optional[float],
+        tp_px: Optional[float],
+    ) -> tuple[ExecutionReport, Optional[str], Optional[str]]:
+        """
+        Унифицированный вход:
+        1) всегда сначала делаем фактический вход через Executor.place_entry();
+        2) затем, если доступен Executor.place_bracket(), пытаемся выставить
+           reduce-only SL/TP ордера на бирже;
+        3) возвращаем ExecutionReport по входу + clientOrderId защитных ордеров.
+        """
+        ex = self.execs.get(sym)
+        if ex is None:
+            raise RuntimeError(f"no executor for {sym}")
+
+        # --- 1. Фактический вход (лимит + догон маркетом внутри Executor) ---
+        rep: ExecutionReport = await ex.place_entry(sym, side, float(qty))
+
+        sl_oid: Optional[str] = None
+        tp_oid: Optional[str] = None
+
+        # --- 2. Брекеты reduce-only, если есть API у Executor ---
+        place_bracket = getattr(ex, "place_bracket", None)
+        if callable(place_bracket) and (sl_px or tp_px):
+            try:
+                br = await place_bracket(
+                    sym,
+                    side,
+                    float(qty),
+                    sl_px=float(sl_px) if sl_px else None,
+                    tp_px=float(tp_px) if tp_px else None,
+                )
+                # Executor.place_bracket возвращает dict
+                if isinstance(br, dict) and br.get("ok", False):
+                    sl_oid = br.get("sl_order_id")
+                    tp_oid = br.get("tp_order_id")
+                else:
+                    logger.warning(
+                        "[worker._enter_with_bracket] bracket not ok for %s %s: %s",
+                        sym,
+                        side,
+                        br,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[worker._enter_with_bracket] place_bracket failed for %s %s: %s",
+                    sym,
+                    side,
+                    e,
+                )
+
+        # --- 3. Возвращаем отчёт по входу и id защитных ордеров ---
+        return rep, sl_oid, tp_oid
+    
     # ---------- watchdog / closing / trades ----------
 
     async def _watchdog_loop(self) -> None:
@@ -2215,12 +2436,14 @@ class Worker:
                                 if first <= 0:
                                     # первое касание — запоминаем и (best-effort) ставим reduce-only лимит
                                     self._tp_first_hit_ms[sym] = now_ms
-                                    place_reduce = getattr(self, "place_reduce_only_limit", None)
+
+                                    ex = self.execs.get(sym)
+                                    place_reduce = getattr(ex, "place_reduce_only_limit", None) if ex is not None else None
                                     if callable(place_reduce):
                                         try:
-                                            px = tp_px  # ставим ровно по TP
+                                            px = float(tp_px)
                                             close_side = "SELL" if side_now == "BUY" else "BUY"
-                                            await place_reduce(sym, close_side, float(qty_now), price=float(px))
+                                            await place_reduce(sym, close_side, float(qty_now), price=px)
                                         except Exception:
                                             pass
                                 else:
@@ -2341,10 +2564,13 @@ class Worker:
         Правила:
         - Для sl_hit / tp_hit в учёте PnL используем плановый уровень SL/TP
           (чтобы не ловить -30R из-за хвоста).
-        - Для flatten/timeout/no_protection — берём консервативную рыночную цену.
+        - Для flatten / timeout / no_protection и прочих причин берём
+          консервативную рыночную цену.
         - Executor.place_exit вызывается всегда (если есть), поэтому на live реально
           отправляется ордер на выход, а эта функция отвечает за приведение
           локального стейта к FLAT и корректный учёт сделки.
+        - Если у позиции есть sl_order_id / tp_order_id, best-effort отменяем
+          защитные ордера через Executor (cancel_bracket / cancel_order), если они есть.
         """
         side = pos.side
         qty = float(pos.qty or 0.0)
@@ -2364,6 +2590,9 @@ class Worker:
                 tp_px=None,
                 opened_ts_ms=0,
                 timeout_ms=timeout_ms,
+                # если ты уже добавил поля в PositionState:
+                sl_order_id=None,
+                tp_order_id=None,
             )
             self._entry_steps.pop(sym, None)
             self._last_flat_ms[sym] = self._now_ms()
@@ -2384,18 +2613,41 @@ class Worker:
         exit_steps: List[str] = []
 
         try:
-            # FSM: переходим в EXITING (best-effort)
+            # FSM: переходим в EXITING (best-effort, не роняет воркер)
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_exiting()
 
             ex = self.execs.get(sym)
 
+            # --- NEW: best-effort отмена защитных ордеров на бирже ---
+            # Если у позиции есть реальные SL/TP ордера — попробуем их снять.
+            sl_oid = getattr(pos, "sl_order_id", None)
+            tp_oid = getattr(pos, "tp_order_id", None)
+            if ex is not None and (sl_oid or tp_oid):
+                # 1) Предпочитаем новый API cancel_bracket
+                cancel_bracket = getattr(ex, "cancel_bracket", None)
+                if callable(cancel_bracket):
+                    with contextlib.suppress(Exception):
+                        await cancel_bracket(
+                            sym,
+                            sl_order_id=sl_oid,
+                            tp_order_id=tp_oid,
+                        )
+                else:
+                    # 2) Fallback: по одному через cancel_order, если он есть
+                    cancel_order = getattr(ex, "cancel_order", None)
+                    if callable(cancel_order):
+                        for oid in (sl_oid, tp_oid):
+                            if oid:
+                                with contextlib.suppress(Exception):
+                                    await cancel_order(sym, oid)
+
             # 1) Пытаемся формально вызвать Executor.place_exit (reduce_only) ради steps/аудита.
             if ex is not None:
                 try:
                     rep: ExecutionReport = await ex.place_exit(sym, close_side, qty)
-                    self._accumulate_exec_counters(rep.steps)
-                    exit_steps = list(rep.steps or [])
+                    self._accumulate_exec_counters(getattr(rep, "steps", None) or [])
+                    exit_steps = list(getattr(rep, "steps", []) or [])
                 except Exception:
                     # Не роняем закрытие, просто помечаем.
                     exit_steps = ["exec_exit_error"]
@@ -2435,6 +2687,8 @@ class Worker:
                 tp_px=None,
                 opened_ts_ms=0,
                 timeout_ms=timeout_ms,
+                sl_order_id=None,
+                tp_order_id=None,
             )
             self._entry_steps.pop(sym, None)
             self._last_flat_ms[sym] = self._now_ms()
@@ -3505,34 +3759,56 @@ class Worker:
 
         return float(px or 0.0)
 
-    def _price_touch_check(self, symbol: str, side: Side, sl_px: float | None, tp_px: float | None) -> tuple[bool, str]:
+    def _price_touch_check(
+        self,
+        symbol: str,
+        side: str,
+        sl_px: float | None,
+        tp_px: float | None,
+    ) -> tuple[bool, Optional[str]]:
         """
-        Возвращает (touched, which), где which ∈ {"sl", "tp", ""}.
-        Чекаем касание по bid/ask:
-        - LONG (BUY): SL сработал, если bid <= sl; TP сработал, если ask >= tp.
-        - SHORT(SELL): SL сработал, если ask >= sl; TP сработал, если bid <= tp.
-        """
-        if sl_px is None and tp_px is None:
-            return False, ""
+        Проверка, был ли *исполняемый* триггер по SL/TP с учётом bid/ask.
 
+        Возвращает:
+          (touched: bool, which: "sl" | "tp" | None)
+        """
         try:
             bid, ask = self.best_bid_ask(symbol)
         except Exception:
             bid, ask = 0.0, 0.0
 
+        bid = float(bid or 0.0)
+        ask = float(ask or 0.0)
+
+        touched: bool = False
+        which: Optional[str] = None
+
+        # если вообще нет цен – ничего не трогаем
+        if bid <= 0.0 and ask <= 0.0:
+            return False, None
+
         if side == "BUY":
-            if sl_px is not None and bid > 0 and bid <= float(sl_px):
-                return True, "sl"
-            if tp_px is not None and ask > 0 and ask >= float(tp_px):
-                return True, "tp"
-        else:  # SELL
-            if sl_px is not None and ask > 0 and ask >= float(sl_px):
-                return True, "sl"
-            if tp_px is not None and bid > 0 and bid <= float(tp_px):
-                return True, "tp"
+            # LONG: стоп исполним, когда ask <= SL; тейк – когда bid >= TP
+            if sl_px is not None and ask <= float(sl_px):
+                touched, which = True, "sl"
+            elif tp_px is not None and bid >= float(tp_px):
+                touched, which = True, "tp"
+        elif side == "SELL":
+            # SHORT: стоп исполним, когда bid >= SL; тейк – когда ask <= TP
+            if sl_px is not None and bid >= float(sl_px):
+                touched, which = True, "sl"
+            elif tp_px is not None and ask <= float(tp_px):
+                touched, which = True, "tp"
 
-        return False, ""
+        logger.debug(
+            "[price_touch] %s side=%s bid=%.2f ask=%.2f sl=%s tp=%s touched=%s which=%s",
+            symbol, side, bid, ask,
+            (None if sl_px is None else float(sl_px)),
+            (None if tp_px is None else float(tp_px)),
+            touched, which,
+        )
 
+        return touched, which
 
     def _fee_bps_for_steps(self, steps: List[str]) -> float:
         """
@@ -3864,7 +4140,7 @@ class Worker:
             return 0.0
 
         # --- рынок и цена ---
-        bid, ask = self.hub.best_bid_ask(sym)
+        bid, ask = self.best_bid_ask(sym)
         px = ask if side == "BUY" else bid
         if px <= 0.0:
             return 0.0
