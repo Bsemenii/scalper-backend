@@ -643,6 +643,148 @@ class Worker:
                 return a
         return None
     
+    async def _sync_symbol_from_exchange(self, symbol: str) -> None:
+        """
+        Привести локальный snapshot self._pos[symbol] к фактическому состоянию на бирже.
+
+        - читает /positionRisk
+        - читает /openOrders по symbol
+        - обновляет side / qty / entry_px
+        - подтягивает sl_px / tp_px и sl_order_id / tp_order_id из reduceOnly-ордеров
+
+        Ничего не ломает, если что-то пойдёт не так — просто пишет warning.
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            # paper режим или нет live-адаптера — ничего не делаем
+            return
+
+        sym_u = symbol.upper()
+
+        # --- 1. Читаем позиции ---
+        try:
+            positions = await adapter.get_positions()
+        except Exception as e:
+            logger.warning("[exchange_sync] get_positions failed: %s", e)
+            return
+
+        pos_row = None
+        for p in positions or []:
+            try:
+                if str(p.get("symbol", "")).upper() == sym_u:
+                    pos_row = p
+                    break
+            except Exception:
+                continue
+
+        ext_amt = 0.0
+        entry_px = 0.0
+        side: Optional[str] = None
+
+        if pos_row is not None:
+            try:
+                ext_amt = float(pos_row.get("positionAmt") or 0.0)
+            except Exception:
+                ext_amt = 0.0
+            try:
+                entry_px = float(pos_row.get("entryPrice") or 0.0)
+            except Exception:
+                entry_px = 0.0
+
+            if abs(ext_amt) > 1e-9:
+                side = "BUY" if ext_amt > 0 else "SELL"
+
+        # --- 2. Читаем открытые ордера (чтобы понять SL/TP) ---
+        sl_px: Optional[float] = None
+        tp_px: Optional[float] = None
+        sl_oid: Optional[str] = None
+        tp_oid: Optional[str] = None
+
+        open_orders: list[dict[str, Any]] = []
+        try:
+            open_orders = await adapter.get_open_orders(symbol=sym_u)  # type: ignore[arg-type]
+        except Exception as e:
+            logger.warning("[exchange_sync] get_open_orders(%s) failed: %s", sym_u, e)
+
+        for od in open_orders or []:
+            try:
+                if str(od.get("symbol", "")).upper() != sym_u:
+                    continue
+
+                reduce_only = str(od.get("reduceOnly") or "").lower()
+                if reduce_only not in ("true", "1"):
+                    # нас интересуют только защитные (reduceOnly) ордера
+                    continue
+
+                otype = str(od.get("type") or "")
+                coid = str(od.get("clientOrderId") or "")
+
+                if otype == "STOP_MARKET":
+                    sp = float(od.get("stopPrice") or 0.0)
+                    if sp > 0:
+                        sl_px = sp
+                        sl_oid = coid
+                elif otype in ("TAKE_PROFIT_MARKET", "LIMIT"):
+                    # TP может быть TP_MARKET(stopPrice) или LIMIT(price)
+                    price = float(od.get("stopPrice") or od.get("price") or 0.0)
+                    if price > 0:
+                        tp_px = price
+                        tp_oid = coid
+            except Exception:
+                continue
+
+        # --- 3. Обновляем локальный snapshot ---
+        prev = self._pos.get(sym_u)
+        # таймаут возьмём из предыдущего snapshot'а или дефолт
+        default_timeout_ms = 180_000
+        timeout_ms = prev.timeout_ms if prev is not None else default_timeout_ms
+        trade_id = prev.trade_id if prev is not None else None
+
+        if side is None or abs(ext_amt) <= 1e-9:
+            # Позиции на бирже нет → локально FLAT
+            self._pos[sym_u] = PositionState(
+                state="FLAT",
+                side=None,
+                qty=0.0,
+                entry_px=0.0,
+                sl_px=None,
+                tp_px=None,
+                opened_ts_ms=0,
+                timeout_ms=timeout_ms,
+                trade_id=trade_id,
+                sl_order_id=None,
+                tp_order_id=None,
+            )
+            logger.info("[exchange_sync] %s -> FLAT (no position on exchange)", sym_u)
+        else:
+            # На бирже открыта позиция → подстраиваемся под неё
+            now_ms = _now_ms()
+            opened_ts_ms = prev.opened_ts_ms if (prev is not None and prev.state == "OPEN") else now_ms
+
+            self._pos[sym_u] = PositionState(
+                state="OPEN",
+                side=side,  # type: ignore[arg-type]
+                qty=abs(ext_amt),
+                entry_px=float(entry_px),
+                sl_px=sl_px,
+                tp_px=tp_px,
+                opened_ts_ms=opened_ts_ms,
+                timeout_ms=timeout_ms,
+                trade_id=trade_id,
+                sl_order_id=sl_oid,
+                tp_order_id=tp_oid,
+            )
+
+            logger.warning(
+                "[exchange_sync] %s synced from exchange: side=%s qty=%.6f entry_px=%s sl=%s tp=%s",
+                sym_u,
+                side,
+                abs(ext_amt),
+                entry_px,
+                sl_px,
+                tp_px,
+            )
+
     async def _sanity_check_live_start(self, account_cfg: Any) -> None:
         """
         Жёсткая проверка перед стартом live:
@@ -754,83 +896,111 @@ class Worker:
             except Exception as e:
                 logger.warning("[worker.live] set_leverage(%s, %s) failed: %s", sym, lev, e)
 
-    async def _exchange_consistency_loop(self) -> None:
+    async def _exchange_consistency_loop(
+        self,
+        *,
+        interval_s: float = 10.0,
+    ) -> None:
         """
-        Live-guard:
-        - периодически опрашивает Binance позиции (positionRisk);
-        - если по торгуемым символам есть расхождения с self._pos,
-          отключает авто и добавляет блок-реизон.
-        Ничего не чинит автоматически, только стопорит автоторговлю.
+        Периодическая сверка локального FSM с биржей (positionRisk).
+
+        Новая логика:
+
+        1) Биржа считается источником истины.
+        2) Если ext_amt != local_amt → пробуем auto-sync через _sync_symbol_from_exchange().
+        3) Если после sync всё сошлось → просто логируем и живём дальше.
+        4) Если после sync всё равно mismatch → выключаем авто-режим и отмечаем
+           GLOBAL:exchange_mismatch (как и раньше).
+
+        Это лечит:
+          - ситуацию, когда лимитка исполнилась, а мы подумали, что она "CANCELED"
+            и оставили локально FLAT;
+          - ситуацию после перезапуска, когда на бирже уже есть открытая позиция,
+            а локальный FSM ещё FLAT.
         """
-        adapter = self._get_live_adapter()
-        if adapter is None:
-            return
+        logger.info("[exchange_guard] consistency loop started, interval_s=%s", interval_s)
 
-        try:
-            interval_s = 12.0  # можно вынести в конфиг
-            sym_set = set(self.symbols)
+        while not self._stop_event.is_set():
+            await asyncio.sleep(interval_s)
 
-            while True:
-                await asyncio.sleep(interval_s)
+            adapter = self._get_live_adapter()
+            if adapter is None:
+                # paper или нет live-адаптера — нечего сверять
+                continue
 
-                # если воркер уже остановлен — выходим
-                if not self._started:
-                    return
+            try:
+                positions = await adapter.get_positions()
+            except Exception as e:
+                logger.warning("[exchange_guard] get_positions error: %s", e)
+                continue
 
+            external_amt: dict[str, float] = {}
+            for p in positions or []:
                 try:
-                    if not hasattr(adapter, "get_positions"):
+                    sym = str(p.get("symbol", "")).upper()
+                    if sym not in self.symbols:
                         continue
-                    raw_positions = await adapter.get_positions()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning("[exchange_guard] failed to fetch positions: %s", e)
+                    amt = float(p.get("positionAmt") or 0.0)
+                    external_amt[sym] = amt
+                except Exception:
                     continue
 
-                external_amt: Dict[str, float] = {}
+            mismatches: list[str] = []
+
+            for sym in self.symbols:
+                sym_u = sym.upper()
+                ext_amt = float(external_amt.get(sym_u, 0.0))
+
+                local = self._pos.get(sym_u)
+                local_amt = 0.0
+                if local and local.state != "FLAT" and local.qty > 0:
+                    local_amt = local.qty if local.side == "BUY" else -local.qty
+
+                # Уже совпадает → ок
+                if abs(ext_amt - local_amt) <= 1e-8:
+                    continue
+
+                # --- сначала пытаемся синкануться с биржей ---
                 try:
-                    for p in raw_positions or []:
-                        sym = str(p.get("symbol", "")).upper()
-                        if sym not in sym_set:
-                            continue
-                        try:
-                            amt = float(p.get("positionAmt") or 0.0)
-                        except Exception:
-                            amt = 0.0
-                        external_amt[sym] = amt
-                except Exception as e:
-                    logger.warning("[exchange_guard] error parsing positions: %s", e)
-                    continue
+                    await self._sync_symbol_from_exchange(sym_u)
+                    local2 = self._pos.get(sym_u)
+                    local_amt2 = 0.0
+                    if local2 and local2.state != "FLAT" and local2.qty > 0:
+                        local_amt2 = local2.qty if local2.side == "BUY" else -local2.qty
 
-                mismatches: List[str] = []
-                for sym in self.symbols:
-                    ext_amt = float(external_amt.get(sym, 0.0))
-                    local = self._pos.get(sym)
-                    local_open = bool(local and local.state != "FLAT" and local.qty and local.qty > 0.0)
-
-                    if abs(ext_amt) > 1e-9 and not local_open:
-                        mismatches.append(f"{sym}: ext={ext_amt}, local=FLAT")
-                    # при желании можно проверять и обратный случай:
-                    # local_open, ext_amt ≈ 0 — но это обычно transient.
-
-                if mismatches:
-                    # выключаем авто
-                    if getattr(self, "_auto_enabled", False):
-                        logger.error(
-                            "[exchange_guard] exchange/worker mismatch, disabling auto: %s",
-                            "; ".join(mismatches),
+                    if abs(ext_amt - local_amt2) <= 1e-8:
+                        # auto-heal прошёл успешно
+                        logger.warning(
+                            "[exchange_guard] auto-synced %s: ext=%.6f, local_before=%.6f, local_after=%.6f",
+                            sym_u,
+                            ext_amt,
+                            local_amt,
+                            local_amt2,
                         )
-                    self._auto_enabled = False
-                    try:
-                        self._inc_block_reason("GLOBAL:exchange_mismatch")
-                    except Exception:
-                        pass
+                        continue
+                except Exception as e:
+                    logger.warning("[exchange_guard] auto-sync failed for %s: %s", sym_u, e)
 
-        except asyncio.CancelledError:
-            logger.info("[exchange_guard] loop cancelled")
-            return
-        except Exception:
-            logger.exception("[exchange_guard] fatal error")
+                # Если сюда дошли — mismatch не смогли вылечить
+                mismatches.append(f"{sym_u}: ext={ext_amt}, local={local_amt}")
+
+            if mismatches:
+                msg = ", ".join(mismatches)
+
+                # Выключаем только один раз, чтобы не спамить логами
+                if self._auto_enabled:
+                    logger.error(
+                        "[exchange_guard] exchange/worker mismatch, disabling auto: %s",
+                        msg,
+                    )
+                    self._auto_enabled = False
+
+                try:
+                    self._block_reasons["GLOBAL:exchange_mismatch"] = (
+                        self._block_reasons.get("GLOBAL:exchange_mismatch", 0) + 1
+                    )
+                except Exception:
+                    pass
 
 
     # ---------- strategy loop (авто-сигналы) ----------
