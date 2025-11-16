@@ -89,6 +89,11 @@ class BinanceUSDTMAdapter:
     - aiohttp + SSL-контекст на базе certifi
     - подписанные запросы (ордеры, аккаунт, позиции, userTrades)
     - базовые методы: баланс, аккаунт, позиции, ордера, маржа, плечо.
+
+    ВАЖНО:
+    - интерфейс совместим с текущим executor/worker;
+    - create_order аккуратно обрабатывает типы ордеров и stopPrice/workingType;
+    - все параметры и подпись пересобираются на каждом ретрае.
     """
 
     def __init__(
@@ -98,6 +103,7 @@ class BinanceUSDTMAdapter:
         base_url: str = "https://fapi.binance.com",
         recv_window: int = 60_000,
         request_timeout: int = 10,
+        default_working_type: str = "MARK_PRICE",
     ) -> None:
         """
         recv_window поднят до 60_000 мс, чтобы уменьшить чувствительность
@@ -105,12 +111,18 @@ class BinanceUSDTMAdapter:
 
         base_url по умолчанию — основной фьючерсный endpoint.
         Для тестнета можно передать другой URL извне.
+
+        default_working_type:
+          - "MARK_PRICE" (рекомендуется)
+          - "CONTRACT_PRICE"
+        Используется для стоп-ордеров, если не задан working_type в req.
         """
         self._api_key = api_key
         self._api_secret = api_secret.encode("utf-8")
         self._base_url = base_url.rstrip("/")
         self._recv_window = recv_window
         self._request_timeout = request_timeout
+        self._default_working_type = default_working_type.upper()
 
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -209,10 +221,15 @@ class BinanceUSDTMAdapter:
         Форматирование числа без экспоненты, с сохранением точности.
         """
         d = Decimal(str(x))
-        # normalize() убирает лишние нули / экспоненту
         d = d.normalize()
-        # иногда normalize() может дать экспоненту, форматируем ещё раз
         return format(d, "f")
+
+    @staticmethod
+    def _bool_to_str(v: bool) -> str:
+        """
+        Binance ожидает true/false в query, но в конечном итоге это строки "true"/"false".
+        """
+        return "true" if v else "false"
 
     async def _request(
         self,
@@ -226,7 +243,7 @@ class BinanceUSDTMAdapter:
 
         - Если signed=True — ensure_time_synced() + подпись.
         - Для GET/DELETE параметры идут в query.
-        - Для POST тоже используем query-параметры (совместимо с Binance).
+        - Для POST/PUT тоже используем query-параметры (совместимо с Binance).
         - При code = -1021 один раз синхронизируем время и повторяем запрос.
         - При таймаутах/сетевых ошибках — до 2 попыток.
         """
@@ -241,8 +258,6 @@ class BinanceUSDTMAdapter:
 
         def _prepare_kwargs(p: Dict[str, Any]) -> Dict[str, Any]:
             # Binance предпочитает query-параметры и для POST/DELETE
-            if method.upper() in ("GET", "DELETE", "POST", "PUT"):
-                return {"params": p}
             return {"params": p}
 
         attempt = 0
@@ -362,7 +377,7 @@ class BinanceUSDTMAdapter:
         """
         return await self._request("GET", "/fapi/v2/positionRisk", signed=True)  # type: ignore[return-value]
 
-    # ---------- Публичные методы адаптера (ордеры) ----------
+    # ---------- Ордера ----------
 
     async def create_order(self, req: Any) -> Dict[str, Any]:
         """
@@ -370,46 +385,52 @@ class BinanceUSDTMAdapter:
 
         Поддерживает:
         - LIMIT / MARKET
-        - STOP_MARKET / TAKE_PROFIT_MARKET (через stopPrice)
+        - STOP / TAKE_PROFIT (лимитные)
+        - STOP_MARKET / TAKE_PROFIT_MARKET (маркет по триггеру)
         - reduceOnly / closePosition
+        - workingType (MARK_PRICE / CONTRACT_PRICE) для стопов
 
         ВАЖНО:
         - req может быть любым объектом с нужными атрибутами
-          (qty, price, stop_price/stop_px, и т.д.), не обязательно OrderReq.
+          (qty, price, stop_price/stop_px, time_in_force, reduce_only, close_position, working_type, client_order_id).
         - Возвращает СЫРОЙ ответ Binance.
         """
         symbol = getattr(req, "symbol")
         side = getattr(req, "side")
         otype = getattr(req, "type")
+        otype_upper = str(otype).upper()
 
         params: Dict[str, Any] = {
             "symbol": symbol,
             "side": side,
-            "type": otype,
+            "type": otype_upper,
         }
 
+        # Кол-во
         qty = getattr(req, "qty", None)
         if qty is not None:
             params["quantity"] = self._fmt_decimal(float(qty))
 
-        # Цена и TIF: корректно обрабатываем, чтобы не слать лишнее
+        # Цена и TIF: для LIMIT / STOP / TAKE_PROFIT (лимитные триггеры)
         price = getattr(req, "price", None)
         tif = getattr(req, "time_in_force", None)
+        tif_upper = str(tif).upper() if tif is not None else None
 
-        otype_upper = str(otype).upper()
-
-        # Для LIMIT и триггерных ордеров указываем price/timeInForce
-        if otype_upper in ("LIMIT", "STOP", "TAKE_PROFIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"):
-            if price is not None and otype_upper == "LIMIT":
+        if otype_upper in ("LIMIT", "STOP", "TAKE_PROFIT"):
+            if price is not None:
                 params["price"] = self._fmt_decimal(float(price))
-            if tif is not None and otype_upper == "LIMIT":
-                params["timeInForce"] = tif
+            if tif_upper is not None:
+                params["timeInForce"] = tif_upper
 
-        # Для MARKET-ордеров price/TIF не отправляем
+        # Для MARKET / STOP_MARKET / TAKE_PROFIT_MARKET price/timeInForce НЕ отправляем
+        # (это чистые маркет-ордера по триггеру или немедленные MARKET)
+
+        # reduceOnly
         reduce_only = bool(getattr(req, "reduce_only", False))
         if reduce_only:
-            params["reduceOnly"] = "true"
+            params["reduceOnly"] = self._bool_to_str(True)
 
+        # client order id
         coid = getattr(req, "client_order_id", None)
         if coid:
             params["newClientOrderId"] = coid
@@ -418,12 +439,35 @@ class BinanceUSDTMAdapter:
         stop_px = getattr(req, "stop_price", None)
         if stop_px is None:
             stop_px = getattr(req, "stop_px", None)
-        if stop_px is not None:
-            params["stopPrice"] = self._fmt_decimal(float(stop_px))
 
+        if otype_upper in ("STOP", "TAKE_PROFIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            if stop_px is not None:
+                params["stopPrice"] = self._fmt_decimal(float(stop_px))
+            else:
+                logger.warning(
+                    "[binance_rest] create_order %s %s without stopPrice",
+                    symbol,
+                    otype_upper,
+                )
+
+        # workingType: тип цены для стопа
+        working_type = getattr(req, "working_type", None)
+        if working_type is not None:
+            wt = str(working_type).upper()
+        else:
+            # Если это стоп-ордер и working_type не задан — используем default_working_type
+            if otype_upper in ("STOP", "TAKE_PROFIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                wt = self._default_working_type
+            else:
+                wt = ""
+
+        if wt:
+            params["workingType"] = wt
+
+        # closePosition: только для STOP_MARKET / TAKE_PROFIT_MARKET
         close_position = bool(getattr(req, "close_position", False))
-        if close_position:
-            params["closePosition"] = "true"
+        if close_position and otype_upper in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            params["closePosition"] = self._bool_to_str(True)
 
         logger.debug("[binance_rest] create_order params=%s", params)
         return await self._request("POST", "/fapi/v1/order", params=params, signed=True)  # type: ignore[return-value]

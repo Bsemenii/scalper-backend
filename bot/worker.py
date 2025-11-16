@@ -487,9 +487,7 @@ class Worker:
             if IndiEngine is not None:
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
-        # ---------------------------------------------------
-        # 6.5 Live Binance: sanity-check + margin/leverage + guard-loop
-        # ---------------------------------------------------
+        # 6.5 Live Binance: sanity-check + margin/leverage
         if mode == "live" and exch_name == "binance_usdtm":
             # 1) жёсткая проверка, что аккаунт пустой по нашим символам
             await self._sanity_check_live_start(account_cfg)
@@ -500,14 +498,13 @@ class Worker:
             except Exception as e:
                 logger.warning("[worker.start] apply_margin_and_leverage_live failed: %s", e)
 
-            # 3) запускаем фонового «охранника» консистентности
-            loop = asyncio.get_running_loop()
-            if self._exchange_task is None or self._exchange_task.done():
-                self._exchange_task = loop.create_task(
-                    self._exchange_consistency_loop(),
-                    name="exchange_guard",
-                )
-
+        # 6.6 Exchange-guard: запускаем ВСЕГДА, он сам проверит, есть ли живой Binance
+        loop = asyncio.get_running_loop()
+        if self._exchange_task is None or self._exchange_task.done():
+            self._exchange_task = loop.create_task(
+                self._exchange_consistency_loop(interval_s=1.0),  # делаем 1s вместо 10s
+                name="exchange_guard",
+            )
         # ---------------------------------------------------
         # 7. Старт WS + коалесер + watchdog
         # ---------------------------------------------------
