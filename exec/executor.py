@@ -1051,14 +1051,13 @@ class Executor:
         tag: str,
     ) -> tuple[Optional[OrderResp], Optional[str], Optional[str]]:
         """
-        Универсальная подача reduce_only ордера с fallback.
+        Универсальная подача reduce_only ордера.
 
-        1) Пытаемся отправить req как есть (reduce_only=True).
-        2) Если получили -2022 (ReduceOnly Order is rejected):
-           - логируем,
-           - повторяем ордер без reduce_only (fallback),
-             с новым client_order_id.
-        3) Возвращаем: (resp | None, final_client_order_id | None, fallback_reason | None)
+        ВАЖНО:
+        - Больше НЕ делаем fallback без reduce_only.
+        - Если получили -2022 (ReduceOnly Order is rejected) или похожее сообщение,
+          возвращаем (None, None, "reduce_only_rejected"), а caller решает, что делать.
+        - Это гарантирует, что SL/TP никогда не могут открыть новую позицию.
         """
         symbol = req.symbol
         coid_initial = req.client_order_id or _coid(tag.lower(), symbol)
@@ -1070,11 +1069,10 @@ class Executor:
             return resp, coid_initial, None
         except Exception as e:
             msg = str(e)
-            # пытаемся вытащить binance_code, если это BinanceRestError
             binance_code = getattr(e, "binance_code", None)
 
             logger.warning(
-                "[exec_bracket] %s reduce_only failed for %s coid=%s: %s",
+                "[exec_bracket] %s reduce_only create failed for %s coid=%s: %s",
                 tag,
                 symbol,
                 coid_initial,
@@ -1087,41 +1085,19 @@ class Executor:
             elif "ReduceOnly Order is rejected" in msg or "-2022" in msg:
                 is_reduce_only_error = True
 
-            # Fallback только на специфическую ошибку reduceOnly
             if is_reduce_only_error:
-                coid_fallback = _coid(f"{tag.lower()}-nr", symbol)
-                fallback_req = OrderReq(
-                    symbol=req.symbol,
-                    side=req.side,
-                    type=req.type,
-                    qty=req.qty,
-                    price=req.price,
-                    time_in_force=req.time_in_force,
-                    reduce_only=False,       # КЛЮЧЕВОЕ отличие
-                    client_order_id=coid_fallback,
-                    stop_price=req.stop_price,
-                    close_position=req.close_position,
+                # КЛЮЧЕВОЕ изменение: НЕ делаем fallback без reduce_only,
+                # чтобы не получить новый вход вместо выхода.
+                logger.error(
+                    "[exec_bracket] %s reduce_only rejected for %s coid=%s, no fallback, reason=%s",
+                    tag,
+                    symbol,
+                    coid_initial,
+                    msg,
                 )
-                try:
-                    raw2 = await self.a.create_order(fallback_req)
-                    resp2 = self._to_order_resp(raw2, coid=coid_fallback)
-                    logger.warning(
-                        "[exec_bracket] %s fallback without reduce_only succeeded for %s coid=%s",
-                        tag,
-                        symbol,
-                        coid_fallback,
-                    )
-                    return resp2, coid_fallback, "fallback_no_reduce_only"
-                except Exception as e2:
-                    logger.error(
-                        "[exec_bracket] %s fallback without reduce_only failed for %s: %s",
-                        tag,
-                        symbol,
-                        e2,
-                    )
-                    return None, None, msg
+                return None, None, "reduce_only_rejected"
 
-            # Любая другая ошибка — просто bubbling вверх по логике caller'а.
+            # Любая другая ошибка — bubbling наверх как текст.
             return None, None, msg
 
     # ----------------------------------------------------------------- Brackets --

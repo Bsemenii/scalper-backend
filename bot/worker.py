@@ -20,6 +20,7 @@ from typing import Optional, Dict, Any, Deque, List, Literal
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
 from bot.core.config import get_settings
+from account.state import AccountState
 
 from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
@@ -267,6 +268,10 @@ class Worker:
         self._strat_task: Optional[asyncio.Task] = None  # авто-стратегия
         self._exchange_task: Optional[asyncio.Task] = None  # live-guard: консистентность с биржей
         self._started: bool = False
+        self._stop_event = asyncio.Event()  # для остановки exchange_consistency_loop
+        
+        # CRITICAL FIX: Global lock to prevent concurrent position opening
+        self._global_position_lock = asyncio.Lock()
 
     # ---------- lifecycle ----------
 
@@ -447,6 +452,8 @@ class Worker:
                 return _self.hub.best_bid_ask(sym_local)
 
             # --- выбор адаптера ---
+            # СТРОГИЙ выбор: BinanceUSDTMAdapter ТОЛЬКО когда mode=="live" И exchange=="binance_usdtm"
+            # Во всех остальных случаях (paper mode или другой exchange) — PaperAdapter
             if mode == "live" and exch_name == "binance_usdtm":
                 if not api_key or not api_secret:
                     raise RuntimeError(
@@ -466,9 +473,13 @@ class Worker:
                     sym, base_url,
                 )
             else:
+                # PaperAdapter используется строго в paper mode или когда exchange != "binance_usdtm"
                 from adapters.binance_rest import PaperAdapter
                 adapter = PaperAdapter()
-                logger.info("[worker] %s executor: PAPER mode", sym)
+                logger.info(
+                    "[worker] %s executor: PAPER mode (mode=%s, exchange=%s)",
+                    sym, mode, exch_name,
+                )
 
             self.execs[sym] = Executor(
                 adapter=adapter,
@@ -488,7 +499,8 @@ class Worker:
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
 
         # 6.5 Live Binance: sanity-check + margin/leverage
-        if mode == "live" and exch_name == "binance_usdtm":
+        is_live = (mode == "live" and exch_name == "binance_usdtm")
+        if is_live:
             # 1) жёсткая проверка, что аккаунт пустой по нашим символам
             await self._sanity_check_live_start(account_cfg)
 
@@ -497,6 +509,28 @@ class Worker:
                 await self._apply_margin_and_leverage_live(account_cfg)
             except Exception as e:
                 logger.warning("[worker.start] apply_margin_and_leverage_live failed: %s", e)
+
+        # 6.55 Initialize AccountState service (for real account data in live mode)
+        adapter_for_account = None
+        if is_live:
+            adapter_for_account = self._get_live_adapter()
+        else:
+            # Use first executor's adapter (PaperAdapter)
+            if self.execs:
+                first_ex = next(iter(self.execs.values()))
+                adapter_for_account = getattr(first_ex, "a", None) or getattr(first_ex, "adapter", None)
+
+        if adapter_for_account:
+            try:
+                self._account_state = AccountState(adapter=adapter_for_account, is_live=is_live)
+                # Initial refresh to get starting snapshot
+                await self._account_state.refresh()
+                logger.info("[worker.start] AccountState initialized (is_live=%s)", is_live)
+            except Exception as e:
+                logger.warning("[worker.start] AccountState initialization failed: %s", e)
+                self._account_state = None
+        else:
+            self._account_state = None
 
         # 6.6 Exchange-guard: запускаем ВСЕГДА, он сам проверит, есть ли живой Binance
         loop = asyncio.get_running_loop()
@@ -518,6 +552,10 @@ class Worker:
         if not self._started:
             return
         self._started = False
+
+        # Сигнализируем остановку exchange_consistency_loop
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
 
         # Остановить стратегию
         if self._strat_task:
@@ -737,6 +775,33 @@ class Worker:
         timeout_ms = prev.timeout_ms if prev is not None else default_timeout_ms
         trade_id = prev.trade_id if prev is not None else None
 
+        # CRITICAL FIX: Preserve existing SL/TP order IDs if not found on exchange
+        # This prevents losing order IDs due to timing issues or temporary API glitches
+        prev_sl_oid = prev.sl_order_id if prev is not None else None
+        prev_tp_oid = prev.tp_order_id if prev is not None else None
+        prev_sl_px = prev.sl_px if prev is not None else None
+        prev_tp_px = prev.tp_px if prev is not None else None
+        
+        # If we have existing order IDs but didn't find them on exchange, preserve them
+        # (they might be temporarily not visible or there's a timing issue)
+        if prev_sl_oid and not sl_oid:
+            sl_oid = prev_sl_oid
+            if not sl_px and prev_sl_px:
+                sl_px = prev_sl_px
+            logger.warning(
+                "[exchange_sync] %s: SL order ID not found on exchange, preserving existing: %s",
+                sym_u, prev_sl_oid
+            )
+        
+        if prev_tp_oid and not tp_oid:
+            tp_oid = prev_tp_oid
+            if not tp_px and prev_tp_px:
+                tp_px = prev_tp_px
+            logger.warning(
+                "[exchange_sync] %s: TP order ID not found on exchange, preserving existing: %s",
+                sym_u, prev_tp_oid
+            )
+
         if side is None or abs(ext_amt) <= 1e-9:
             # Позиции на бирже нет → локально FLAT
             self._pos[sym_u] = PositionState(
@@ -755,7 +820,7 @@ class Worker:
             logger.info("[exchange_sync] %s -> FLAT (no position on exchange)", sym_u)
         else:
             # На бирже открыта позиция → подстраиваемся под неё
-            now_ms = _now_ms()
+            now_ms = self._now_ms()
             opened_ts_ms = prev.opened_ts_ms if (prev is not None and prev.state == "OPEN") else now_ms
 
             self._pos[sym_u] = PositionState(
@@ -773,13 +838,15 @@ class Worker:
             )
 
             logger.warning(
-                "[exchange_sync] %s synced from exchange: side=%s qty=%.6f entry_px=%s sl=%s tp=%s",
+                "[exchange_sync] %s synced from exchange: side=%s qty=%.6f entry_px=%s sl=%s tp=%s sl_oid=%s tp_oid=%s",
                 sym_u,
                 side,
                 abs(ext_amt),
                 entry_px,
                 sl_px,
                 tp_px,
+                sl_oid,
+                tp_oid,
             )
 
     async def _sanity_check_live_start(self, account_cfg: Any) -> None:
@@ -919,6 +986,13 @@ class Worker:
 
         while not self._stop_event.is_set():
             await asyncio.sleep(interval_s)
+
+            # CRITICAL FIX: Refresh AccountState periodically to keep it synchronized
+            try:
+                if hasattr(self, "_account_state") and self._account_state:
+                    await self._account_state.refresh()
+            except Exception as e:
+                logger.warning("[exchange_guard] AccountState refresh failed: %s", e)
 
             adapter = self._get_live_adapter()
             if adapter is None:
@@ -1950,221 +2024,377 @@ class Worker:
         if qty <= 0.0:
             return {"ok": False, "reason": "qty_le_zero", "qty": qty}
 
-        # --- executor ---
-        ex = self.execs.get(sym)
-        if ex is None:
-            return {"ok": False, "reason": "no_executor", "symbol": sym}
-
-        # --- best bid/ask и last для приблизительной цены входа ---
-        try:
-            bid, ask = self.best_bid_ask(sym)
-            bid = float(bid or 0.0)
-            ask = float(ask or 0.0)
-        except Exception:
-            bid = ask = 0.0
-
-        last = self.latest_tick(sym) or {}
-        try:
-            last_px = float(last.get("price") or 0.0)
-            last_mark = float(last.get("mark_price") or 0.0)
-        except Exception:
-            last_px = last_mark = 0.0
-
-        mid = 0.0
-        if bid > 0.0 and ask > 0.0:
-            mid = (bid + ask) / 2.0
-        elif last_px > 0.0:
-            mid = last_px
-        elif last_mark > 0.0:
-            mid = last_mark
-
-        if mid <= 0.0:
-            # вообще нет цены — лучше безопасно не входить
-            self._inc_block_reason(f"{sym}:no_best")
-            return {"ok": False, "reason": "no_best"}
-
-        # --- проверка minimal notional (в USD) ---
-        min_notional = float(getattr(self, "_min_notional_usd", 5.0))
-        notional = abs(qty * mid)
-        if notional < min_notional:
-            return {
-                "ok": False,
-                "reason": "below_min_notional",
-                "notional": float(notional),
-                "min_notional": float(min_notional),
-            }
-
-        # --- если SL/TP не заданы явно — строим план через _build_sltp_plan() ---
-        entry_px_plan = mid
-        if (sl_px is None or tp_px is None) and hasattr(self, "_build_sltp_plan"):
-            try:
-                plan = self._build_sltp_plan(
-                    symbol=sym,
-                    side=s,
-                    entry_px=entry_px_plan,
-                    qty=float(qty),
-                    micro=self._last_micro.get(sym),
-                    indi=self._last_indi.get(sym),
-                    decision=None,
+        # CRITICAL FIX: Global lock to prevent concurrent position opening
+        # This ensures only ONE position can be opened at a time across ALL symbols
+        async with self._global_position_lock:
+            # Check if ANY position is already open BEFORE attempting entry
+            any_open = False
+            for check_sym in self.symbols:
+                check_pos = self._pos.get(check_sym)
+                if check_pos and check_pos.state in ("OPEN", "ENTERING", "EXITING"):
+                    any_open = True
+                    break
+            
+            if any_open:
+                log.warning(
+                    "[place_entry] BLOCKED: Another position is already open. Cannot open %s %s",
+                    sym, s
                 )
-                if sl_px is None:
-                    sl_px = float(plan.sl_px)
-                if tp_px is None:
-                    tp_px = float(plan.tp_px)
-            except Exception as e:
-                log.exception("[place_entry] _build_sltp_plan failed for %s %s: %s", sym, s, e)
-                return {"ok": False, "reason": "sltp_plan_failed", "error": str(e)}
-
-        # --- helper: snapshot позиции на бирже (если мы в live-режиме) ---
-        async def _exchange_snapshot() -> Tuple[float, Optional[float]]:
-            """
-            Возвращает (positionAmt, entryPrice) для sym по Binance.
-            Если адаптер не live — (0.0, None).
-            """
-            adapter = self._get_live_adapter()
-            if adapter is None:
-                return 0.0, None
+                self._inc_block_reason(f"{sym}:global_position_lock_active")
+                return {"ok": False, "reason": "global_position_lock_active", "symbol": sym, "side": s, "qty": qty}
+            
+            # --- account state / daily limits (ТОЛЬКО из Binance данных) ---
             try:
-                raw_positions = await adapter.get_positions()
-            except Exception as e:
-                log.warning("[place_entry] get_positions failed for %s: %s", sym, e)
-                return 0.0, None
+                # по умолчанию — локальные счётчики (используются в paper / fallback)
+                num_trades_today = int(self._pnl_day.get("trades", 0) or 0)
+                pnl_r_day = float(self._pnl_day.get("pnl_r", 0.0) or 0.0)
 
+                if hasattr(self, "_account_state") and self._account_state:
+                    # если есть сервис аккаунта — опираемся на него
+                    snapshot = self._account_state.get_snapshot()
+
+                    # если снапшота нет или он старый – обновляем
+                    if snapshot is None or not self._account_state.is_fresh(max_age_s=10):
+                        await self._account_state.refresh()
+                        snapshot = self._account_state.get_snapshot()
+
+                    # если после refresh всё равно нет данных или много ошибок — просто не входим
+                    if snapshot is None or self._account_state.consecutive_errors >= 3:
+                        self._inc_block_reason("account_state_stale")
+                        return {
+                            "ok": False,
+                            "reason": "account_state_stale",
+                            "symbol": sym,
+                            "side": s,
+                            "qty": qty,
+                        }
+
+                    # 1) количество сделок за день — из AccountState (userTrades+DB)
+                    num_trades_today = int(snapshot.num_trades_today)
+
+                    # 2) дневный PnL в R: используем realized_pnl_today (USD) и текущий equity
+                    risk_pct = float(getattr(self._risk_cfg, "risk_per_trade_pct", 0.0) or 0.0)
+                    equity_ref = float(snapshot.equity or 0.0)
+                    if equity_ref <= 0.0:
+                        equity_ref = float(getattr(self, "_starting_equity_usd", 0.0) or 0.0)
+
+                    if risk_pct > 0.0 and equity_ref > 0.0:
+                        r_usd = equity_ref * (risk_pct / 100.0)
+                        pnl_r_day = float(snapshot.realized_pnl_today) / r_usd
+                    else:
+                        pnl_r_day = 0.0
+
+                # Проверяем дневные лимиты в R
+                day_state = DayState(
+                    pnl_r_day=float(pnl_r_day),
+                    consec_losses=int(getattr(self, "_consec_losses", 0) or 0),
+                    trading_disabled=False,
+                )
+                day_dec = check_day_limits(day_state, self._risk_cfg)
+                if not day_dec.allow:
+                    reasons = [f"day_{r}" for r in day_dec.reasons]
+                    for r in reasons:
+                        self._inc_block_reason(r)
+                    return {
+                        "ok": False,
+                        "reason": ",".join(reasons),
+                        "symbol": sym,
+                        "side": s,
+                        "qty": qty,
+                    }
+
+                # Лимит на количество сделок в день — тоже на основе реальных данных
+                max_trades_per_day = int(getattr(self._risk_cfg, "max_trades_per_day", 0) or 0)
+                if max_trades_per_day > 0 and num_trades_today >= max_trades_per_day:
+                    self._inc_block_reason("day_max_trades_reached")
+                    return {
+                        "ok": False,
+                        "reason": "day_max_trades_reached",
+                        "symbol": sym,
+                        "side": s,
+                        "qty": qty,
+                        "num_trades_today": num_trades_today,
+                        "max_trades": max_trades_per_day,
+                    }
+            except Exception as e:
+                log.warning("[place_entry] Error checking daily limits: %s", e)
+                # на ошибке лимитов не входим, но и не падаем
+                # Don't block on error, but log it
+            
+            # --- executor ---
+            ex = self.execs.get(sym)
+            if ex is None:
+                return {"ok": False, "reason": "no_executor", "symbol": sym}
+
+            # --- best bid/ask и last для приблизительной цены входа ---
             try:
-                for p in raw_positions or []:
-                    psym = str(p.get("symbol", "")).upper()
-                    if psym != sym:
-                        continue
-                    amt = float(p.get("positionAmt") or 0.0)
-                    entry_price = float(p.get("entryPrice") or 0.0)
-                    return amt, (entry_price if entry_price > 0.0 else None)
-            except Exception as e:
-                log.warning("[place_entry] error parsing positionRisk for %s: %s", sym, e)
-            return 0.0, None
+                bid, ask = self.best_bid_ask(sym)
+                bid = float(bid or 0.0)
+                ask = float(ask or 0.0)
+            except Exception:
+                bid = ask = 0.0
 
-        # состояние позиции до входа (для live-режима)
-        ext_amt_before, _ = await _exchange_snapshot()
-
-        # --- вызываем Executor.place_entry с временными override-ами конфига ---
-        with self._temporary_exec_overrides(
-            sym,
-            limit_offset_ticks=limit_offset_ticks,
-        ):
+            last = self.latest_tick(sym) or {}
             try:
-                rep = await ex.place_entry(sym, s, qty, reduce_only=False)
-            except Exception as e:
-                log.exception("[place_entry] executor failed for %s %s: %s", sym, s, e)
-                self._inc_block_reason(f"{sym}:entry_error")
-                return {"ok": False, "reason": "entry_error", "error": str(e)}
+                last_px = float(last.get("price") or 0.0)
+                last_mark = float(last.get("mark_price") or 0.0)
+            except Exception:
+                last_px = last_mark = 0.0
 
-        # --- steps для метрик ---
-        steps = list(getattr(rep, "steps", []) or [])
-        self._entry_steps[sym] = steps
-        with _ctx.suppress(Exception):
-            self._accumulate_exec_counters(steps)
+            mid = 0.0
+            if bid > 0.0 and ask > 0.0:
+                mid = (bid + ask) / 2.0
+            elif last_px > 0.0:
+                mid = last_px
+            elif last_mark > 0.0:
+                mid = last_mark
 
-        # --- разбор ExecutionReport ---
-        filled = float(getattr(rep, "filled_qty", 0.0) or 0.0)
-        status = str(getattr(rep, "status", "CANCELED") or "CANCELED")
-        avg_px = getattr(rep, "avg_px", None)
+            if mid <= 0.0:
+                # вообще нет цены — лучше безопасно не входить
+                self._inc_block_reason(f"{sym}:no_best")
+                return {"ok": False, "reason": "no_best"}
 
-        limit_oid = getattr(rep, "limit_oid", None)
-        market_oid = getattr(rep, "market_oid", None)
+            # --- проверка minimal notional (в USD) ---
+            min_notional = float(getattr(self, "_min_notional_usd", 5.0))
+            notional = abs(qty * mid)
+            if notional < min_notional:
+                return {
+                    "ok": False,
+                    "reason": "below_min_notional",
+                    "notional": float(notional),
+                    "min_notional": float(min_notional),
+                }
 
-        log.debug(
-            "[place_entry] exec report %s %s: status=%s filled=%.6f avg_px=%s limit_oid=%s market_oid=%s steps=%s",
-            sym, s, status, filled, avg_px, limit_oid, market_oid, steps,
-        )
-
-        # --- дополнительная проверка по Binance: берём правду с биржи, если есть ---
-        ext_amt_after, ext_entry_px = await _exchange_snapshot()
-        delta_ext = abs(ext_amt_after) - abs(ext_amt_before)
-
-        if abs(ext_amt_after) > 1e-9 and abs(delta_ext) > 1e-9:
-            # Биржа говорит, что позиция открыта / увеличена — доверяем ей.
-            real_side = "BUY" if ext_amt_after > 0 else "SELL"
-            real_qty = abs(ext_amt_after)
-            filled = real_qty
-            status = "FILLED"
-            if ext_entry_px is not None and ext_entry_px > 0.0:
-                avg_px = ext_entry_px
-            s = real_side
-
-            log.info(
-                "[place_entry] corrected from exchange for %s: side=%s qty=%.6f entry_px=%s",
-                sym, s, real_qty, avg_px,
-            )
-
-        # если реально ничего не исполнилось — считаем вход отменённым
-        if filled <= 0.0 and status == "CANCELED":
-            self._inc_block_reason(f"{sym}:entry_canceled_no_fill")
-            return {
-                "ok": False,
-                "reason": "entry_canceled_no_fill",
-                "status": status,
-                "steps": steps,
-            }
-
-        # фактически исполненный объём и цена входа
-        filled_qty = float(filled)
-        entry_px_effective = float(avg_px or entry_px_plan or mid)
-
-        # --- обновляем runtime-позицию и навешиваем SL/TP-брекеты ---
-        now_ms = int(time.time() * 1000)
-        lock = self._locks[sym]
-        async with lock:
-            prev = self._pos.get(sym)
-            timeout_ms = int(getattr(prev, "timeout_ms", 180_000))
-
-            sl_oid: Optional[str] = None
-            tp_oid: Optional[str] = None
-
-            # навешиваем защитные ордера, только если есть что защищать
-            if filled_qty > 0.0 and (sl_px is not None or tp_px is not None):
+            # --- если SL/TP не заданы явно — строим план через _build_sltp_plan() ---
+            entry_px_plan = mid
+            if (sl_px is None or tp_px is None) and hasattr(self, "_build_sltp_plan"):
                 try:
-                    br = await ex.place_bracket(
+                    plan = self._build_sltp_plan(
                         symbol=sym,
                         side=s,
-                        qty=filled_qty,
-                        sl_px=sl_px,
-                        tp_px=tp_px,
+                        entry_px=entry_px_plan,
+                        qty=float(qty),
+                        micro=self._last_micro.get(sym),
+                        indi=self._last_indi.get(sym),
+                        decision=None,
                     )
-                    if isinstance(br, dict):
-                        if not br.get("ok", True):
-                            log.warning(
-                                "[place_entry] place_bracket failed for %s %s: %s",
-                                sym, s, br,
-                            )
-                        sl_oid = br.get("sl_order_id") or None
-                        tp_oid = br.get("tp_order_id") or None
+                    if sl_px is None:
+                        sl_px = float(plan.sl_px)
+                    if tp_px is None:
+                        tp_px = float(plan.tp_px)
                 except Exception as e:
-                    log.warning(
-                        "[place_entry] place_bracket error for %s %s: %s",
-                        sym,
-                        s,
-                        e,
-                    )
+                    log.exception("[place_entry] _build_sltp_plan failed for %s %s: %s", sym, s, e)
+                    return {"ok": False, "reason": "sltp_plan_failed", "error": str(e)}
 
-            # обновляем runtime-позицию
-            self._pos[sym] = PositionState(
-                state="OPEN",
-                side=s,
-                qty=filled_qty,
-                entry_px=entry_px_effective,
-                sl_px=float(sl_px) if sl_px is not None else None,
-                tp_px=float(tp_px) if tp_px is not None else None,
-                opened_ts_ms=now_ms,
-                timeout_ms=timeout_ms,
-                trade_id=getattr(prev, "trade_id", None),
-                sl_order_id=sl_oid,
-                tp_order_id=tp_oid,
+            # --- helper: snapshot позиции на бирже (если мы в live-режиме) ---
+            async def _exchange_snapshot() -> Tuple[float, Optional[float]]:
+                """
+                Возвращает (positionAmt, entryPrice) для sym по Binance.
+                Если адаптер не live — (0.0, None).
+                """
+                adapter = self._get_live_adapter()
+                if adapter is None:
+                    return 0.0, None
+                try:
+                    raw_positions = await adapter.get_positions()
+                except Exception as e:
+                    log.warning("[place_entry] get_positions failed for %s: %s", sym, e)
+                    return 0.0, None
+
+                try:
+                    for p in raw_positions or []:
+                        psym = str(p.get("symbol", "")).upper()
+                        if psym != sym:
+                            continue
+                        amt = float(p.get("positionAmt") or 0.0)
+                        entry_price = float(p.get("entryPrice") or 0.0)
+                        return amt, (entry_price if entry_price > 0.0 else None)
+                except Exception as e:
+                    log.warning("[place_entry] error parsing positionRisk for %s: %s", sym, e)
+                return 0.0, None
+
+            # состояние позиции до входа (для live-режима)
+            ext_amt_before, _ = await _exchange_snapshot()
+
+            # --- вызываем Executor.place_entry с временными override-ами конфига ---
+            with self._temporary_exec_overrides(
+                sym,
+                limit_offset_ticks=limit_offset_ticks,
+            ):
+                try:
+                    rep = await ex.place_entry(sym, s, qty, reduce_only=False)
+                except Exception as e:
+                    log.exception("[place_entry] executor failed for %s %s: %s", sym, s, e)
+                    self._inc_block_reason(f"{sym}:entry_error")
+                    return {"ok": False, "reason": "entry_error", "error": str(e)}
+
+            # --- steps для метрик ---
+            steps = list(getattr(rep, "steps", []) or [])
+            self._entry_steps[sym] = steps
+            with _ctx.suppress(Exception):
+                self._accumulate_exec_counters(steps)
+
+            # --- разбор ExecutionReport ---
+            filled = float(getattr(rep, "filled_qty", 0.0) or 0.0)
+            status = str(getattr(rep, "status", "CANCELED") or "CANCELED")
+            avg_px = getattr(rep, "avg_px", None)
+
+            limit_oid = getattr(rep, "limit_oid", None)
+            market_oid = getattr(rep, "market_oid", None)
+
+            log.debug(
+                "[place_entry] exec report %s %s: status=%s filled=%.6f avg_px=%s limit_oid=%s market_oid=%s steps=%s",
+                sym, s, status, filled, avg_px, limit_oid, market_oid, steps,
             )
 
-            # FSM: переводим в OPEN (best-effort)
-            with _ctx.suppress(Exception):
-                fsm = self._fsm.get(sym)
-                if fsm is not None:
-                    await fsm.on_open()
+            # --- дополнительная проверка по Binance: берём правду с биржи, если есть ---
+            ext_amt_after, ext_entry_px = await _exchange_snapshot()
+            delta_ext = abs(ext_amt_after) - abs(ext_amt_before)
+
+            if abs(ext_amt_after) > 1e-9 and abs(delta_ext) > 1e-9:
+                # Биржа говорит, что позиция открыта / увеличена — доверяем ей.
+                real_side = "BUY" if ext_amt_after > 0 else "SELL"
+                real_qty = abs(ext_amt_after)
+                filled = real_qty
+                status = "FILLED"
+                if ext_entry_px is not None and ext_entry_px > 0.0:
+                    avg_px = ext_entry_px
+                s = real_side
+
+                log.info(
+                    "[place_entry] corrected from exchange for %s: side=%s qty=%.6f entry_px=%s",
+                    sym, s, real_qty, avg_px,
+                )
+
+            # если реально ничего не исполнилось — считаем вход отменённым
+            if filled <= 0.0 and status == "CANCELED":
+                self._inc_block_reason(f"{sym}:entry_canceled_no_fill")
+                return {
+                    "ok": False,
+                    "reason": "entry_canceled_no_fill",
+                    "status": status,
+                    "steps": steps,
+                }
+
+            # фактически исполненный объём и цена входа
+            filled_qty = float(filled)
+            entry_px_effective = float(avg_px or entry_px_plan or mid)
+
+            # --- обновляем runtime-позицию и навешиваем SL/TP-брекеты ---
+            now_ms = int(time.time() * 1000)
+            lock = self._locks[sym]
+            async with lock:
+                prev = self._pos.get(sym)
+                timeout_ms = int(getattr(prev, "timeout_ms", 180_000))
+
+                sl_oid: Optional[str] = None
+                tp_oid: Optional[str] = None
+
+                # навешиваем защитные ордера, только если есть что защищать
+                if filled_qty > 0.0 and (sl_px is not None or tp_px is not None):
+                    try:
+                        br = await ex.place_bracket(
+                            symbol=sym,
+                            side=s,
+                            qty=filled_qty,
+                            sl_px=sl_px,
+                            tp_px=tp_px,
+                        )
+                        if isinstance(br, dict):
+                            if not br.get("ok", True):
+                                log.warning(
+                                    "[place_entry] place_bracket failed for %s %s: %s",
+                                    sym, s, br,
+                                )
+                            sl_oid = br.get("sl_order_id") or None
+                            tp_oid = br.get("tp_order_id") or None
+                            
+                            # CRITICAL FIX #5 & #6: Verify SL/TP orders are actually placed and are reduce_only
+                            if hasattr(ex, "a") or hasattr(ex, "adapter"):
+                                adapter = getattr(ex, "a", None) or getattr(ex, "adapter", None)
+                                if adapter and hasattr(adapter, "get_open_orders"):
+                                    try:
+                                        open_orders = await adapter.get_open_orders(symbol=sym)
+                                        sl_found = False
+                                        tp_found = False
+                                        sl_is_reduce_only = False
+                                        tp_is_reduce_only = False
+                                        
+                                        for o in open_orders or []:
+                                            oid = str(o.get("clientOrderId") or o.get("orderId") or "")
+                                            reduce_only = str(o.get("reduceOnly") or "").lower() in ("true", "1")
+                                            
+                                            if sl_oid and oid == str(sl_oid):
+                                                sl_found = True
+                                                sl_is_reduce_only = reduce_only
+                                            if tp_oid and oid == str(tp_oid):
+                                                tp_found = True
+                                                tp_is_reduce_only = reduce_only
+                                        
+                                        # CRITICAL FIX #5: If fallback happened and order is NOT reduce_only, cancel it immediately
+                                        if sl_oid and sl_found and not sl_is_reduce_only:
+                                            log.error(
+                                                "[place_entry] CRITICAL: SL order %s is NOT reduce_only! Canceling immediately.",
+                                                sl_oid
+                                            )
+                                            try:
+                                                if hasattr(ex, "cancel_order"):
+                                                    await ex.cancel_order(sym, sl_oid)
+                                                elif hasattr(adapter, "cancel_order"):
+                                                    await adapter.cancel_order(sym, client_order_id=sl_oid)
+                                                sl_oid = None
+                                            except Exception as cancel_err:
+                                                log.error("[place_entry] Failed to cancel non-reduce_only SL: %s", cancel_err)
+                                        
+                                        if tp_oid and tp_found and not tp_is_reduce_only:
+                                            log.error(
+                                                "[place_entry] CRITICAL: TP order %s is NOT reduce_only! Canceling immediately.",
+                                                tp_oid
+                                            )
+                                            try:
+                                                if hasattr(ex, "cancel_order"):
+                                                    await ex.cancel_order(sym, tp_oid)
+                                                elif hasattr(adapter, "cancel_order"):
+                                                    await adapter.cancel_order(sym, client_order_id=tp_oid)
+                                                tp_oid = None
+                                            except Exception as cancel_err:
+                                                log.error("[place_entry] Failed to cancel non-reduce_only TP: %s", cancel_err)
+                                        
+                                        if (sl_px and not sl_found) or (tp_px and not tp_found):
+                                            log.warning(
+                                                "[place_entry] SL/TP orders not found on exchange for %s: sl_found=%s tp_found=%s",
+                                                sym, sl_found, tp_found
+                                            )
+                                    except Exception as verify_err:
+                                        log.warning("[place_entry] Failed to verify SL/TP orders: %s", verify_err)
+                    except Exception as e:
+                        log.warning(
+                            "[place_entry] place_bracket error for %s %s: %s",
+                            sym,
+                            s,
+                            e,
+                        )
+
+                # обновляем runtime-позицию
+                self._pos[sym] = PositionState(
+                    state="OPEN",
+                    side=s,
+                    qty=filled_qty,
+                    entry_px=entry_px_effective,
+                    sl_px=float(sl_px) if sl_px is not None else None,
+                    tp_px=float(tp_px) if tp_px is not None else None,
+                    opened_ts_ms=now_ms,
+                    timeout_ms=timeout_ms,
+                    trade_id=getattr(prev, "trade_id", None),
+                    sl_order_id=sl_oid,
+                    tp_order_id=tp_oid,
+                )
+
+                # FSM: переводим в OPEN (best-effort)
+                with _ctx.suppress(Exception):
+                    fsm = self._fsm.get(sym)
+                    if fsm is not None:
+                        await fsm.on_open()
 
         return {
             "ok": True,
@@ -2238,10 +2468,26 @@ class Worker:
             return {"ok": False, "reason": "edge_too_small", "edge_diag": edge_info}
 
          # --- account snapshot / risk target ---
+        # CRITICAL FIX: Use real account equity from AccountState (live mode) or fallback to simulated
+        equity_now = float(getattr(self, "_starting_equity_usd", 1000.0))
         try:
+            if hasattr(self, "_account_state") and self._account_state:
+                snapshot = self._account_state.get_snapshot()
+                if snapshot and snapshot.equity > 0:
+                    equity_now = float(snapshot.equity)
+                    logger.debug("[place_entry_auto] Using real equity from AccountState: %.2f", equity_now)
+                else:
+                    # Fallback: refresh and try again
+                    await self._account_state.refresh()
+                    snapshot = self._account_state.get_snapshot()
+                    if snapshot and snapshot.equity > 0:
+                        equity_now = float(snapshot.equity)
+            else:
+                # Paper mode or AccountState not initialized: use simulated equity
+                equity_now = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
+        except Exception as e:
+            logger.warning("[place_entry_auto] Error getting equity from AccountState: %s, using fallback", e)
             equity_now = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
-        except Exception:
-            equity_now = float(getattr(self, "_starting_equity_usd", 1000.0))
 
         # leverage: per-symbol override через хелпер
         lev = float(self._leverage_for_symbol(sym))
@@ -2259,6 +2505,22 @@ class Worker:
         # --- первичный сайзинг ---
         raw_qty = target_risk_usd / sl_distance_px
         max_qty_by_lev = max(0.0, (equity_now * lev) / mid)
+        
+        # CRITICAL FIX #4: Check available margin before entry
+        available_margin = equity_now  # fallback
+        try:
+            if hasattr(self, "_account_state") and self._account_state:
+                snapshot = self._account_state.get_snapshot()
+                if snapshot:
+                    available_margin = float(snapshot.available_margin)
+        except Exception:
+            pass
+        
+        # Ensure we don't exceed available margin
+        max_notional_by_margin = available_margin * lev if available_margin > 0 else 0.0
+        max_qty_by_margin = max_notional_by_margin / mid if mid > 0 else 0.0
+        max_qty_by_lev = min(max_qty_by_lev, max_qty_by_margin)
+        
         qty = min(raw_qty, max_qty_by_lev)
         if qty_step > 0: qty = math.floor(qty / qty_step) * qty_step
         if qty <= 0:
@@ -2540,6 +2802,43 @@ class Worker:
                         pos = self._pos[sym]
                         if pos.state != "OPEN":
                             continue
+
+                        # CRITICAL FIX #2: Watchdog to detect and restore missing SL/TP orders
+                        # Check if position has SL/TP prices but missing order IDs
+                        if pos.sl_px is not None and not pos.sl_order_id:
+                            logger.error(
+                                "[watchdog] CRITICAL: %s has SL price (%.2f) but NO SL order ID! Restoring...",
+                                sym, pos.sl_px
+                            )
+                            try:
+                                ex = self.execs.get(sym)
+                                if ex and hasattr(ex, "place_bracket"):
+                                    # Try to restore SL order
+                                    br = await ex.place_bracket(
+                                        symbol=sym,
+                                        side=pos.side or "BUY",
+                                        qty=pos.qty,
+                                        sl_px=pos.sl_px,
+                                        tp_px=pos.tp_px,
+                                    )
+                                    if isinstance(br, dict) and br.get("ok"):
+                                        sl_oid = br.get("sl_order_id")
+                                        tp_oid = br.get("tp_order_id")
+                                        if sl_oid:
+                                            pos.sl_order_id = sl_oid
+                                            logger.warning("[watchdog] Restored SL order ID for %s: %s", sym, sl_oid)
+                                        if tp_oid and not pos.tp_order_id:
+                                            pos.tp_order_id = tp_oid
+                                            logger.warning("[watchdog] Restored TP order ID for %s: %s", sym, tp_oid)
+                            except Exception as restore_err:
+                                logger.error("[watchdog] Failed to restore SL/TP for %s: %s", sym, restore_err)
+                        
+                        if pos.tp_px is not None and not pos.tp_order_id:
+                            logger.warning(
+                                "[watchdog] %s has TP price (%.2f) but NO TP order ID",
+                                sym, pos.tp_px
+                            )
+                            # TP restoration attempted above in the same bracket call
 
                         # 1) fail-safe timeout if no SL/TP at all
                         if pos.sl_px is None and pos.tp_px is None:

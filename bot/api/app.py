@@ -11,7 +11,7 @@ from bot.core.config import reload_settings
 from strategy.cross_guard import CrossCfg, decide_cross_guard, pick_best_symbol_by_speed
 
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -621,6 +621,62 @@ def status() -> Dict[str, Any]:
         "log_level": getattr(s, "log_level", "INFO"),
     }
 
+@app.get("/account/state")
+async def account_state() -> Dict[str, Any]:
+    """
+    Снапшот аккаунта из AccountState (Binance/бумага):
+    - equity / available_margin
+    - realized_pnl_today / num_trades_today
+    - свежесть снапшота и ошибки обновления
+    """
+    w = _worker_required()
+
+    # аккуратно достаём сервис стейта
+    acc_state = getattr(w, "_account_state", None)
+    if acc_state is None:
+        return {
+            "ok": False,
+            "error": "account_state_not_configured",
+        }
+
+    # пробуем взять последний снапшот
+    snap = acc_state.get_snapshot()
+    if snap is None:
+        # если ни разу не обновлялся — дергаем refresh
+        try:
+            snap = await acc_state.refresh()
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"refresh_failed: {e}",
+            }
+
+    if snap is None:
+        return {
+            "ok": False,
+            "error": "no_snapshot",
+        }
+
+    # возраст снапшота
+    age_ms = acc_state.snapshot_age_ms()
+    is_fresh = acc_state.is_fresh(max_age_s=10)
+
+    return {
+        "ok": True,
+        "snapshot": {
+            "ts": snap.ts.isoformat(),
+            "equity": float(snap.equity),
+            "available_margin": float(snap.available_margin),
+            "realized_pnl_today": float(snap.realized_pnl_today),
+            "num_trades_today": int(snap.num_trades_today),
+            "open_positions": snap.open_positions,  # уже dict по символам
+        },
+        "meta": {
+            "age_ms": age_ms,
+            "is_fresh": bool(is_fresh),
+            "consecutive_errors": acc_state.consecutive_errors,
+        },
+    }
 
 # ------------------------------------------------------------------------------
 # Diagnostics
@@ -1357,6 +1413,21 @@ def fees() -> Dict[str, Any]:
             fees_binance = dict(getattr(fees_cfg, "binance_usdtm"))
         except Exception:
             pass
+        
+    @app.post("/metrics/reset")
+    async def metrics_reset() -> Dict[str, Any]:
+        """
+        Сброс дневных метрик / pnl / счётчиков.
+        Реализация зависит от того, как у тебя сделан Worker,
+        но MVP-идея примерно такая: вызвать метод reset_metrics() если он есть.
+        """
+        w = _worker_required()
+        reset = getattr(w, "reset_metrics", None)
+        if callable(reset):
+            res = reset()
+            if isinstance(res, dict):
+                return {"ok": True, **res}
+        return {"ok": True}
 
     w = _worker_required()
     per_symbol = {}
