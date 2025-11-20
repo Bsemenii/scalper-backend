@@ -1,0 +1,33 @@
+services:
+  backend:
+    build:
+      context: ./ai-scalping-backend   # <--- ВАЖНО
+      dockerfile: Dockerfile
+    container_name: ai-scalping-backend
+    ports:
+      - "8000:8000"                     # API: http://localhost:8010
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Warsaw
+    volumes:
+      - ./ai-scalping-backend/config:/app/config
+      - ./ai-scalping-backend/data:/app/data
+      - ./ai-scalping-backend/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 8
+
+  frontend:
+    build:
+      context: ./frontend              # <--- папка фронта
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://backend:8000   # фронт говорит с сервисом backend по docker-имени
+    container_name: ai-scalping-frontend
+    ports:
+      - "5173:80"                      # http://localhost:5173
+    restart: unless-stopped
+    depends_on:
+      - backend

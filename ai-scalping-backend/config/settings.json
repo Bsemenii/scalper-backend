@@ -1,0 +1,120 @@
+{
+  "mode": "live",
+
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+
+  "streams": {
+    "coalesce_ms": 75
+  },
+
+  "risk": {
+    "risk_per_trade_pct": 0.60,
+    "daily_stop_r": -6.0,
+    "daily_target_r": 8.0,
+    "max_consec_losses": 3,
+    "cooldown_after_sl_s": 900,
+    "min_risk_usd_floor": 1.0
+  },
+
+  "safety": {
+    "max_spread_ticks": 6,
+    "min_top5_liquidity_usd": 300000.0,
+    "skip_funding_minute": true,
+    "skip_minute_zero": true,
+    "min_liq_buffer_sl_mult": 3.0
+  },
+
+  "strategy": {
+    "auto_signal_enabled": true,
+
+    "min_range_bps": 2.0,
+    "min_range_ticks": 3,
+    "warmup_ms": 45000,
+    "stale_ms": 3000,
+    "auto_min_flat_ms": 900,
+
+    "ev_guard_kR": 0.35,
+
+    "regime": {
+      "vol_window_s": 60
+    },
+
+    "momentum": {
+      "obi_t": 0.003,
+      "tp_r": 2.0,
+      "stop_k_sigma": 1.2
+    },
+
+    "reversion": {
+      "bb_z": 0.9,
+      "rsi": 62,
+      "tp_to_vwap": true,
+      "tp_r": 1.7
+    },
+
+    "cross_guard": {
+      "enabled": true,
+      "lookback_s": 60,
+      "min_btc_strength_bp": 4.0,
+      "block_on_divergence": true,
+      "prefer_symbol_with_higher_speed": true
+    }
+  },
+
+  "execution": {
+    "price_tick_fallback": 0.1,
+    "qty_step_fallback": 0.001,
+
+    "limit_offset_ticks": 0,
+    "limit_timeout_ms": 900,
+    "max_slippage_bp": 4,
+
+    "time_in_force": "GTX",
+    "post_only": true,
+    "on_timeout": "abort",
+
+    "fee_bps_maker": 2.0,
+    "fee_bps_taker": 4.0,
+
+    "min_stop_ticks": 12,
+    "poll_ms": 50,
+
+    "demo_upnl_mid": true
+  },
+
+  "ml": {
+    "enabled": false,
+    "p_threshold_mom": 0.55,
+    "p_threshold_rev": 0.60,
+    "model_path": "./ml_artifacts/model.bin"
+  },
+
+  "account": {
+    "starting_equity_usd": 17.00,
+    "leverage": 15,
+    "mode": "live",
+    "exchange": "binance_usdtm",
+    "per_symbol_leverage": {
+      "BTCUSDT": 15,
+      "ETHUSDT": 12
+    },
+    "min_notional_usd": 5.0
+  },
+
+  "fees": {
+    "binance_usdtm": {
+      "maker_bps": 2.0,
+      "taker_bps": 4.0
+    }
+  },
+
+  "binance_usdtm": {
+    "api_key_env": "BINANCE_API_KEY",
+    "api_secret_env": "BINANCE_API_SECRET",
+    "base_url_env": "BINANCE_FUTURES_BASE_URL",
+    "testnet": false
+  },
+
+  "log_dir": "./logs",
+  "log_level": "INFO"
+}

@@ -1,0 +1,424 @@
+/* Trade Tape Styles */
+.trade-tape {
+  background: #131722;
+  border: 1px solid #1e2329;
+  border-radius: 8px;
+  overflow: hidden;
+  font-family: 'Roboto Mono', 'Consolas', monospace;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.trade-tape-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #1a1f2e, #161b26);
+  border-bottom: 1px solid #2a2e39;
+}
+
+.header-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.symbol-name {
+  color: #f0f3fa;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.tape-type {
+  color: #868b9a;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  animation: pulse-status 2s infinite;
+}
+
+.status-dot.connected {
+  background: #4caf50;
+}
+
+.status-dot.disconnected {
+  background: #f44336;
+}
+
+@keyframes pulse-status {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.1);
+  }
+}
+
+.status-text {
+  color: #868b9a;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Volume Breakdown Section */
+.volume-breakdown {
+  background: #1e2329;
+  border-bottom: 1px solid #2a2e39;
+  padding: 12px 16px;
+}
+
+.interval-selector {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.interval-btn {
+  background: transparent;
+  border: 1px solid #2a2e39;
+  color: #868b9a;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: 'Roboto Mono', monospace;
+  min-width: 32px;
+  text-align: center;
+}
+
+.interval-btn:hover {
+  background: #2a2e39;
+  color: #f0f3fa;
+  transform: translateY(-1px);
+}
+
+.interval-btn.active {
+  background: #2196f3;
+  border-color: #2196f3;
+  color: white;
+  box-shadow: 0 0 8px rgba(33, 150, 243, 0.3);
+}
+
+.volume-display {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.volume-bars {
+  height: 8px;
+  background: #0b0b0f;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid #2a2e39;
+}
+
+.volume-bar-container {
+  display: flex;
+  height: 100%;
+  position: relative;
+}
+
+.volume-bar {
+  height: 100%;
+  transition: width 0.3s ease;
+  position: relative;
+}
+
+.buy-bar {
+  background: linear-gradient(90deg, #4caf50, #66bb6a);
+  border-radius: 4px 0 0 4px;
+}
+
+.sell-bar {
+  background: linear-gradient(90deg, #f44336, #ff5252);
+  border-radius: 0 4px 4px 0;
+  margin-left: auto;
+}
+
+.volume-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.volume-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 4px;
+  flex: 1;
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+}
+
+.volume-stat:hover {
+  background: rgba(255, 255, 255, 0.05);
+  transform: translateY(-1px);
+}
+
+.volume-stat.buy {
+  border-color: rgba(76, 175, 80, 0.3);
+}
+
+.volume-stat.sell {
+  border-color: rgba(244, 67, 54, 0.3);
+}
+
+.volume-label {
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #868b9a;
+}
+
+.volume-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.volume-stat.buy .volume-value {
+  color: #4caf50;
+}
+
+.volume-stat.sell .volume-value {
+  color: #f44336;
+}
+
+.volume-percent {
+  font-size: 9px;
+  color: #646970;
+  font-weight: 500;
+}
+
+/* Trades Section */
+.trades-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.trades-header {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: #1e2329;
+  border-bottom: 1px solid #2a2e39;
+  font-size: 11px;
+  color: #868b9a;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.col-price {
+  flex: 1;
+  text-align: left;
+}
+
+.col-amount {
+  flex: 1;
+  text-align: center;
+}
+
+.col-time {
+  flex: 1;
+  text-align: right;
+}
+
+.trades-list {
+  flex: 1;
+  overflow-y: auto;
+  background: #131722;
+}
+
+/* Custom Scrollbar */
+.trades-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.trades-list::-webkit-scrollbar-track {
+  background: #1e2329;
+}
+
+.trades-list::-webkit-scrollbar-thumb {
+  background: #2a2e39;
+  border-radius: 2px;
+}
+
+.trades-list::-webkit-scrollbar-thumb:hover {
+  background: #3a3e49;
+}
+
+.trade-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 16px;
+  font-size: 11px;
+  line-height: 1.4;
+  min-height: 20px;
+  transition: all 0.15s ease;
+  border-left: 2px solid transparent;
+  animation: slide-in 0.3s ease;
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.trade-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+  transform: translateX(2px);
+}
+
+.trade-row.buy {
+  border-left-color: #4caf50;
+}
+
+.trade-row.sell {
+  border-left-color: #f44336;
+}
+
+.trade-row.buy:hover {
+  background: rgba(76, 175, 80, 0.05);
+}
+
+.trade-row.sell:hover {
+  background: rgba(244, 67, 54, 0.05);
+}
+
+.trade-price {
+  flex: 1;
+  text-align: left;
+  font-weight: 600;
+  font-family: 'Roboto Mono', monospace;
+}
+
+.trade-row.buy .trade-price {
+  color: #4caf50;
+}
+
+.trade-row.sell .trade-price {
+  color: #f44336;
+}
+
+.trade-amount {
+  flex: 1;
+  text-align: center;
+  color: #868b9a;
+  font-weight: 400;
+}
+
+.trade-time {
+  flex: 1;
+  text-align: right;
+  color: #646970;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+/* Footer */
+.trade-tape-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: #1e2329;
+  border-top: 1px solid #2a2e39;
+  font-size: 10px;
+}
+
+.trade-count {
+  color: #868b9a;
+  font-weight: 500;
+}
+
+.last-update {
+  color: #646970;
+  font-size: 9px;
+}
+
+/* Responsive Design */
+@media (max-width: 1200px) {
+  .interval-selector {
+    gap: 2px;
+  }
+  
+  .interval-btn {
+    padding: 3px 6px;
+    font-size: 9px;
+    min-width: 28px;
+  }
+  
+  .trade-row {
+    padding: 2px 12px;
+    font-size: 10px;
+    min-height: 18px;
+  }
+  
+  .volume-breakdown {
+    padding: 10px 12px;
+  }
+}
+
+@media (max-width: 768px) {
+  .interval-selector {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+  }
+  
+  .volume-stats {
+    flex-direction: column;
+    gap: 4px;
+  }
+  
+  .trade-row {
+    padding: 2px 8px;
+    font-size: 9px;
+    min-height: 16px;
+  }
+  
+  .col-time,
+  .trade-time {
+    display: none;
+  }
+}

@@ -1,0 +1,29 @@
+/* src/components/CandleChart.css */
+.candle-chart {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    height: 100%;
+  }
+  
+  .candle-chart-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #9ca3af;
+    padding: 2px 4px;
+  }
+  
+  .candle-chart-title {
+    font-weight: 500;
+  }
+  
+  .candle-chart-subtitle {
+    opacity: 0.7;
+  }
+  
+  .candle-chart-container {
+    flex: 1;
+    min-height: 220px;
+  }
+  
