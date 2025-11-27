@@ -1,7 +1,7 @@
 {
   "mode": "live",
 
-  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "symbols": ["GALAUSDT"],
 
   "streams": {
     "coalesce_ms": 75
@@ -9,8 +9,10 @@
 
   "risk": {
     "risk_per_trade_pct": 0.60,
+    "risk_per_trade_usd": 20.0,
     "daily_stop_r": -6.0,
     "daily_target_r": 8.0,
+    "max_daily_loss_usd": 100.0,
     "max_consec_losses": 3,
     "cooldown_after_sl_s": 900,
     "min_risk_usd_floor": 1.0
@@ -25,6 +27,7 @@
   },
 
   "strategy": {
+    "mode": "bollinger_basic",
     "auto_signal_enabled": true,
 
     "min_range_bps": 2.0,
@@ -46,10 +49,26 @@
     },
 
     "reversion": {
-      "bb_z": 0.9,
+      "bb_z_trigger": 1.2,
+      "bb_k": 2.0,
+      "stop_k_sigma": 0.45,
+      "tp_rr_main": 1.6,
+      "tp_r": 1.6,
+      "max_mid_slope_bp": 45.0,
+      "entry_band_buffer_bp": 20.0,
+      "min_rr_after_fees": 0.9,
+      "allow_micro_pierce": true,
+      "bb_z": 1.2,
       "rsi": 62,
-      "tp_to_vwap": true,
-      "tp_r": 1.7
+      "tp_to_vwap": true
+    },
+
+    "bollinger_basic": {
+      "tp_pct": 0.004,
+      "sl_pct": 0.0025,
+      "entry_threshold_pct": 0.0005,
+      "entry_usd": 25.0,
+      "leverage": 10.0
     },
 
     "cross_guard": {
@@ -91,14 +110,17 @@
 
   "account": {
     "starting_equity_usd": 17.00,
-    "leverage": 15,
+    "leverage": 10,
     "mode": "live",
     "exchange": "binance_usdtm",
     "per_symbol_leverage": {
-      "BTCUSDT": 15,
-      "ETHUSDT": 12
+      "GALAUSDT": 10
     },
-    "min_notional_usd": 5.0
+    "min_notional_usd": 5.0,
+    "fees": {
+      "taker_rate": 0.0005,
+      "maker_rate": 0.0002
+    }
   },
 
   "fees": {

@@ -79,7 +79,10 @@ const TradesTable = ({ trades }) => {
               <th style={{ ...headerCellBase, textAlign: "right" }}>
                 PnL (USD)
               </th>
-              <th style={{ ...headerCellBase, textAlign: "right" }}>PnL (R)</th>
+              <th style={{ ...headerCellBase, textAlign: "right" }}>R Value</th>
+              <th style={{ ...headerCellBase, textAlign: "right" }}>
+                Fees (USD)
+              </th>
               <th style={{ ...headerCellBase, textAlign: "left" }}>Reason</th>
               <th style={{ ...headerCellBase, textAlign: "left" }}>Opened</th>
               <th style={{ ...headerCellBase, textAlign: "left" }}>Closed</th>
@@ -89,7 +92,7 @@ const TradesTable = ({ trades }) => {
             {rows.length === 0 ? (
               <tr>
                 <td
-                  colSpan={10}
+                  colSpan={11}
                   style={{
                     ...cellBase,
                     textAlign: "center",
@@ -103,12 +106,20 @@ const TradesTable = ({ trades }) => {
             ) : (
               rows.map((t, idx) => {
                 const side = String(t.side || "").toUpperCase();
-                const pnlUsd = Number(t.pnl_usd ?? 0);
+                // Use realized_pnl_usd from backend (single source of truth)
+                const pnlUsd = Number(t.realized_pnl_usd ?? t.pnl_usd ?? 0);
                 const colorPnl =
                   pnlUsd > 0 ? "#22c55e" : pnlUsd < 0 ? "#f97316" : "#e5e7eb";
 
+                // Use opened_at/closed_at from backend, fallback to old field names for compatibility
+                const openedTs = t.opened_at ?? t.opened_ts ?? t.entry_ts_ms;
+                const closedTs = t.closed_at ?? t.closed_ts ?? t.exit_ts_ms;
+                
+                // Use reason_close as primary reason, fallback to reason_open
+                const reason = t.reason_close ?? t.reason ?? t.reason_open ?? "—";
+
                 return (
-                  <tr key={`${t.symbol || "sym"}-${t.opened_ts || idx}`}>
+                  <tr key={`${t.symbol || "sym"}-${t.id || openedTs || idx}`}>
                     <td style={{ ...cellBase, color: "#e5e7eb" }}>
                       {String(t.symbol || "").toUpperCase() || "—"}
                     </td>
@@ -142,7 +153,7 @@ const TradesTable = ({ trades }) => {
                         color: "#9ca3af",
                       }}
                     >
-                      {formatNumber(t.entry_px ?? t.entry_price, 2)}
+                      {formatNumber(t.entry_price ?? t.entry_px, 2)}
                     </td>
                     <td
                       style={{
@@ -151,7 +162,7 @@ const TradesTable = ({ trades }) => {
                         color: "#9ca3af",
                       }}
                     >
-                      {formatNumber(t.exit_px, 2)}
+                      {formatNumber(t.exit_price ?? t.exit_px, 2)}
                     </td>
                     <td
                       style={{
@@ -161,7 +172,7 @@ const TradesTable = ({ trades }) => {
                         fontWeight: 500,
                       }}
                     >
-                      {formatNumber(t.pnl_usd, 2)}
+                      {formatNumber(t.realized_pnl_usd ?? t.pnl_usd, 2)}
                     </td>
                     <td
                       style={{
@@ -170,7 +181,16 @@ const TradesTable = ({ trades }) => {
                         color: "#e5e7eb",
                       }}
                     >
-                      {formatNumber(t.pnl_r, 2)}
+                      {formatNumber(t.r_value ?? t.pnl_r ?? t.r, 2)}
+                    </td>
+                    <td
+                      style={{
+                        ...cellBase,
+                        textAlign: "right",
+                        color: "#6b7280",
+                      }}
+                    >
+                      {formatNumber(t.fees_usd, 2)}
                     </td>
                     <td
                       style={{
@@ -180,15 +200,15 @@ const TradesTable = ({ trades }) => {
                         textOverflow: "ellipsis",
                         color: "#9ca3af",
                       }}
-                      title={t.reason || ""}
+                      title={reason}
                     >
-                      {t.reason || "—"}
+                      {reason}
                     </td>
                     <td style={{ ...cellBase, color: "#6b7280" }}>
-                      {formatTs(t.opened_ts)}
+                      {formatTs(openedTs)}
                     </td>
                     <td style={{ ...cellBase, color: "#6b7280" }}>
-                      {formatTs(t.closed_ts)}
+                      {formatTs(closedTs)}
                     </td>
                   </tr>
                 );

@@ -14,8 +14,10 @@ class StreamsCfg(BaseModel):
 
 class RiskCfg(BaseModel):
     risk_per_trade_pct: float = 0.25
+    risk_per_trade_usd: float = 20.0  # Fixed USD risk per trade (for R-scaling with stop_distance_usd)
     daily_stop_r: float = -10.0
     daily_target_r: float = 15.0
+    max_daily_loss_usd: float = 100.0  # Hard daily loss limit in USD (blocks new entries if realized_pnl_today <= -max_daily_loss_usd)
     max_consec_losses: int = 3
     cooldown_after_sl_s: int = 120
     min_risk_usd_floor: float = 0.25
@@ -29,6 +31,11 @@ class SafetyCfg(BaseModel):
     min_liq_buffer_sl_mult: float = 3.0
 
 
+class FeesCfg(BaseModel):
+    taker_rate: float = 0.0005
+    maker_rate: float = 0.0002
+
+
 class RegimeCfg(BaseModel):
     vol_window_s: int = 60
 
@@ -40,16 +47,35 @@ class MomentumCfg(BaseModel):
 
 
 class ReversionCfg(BaseModel):
-    bb_z: float = 2.0
+    bb_z: float = 2.0  # Legacy: use bb_z_trigger instead
+    bb_z_trigger: float = 1.2
+    bb_k: float = 2.0
+    stop_k_sigma: float = 0.45
+    tp_rr_main: float = 1.6
+    tp_r: float = 1.6  # Alias for tp_rr_main for compatibility
+    max_mid_slope_bp: float = 45.0
+    entry_band_buffer_bp: float = 20.0
+    min_rr_after_fees: float = 0.9
+    allow_micro_pierce: bool = True
     rsi: int = 70
     tp_to_vwap: bool = True
-    tp_r: float = 1.3
+
+
+class BollingerBasicCfg(BaseModel):
+    tp_pct: float = 0.004  # 0.4% take profit
+    sl_pct: float = 0.0025  # 0.25% stop loss
+    entry_threshold_pct: float = 0.0005  # 0.05% threshold for entry
+    require_bandwidth_min: Optional[float] = None  # Minimum bandwidth (optional filter)
+    entry_usd: float = 25.0  # Entry risk in USD (20-30 USD range)
+    leverage: float = 10.0  # Leverage multiplier (10x default)
 
 
 class StrategyCfg(BaseModel):
     regime: RegimeCfg = RegimeCfg()
     momentum: MomentumCfg = MomentumCfg()
     reversion: ReversionCfg = ReversionCfg()
+    bollinger_basic: BollingerBasicCfg = BollingerBasicCfg()
+    mode: str = "reversion_only"  # Strategy routing mode: "reversion_only" | "momentum_first" | "bollinger_basic" | etc.
 
 
 class ExecutionCfg(BaseModel):
@@ -78,11 +104,12 @@ class AccountCfg(BaseModel):
 
     # опционально, чтобы не терять per_symbol_leverage из settings.json
     per_symbol_leverage: Dict[str, float] = Field(default_factory=dict)
+    fees: FeesCfg = FeesCfg()
 
 
 class Settings(BaseModel):
     mode: str = "paper"
-    symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+    symbols: list[str] = Field(default_factory=lambda: ["GALAUSDT"])  # TEMP: single-symbol mode GALAUSDT, 10x leverage
     streams: StreamsCfg = StreamsCfg()
     risk: RiskCfg = RiskCfg()
     safety: SafetyCfg = SafetyCfg()

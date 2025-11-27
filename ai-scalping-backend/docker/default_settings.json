@@ -1,12 +1,27 @@
 {
     "mode": "paper",
-    "symbols": ["BTCUSDT","ETHUSDT","SOLUSDT"],
+    "symbols": ["GALAUSDT"],
     "streams": { "coalesce_ms": 75 },
-    "risk": { "risk_per_trade_pct": 0.10, "daily_stop_r": -4, "daily_target_r": 6, "max_consec_losses": 3, "cooldown_after_sl_s": 90, "min_risk_usd_floor": 1.5 },
+    "risk": { "risk_per_trade_pct": 0.10, "risk_per_trade_usd": 20.0, "daily_stop_r": -4, "daily_target_r": 6, "max_daily_loss_usd": 100.0, "max_consec_losses": 3, "cooldown_after_sl_s": 90, "min_risk_usd_floor": 1.5 },
     "safety": { "max_spread_ticks": 8, "min_top5_liquidity_usd": 300000, "skip_funding_minute": true, "skip_minute_zero": true, "min_liq_buffer_sl_mult": 3 },
     "execution": { "limit_offset_ticks": 1, "limit_timeout_ms": 2000, "max_slippage_bp": 4, "time_in_force": "GTX", "fee_bps_maker": 0.0, "fee_bps_taker": 0.0, "min_stop_ticks": 24 },
     "ml": { "enabled": false, "p_threshold_mom": 0.55, "p_threshold_rev": 0.60, "model_path": "./ml_artifacts/model.bin" },
-    "account": { "starting_equity_usd": 1000, "leverage": 1, "min_notional_usd": 5 },
+    "account": { "starting_equity_usd": 1000, "leverage": 10, "per_symbol_leverage": { "GALAUSDT": 10 }, "min_notional_usd": 5, "fees": { "taker_rate": 0.0005, "maker_rate": 0.0002 } },
+    "strategy": { 
+      "mode": "reversion_only", 
+      "reversion": { 
+        "bb_z_trigger": 1.2,
+        "bb_k": 2.0,
+        "stop_k_sigma": 0.45,
+        "tp_rr_main": 1.6,
+        "tp_r": 1.6,
+        "max_mid_slope_bp": 45.0,
+        "entry_band_buffer_bp": 20.0,
+        "min_rr_after_fees": 0.9,
+        "allow_micro_pierce": true,
+        "bb_z": 1.2
+      } 
+    },
     "log_dir": "./logs",
     "log_level": "INFO"
   }

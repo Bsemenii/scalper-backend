@@ -10,8 +10,10 @@ CREATE TABLE IF NOT EXISTS trades (
   exit_px       REAL NOT NULL,
   sl_px         REAL,
   tp_px         REAL,
-  r             REAL NOT NULL DEFAULT 0,     -- итог в R
-  pnl_usd       REAL NOT NULL DEFAULT 0,
+  r             REAL NOT NULL DEFAULT 0,     -- итог в R (сырое значение)
+  pnl_usd       REAL NOT NULL DEFAULT 0,     -- итог в USD (net, с учётом комиссий)
+  pnl_r         REAL NOT NULL DEFAULT 0,     -- итог в R для отчётов (может = r)
+  fees_usd      REAL NOT NULL DEFAULT 0,     -- суммарные комиссии по сделке
   reason_open   TEXT,
   reason_close  TEXT,
   meta          TEXT                         -- JSON (фичи/фильтры, решение модели и т.п.)
@@ -64,4 +66,5 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 -- Индексы
 CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_symbol      ON orders(symbol);
+CREATE INDEX IF NOT EXISTS idx_orders_trade_id    ON orders(trade_id);
 CREATE INDEX IF NOT EXISTS idx_fills_order_id     ON fills(order_id);

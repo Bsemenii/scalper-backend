@@ -377,6 +377,22 @@ class BinanceUSDTMAdapter:
         """
         return await self._request("GET", "/fapi/v2/positionRisk", signed=True)  # type: ignore[return-value]
 
+    async def get_price(self, symbol: str) -> Optional[float]:
+        """
+        GET /fapi/v1/ticker/price — текущая цена символа.
+        Используется для конвертации комиссий из других активов в USDT.
+        
+        Возвращает цену как float или None при ошибке.
+        """
+        try:
+            data = await self._request("GET", "/fapi/v1/ticker/price", params={"symbol": symbol}, signed=False)  # type: ignore[assignment]
+            if isinstance(data, dict) and "price" in data:
+                return float(data["price"])
+            return None
+        except Exception as e:
+            logger.warning("[binance_rest] get_price failed for %s: %s", symbol, e)
+            return None
+
     # ---------- Ордера ----------
 
     async def create_order(self, req: Any) -> Dict[str, Any]:
@@ -663,6 +679,19 @@ class PaperAdapter:
         Для paper — просто то, что лежит в self._positions.
         """
         return list(self._positions.values())
+
+    async def get_price(self, symbol: str) -> Optional[float]:
+        """
+        Paper-версия get_price: возвращает примерную цену для конвертации комиссий.
+        Для простоты возвращаем фиксированные значения для популярных пар.
+        """
+        # Примерные цены для популярных активов в USDT
+        prices = {
+            "BNBUSDT": 600.0,
+            "BTCUSDT": 40000.0,
+            "ETHUSDT": 2500.0,
+        }
+        return prices.get(symbol.upper())
 
     # ---------- Ордера ----------
 

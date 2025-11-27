@@ -50,6 +50,16 @@ export async function getTrades({ limit = 50, symbol, since } = {}) {
   return request(`/trades${qs ? `?${qs}` : ""}`);
 }
 
+// Get trades with stats from /trades/recent endpoint (single source of truth)
+export async function getTradesRecent({ limit = 100, offset = 0 } = {}) {
+  const params = new URLSearchParams();
+  if (limit) params.set("limit", String(limit));
+  if (offset) params.set("offset", String(offset));
+
+  const qs = params.toString();
+  return request(`/trades/recent${qs ? `?${qs}` : ""}`);
+}
+
 // ---------- Simple API (як було в твоєму попередньому варіанті) ----------
 
 const SIMPLE_API_BASE = `${API_BASE}/api`;
@@ -107,9 +117,9 @@ export async function getMetricsState() {
 }
 
 export async function resetMetrics(baseline = "now") {
-  return request("/paper/reset_metrics", {
+  // Use new clear stats endpoint
+  return request("/stats/clear", {
     method: "POST",
-    body: JSON.stringify({ baseline }),
   });
 }
 

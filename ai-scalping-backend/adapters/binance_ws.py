@@ -116,7 +116,10 @@ class BinanceWS:
             )
 
         if self._runner_task is None or self._runner_task.done():
+            url = self._build_url()
+            logger.info("[binance_ws] starting WS runner for symbols=%s, url=%s", self._symbols, url)
             self._runner_task = asyncio.create_task(self._runner(), name="binance-ws-runner")
+            logger.info("[binance_ws] WS runner task created")
 
     async def close(self) -> None:
         """Остановка и закрытие WS/HTTP."""
@@ -179,10 +182,12 @@ class BinanceWS:
             url = self._build_url()
             self._diag["url"] = url
             try:
+                logger.info("[binance_ws] attempting to connect to %s", url)
                 async with await self._connect_ws(url) as ws:
                     self._ws = ws
                     self._diag["connects"] += 1
                     backoff = self._reconnect_min  # сброс после успешного коннекта
+                    logger.info("[binance_ws] connected successfully (connect #%d)", self._diag["connects"])
 
                     async for msg in ws:
                         if self._stop.is_set():
@@ -206,12 +211,14 @@ class BinanceWS:
                             break
 
             except asyncio.CancelledError:
+                logger.info("[binance_ws] runner cancelled, exiting")
                 break
             except Exception as e:
                 # мягкий бэкофф с джиттером, cap по максимуму
                 self._diag["errors"] += 1
                 self._diag["last_error"] = f"WS loop: {type(e).__name__}: {e}"
-                logger.exception("WS loop error")
+                logger.error("[binance_ws] WS loop error: %s (will reconnect in %.1fs)", e, min(backoff, self._reconnect_max))
+                logger.exception("[binance_ws] WS loop error details")
                 sleep_base = min(backoff, self._reconnect_max)
                 jitter = random.uniform(0.0, sleep_base * 0.3)
                 await asyncio.sleep(sleep_base + jitter)

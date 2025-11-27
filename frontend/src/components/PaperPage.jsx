@@ -78,6 +78,8 @@ const PaperPage = () => {
 
   const day = pnlNow?.pnl_day?.day ?? '';
   const pnlUsd = pnlNow?.pnl_day?.pnl_usd ?? 0;
+  const feesUsd = pnlNow?.pnl_day?.fees_usd ?? 0;
+  const grossPnlUsd = pnlUsd + feesUsd;
   const pnlR = pnlNow?.pnl_day?.pnl_r ?? 0;
   const tradesCount = pnlNow?.pnl_day?.trades ?? 0;
   const winrate = pnlNow?.pnl_day?.winrate;
@@ -90,7 +92,7 @@ const PaperPage = () => {
     <div className="pp-root">
       <div className="pp-header">
         <div className="pp-header-left">
-          <h1 className="pp-title">Paper Trading Dashboard</h1>
+          <h1 className="pp-title">Trading Dashboard</h1>
           <span className="pp-subtitle">
             {day && <>Session: <strong>{day}</strong></>}
           </span>
@@ -98,9 +100,21 @@ const PaperPage = () => {
 
         <div className="pp-header-right">
           <div className="pp-metric">
-            <span className="pp-metric-label">PnL (USD)</span>
+            <span className="pp-metric-label">PnL Net (USD)</span>
             <span className={`pp-metric-value ${pnlUsd >= 0 ? 'pp-pos' : 'pp-neg'}`}>
               {fmtNumber(pnlUsd, 2)}
+            </span>
+          </div>
+          <div className="pp-metric">
+            <span className="pp-metric-label">PnL Gross (USD)</span>
+            <span className={`pp-metric-value ${grossPnlUsd >= 0 ? 'pp-pos' : 'pp-neg'}`}>
+              {fmtNumber(grossPnlUsd, 2)}
+            </span>
+          </div>
+          <div className="pp-metric">
+            <span className="pp-metric-label">Fees Paid (USD)</span>
+            <span className="pp-metric-value" style={{ color: '#ef4444' }}>
+              {fmtNumber(feesUsd, 2)}
             </span>
           </div>
           <div className="pp-metric">
@@ -162,7 +176,7 @@ const PaperPage = () => {
           <CandleChart
             symbol={activeSymbol}
             timeframe="1m"
-            title={`Paper — ${activeSymbol}`}
+            title={`${activeSymbol}`}
             trades={trades}
           />
         </div>
@@ -184,13 +198,14 @@ const PaperPage = () => {
                   <th>Exit</th>
                   <th>PnL $</th>
                   <th>PnL R</th>
+                  <th>Fees $</th>
                   <th>Reason</th>
                 </tr>
               </thead>
               <tbody>
                 {trades.length === 0 && !loadingTrades && (
                   <tr>
-                    <td colSpan={8} className="pp-trades-empty">
+                    <td colSpan={9} className="pp-trades-empty">
                       No trades yet for {activeSymbol}.
                     </td>
                   </tr>
@@ -212,6 +227,9 @@ const PaperPage = () => {
                     </td>
                     <td className={t.pnl_r >= 0 ? 'pp-pos' : 'pp-neg'}>
                       {t.pnl_r != null ? fmtNumber(t.pnl_r, 2) : '—'}
+                    </td>
+                    <td style={{ color: '#6b7280' }}>
+                      {t.fees_usd != null ? fmtNumber(t.fees_usd, 2) : '—'}
                     </td>
                     <td>{t.reason || '—'}</td>
                   </tr>

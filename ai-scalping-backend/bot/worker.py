@@ -5,26 +5,41 @@ import asyncio
 import contextlib
 import logging
 import os
-from dotenv import load_dotenv
 import time
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Tuple, Literal, Deque
 from collections import deque
-from typing import Deque
 from contextlib import contextmanager
+from dotenv import load_dotenv
 from strategy.cross_guard import decide_cross_guard, CrossCfg, pick_best_symbol_by_speed
-from adapters.binance_rest import PaperAdapter, BinanceUSDTMAdapter
-from typing import Optional, Dict, Any, Deque, List, Literal
+from adapters.binance_rest import BinanceUSDTMAdapter
 
 from exec.fsm import PositionFSM
 from bot.core.types import Side as CoreSide  # (может быть неиспользован — ок)
 from bot.core.config import get_settings
 from account.state import AccountState
+from exec.position_state import (
+    get_position_state,
+    save_position_state,
+    flat_state,
+    with_long,
+    with_short,
+    PositionSide,
+)
+from exec.bollinger_executor import (
+    place_entry_order,
+    place_exit_order,
+    compute_tp_sl_levels,
+    attach_sl_tp,
+    check_sl_tp_hit,
+)
+
+# Type alias for Side (used throughout the code)
+Side = CoreSide
 
 from adapters.binance_ws import BinanceWS
 from stream.coalescer import Coalescer, TickerTick
-from adapters.binance_rest import PaperAdapter
 from exec.executor import Executor, ExecCfg, ExecutionReport
 from strategy.router import StrategyCfg, pick_candidate
 from strategy.momentum import EntryCandidate as MomEntry
@@ -43,6 +58,10 @@ try:
     from features.indicators import IndiEngine  # type: ignore
 except Exception:
     IndiEngine = None  # type: ignore
+try:
+    from features.bollinger import BollingerEngine  # type: ignore
+except Exception:
+    BollingerEngine = None  # type: ignore
 
 # риск-фильтры
 from risk.filters import (
@@ -50,6 +69,7 @@ from risk.filters import (
     MicroCtx, TimeCtx, PositionalCtx, DayState,
     check_entry_safety, check_day_limits,
 )
+from risk.sizing import calc_qty_from_stop_distance_usd
 
 # кандидаты (лёгкая стратегия)
 from strategy.candidates import CandidateEngine, Decision
@@ -126,7 +146,7 @@ class Worker:
       - SL/TP план + watchdog (таймаут и защита),
       - учёт сделок и дневной PnL (best-effort),
       - счётчики исполнения (для /metrics),
-      - комиссии (maker/taker) в paper-режиме,
+      - комиссии (maker/taker) из реальных данных Binance,
       - риск-фильтры (safety + дневные лимиты),
       - авто-сайзинг позиции от процента риска,
       - лёгкие авто-сигналы (кандидаты) с анти-спамом.
@@ -212,8 +232,16 @@ class Worker:
         self._pnl_r_equity: float = 0.0
         self._consec_losses: int = 0
 
+        self._fixed_margin_per_trade = 30.0
+        self._fixed_leverage = 10.0
+        self._max_notional_per_trade = 400.0
+
+
         # ts последнего стоп-лосса (для cooldown_after_sl_s)
         self._last_sl_ts_ms: int = 0
+
+        # ts последней сверки PnL с БД (для throttling reconciliation)
+        self._last_reconcile_ts_ms: int = 0
 
         # --- причины блокировок входа ---
         self._block_reasons: Dict[str, int] = {}
@@ -251,6 +279,7 @@ class Worker:
 
         self._micro_eng: Dict[str, MicroFeatureEngine] = {}
         self._indi_eng: Dict[str, IndiEngine] = {}
+        self._bollinger_eng: Dict[str, BollingerEngine] = {}
         self._last_micro: Dict[str, Dict[str, Any]] = {}
         self._last_indi: Dict[str, Dict[str, Any]] = {}
 
@@ -272,6 +301,9 @@ class Worker:
         
         # CRITICAL FIX: Global lock to prevent concurrent position opening
         self._global_position_lock = asyncio.Lock()
+        
+        # --- desync guard counter for exchange consistency ---
+        self._desync_count: int = 0
 
     # ---------- lifecycle ----------
 
@@ -279,8 +311,7 @@ class Worker:
         """
         Старт воркера:
         - читает settings + ENV;
-        - решает, paper или live;
-        - инициализирует Executor'ы с нужным адаптером (PaperAdapter / BinanceUSDTMAdapter);
+        - инициализирует Executor'ы с BinanceUSDTMAdapter (только live mode);
         - поднимает WS, коалесер, watchdog и strategy_loop.
         """
         if self._started:
@@ -324,13 +355,21 @@ class Worker:
             binance_cfg = getattr(s, "binance_usdtm", None)
             exec_cfg = getattr(s, "execution", None)
 
-        # mode: ТОЛЬКО из settings.account.mode, fallback = "paper"
-        mode = "paper"
+        # mode: ТОЛЬКО live mode поддерживается (paper trading удалён)
+        mode = "live"
         if account_cfg is not None:
             try:
-                mode = str(getattr(account_cfg, "mode", "paper") or "paper").lower()
+                mode_raw = str(getattr(account_cfg, "mode", "live") or "live").lower()
+                if mode_raw == "live":
+                    mode = "live"
+                else:
+                    logger.warning(
+                        f"[worker] Invalid mode '{mode_raw}' in settings, forcing 'live' mode. "
+                        "Paper trading is no longer supported."
+                    )
+                    mode = "live"
             except Exception:
-                mode = "paper"
+                mode = "live"
 
         # exchange: settings.account.exchange или "binance_usdtm"
         exch_name = "binance_usdtm"
@@ -418,10 +457,22 @@ class Worker:
         elif env_testnet_raw.lower() in ("1", "true", "yes"):
             use_testnet = True
 
+        # Log API key status (without exposing secrets)
+        api_key_status = "SET" if api_key else "MISSING"
+        api_secret_status = "SET" if api_secret else "MISSING"
         logger.info(
-            "[worker.start] binance cfg: api_key_env=%s, base_url_env=%s, base_url=%s, testnet=%s",
-            api_key_env, base_url_env, base_url, use_testnet,
+            "[worker.start] binance cfg: api_key=%s, api_secret=%s, base_url=%s, testnet=%s",
+            api_key_status, api_secret_status, base_url, use_testnet,
         )
+        
+        # If live mode but keys are missing, log warning but continue (will fail later with clear error)
+        if mode == "live" and exch_name == "binance_usdtm":
+            if not api_key or not api_secret:
+                logger.error(
+                    "[worker.start] CRITICAL: Live mode requires API keys but they are missing! "
+                    "Set %s and %s environment variables. Worker will fail during executor initialization.",
+                    api_key_env, api_secret_env
+                )
 
         # ---------------------------------------------------
         # 5. Старт strategy_loop (до инициализации потоков ОК)
@@ -429,6 +480,7 @@ class Worker:
         if self._strat_task is None or self._strat_task.done():
             loop = asyncio.get_running_loop()
             self._strat_task = loop.create_task(self._strategy_loop(), name="strategy_loop")
+            logger.info("[worker.start] strategy_loop task created and started")
 
         # ---------------------------------------------------
         # 6. Инициализация executors и движков по символам
@@ -452,8 +504,7 @@ class Worker:
                 return _self.hub.best_bid_ask(sym_local)
 
             # --- выбор адаптера ---
-            # СТРОГИЙ выбор: BinanceUSDTMAdapter ТОЛЬКО когда mode=="live" И exchange=="binance_usdtm"
-            # Во всех остальных случаях (paper mode или другой exchange) — PaperAdapter
+            # ТОЛЬКО live mode с BinanceUSDTMAdapter (paper trading удалён)
             if mode == "live" and exch_name == "binance_usdtm":
                 if not api_key or not api_secret:
                     raise RuntimeError(
@@ -473,12 +524,10 @@ class Worker:
                     sym, base_url,
                 )
             else:
-                # PaperAdapter используется строго в paper mode или когда exchange != "binance_usdtm"
-                from adapters.binance_rest import PaperAdapter
-                adapter = PaperAdapter()
-                logger.info(
-                    "[worker] %s executor: PAPER mode (mode=%s, exchange=%s)",
-                    sym, mode, exch_name,
+                raise RuntimeError(
+                    f"Invalid configuration: mode={mode}, exchange={exch_name}. "
+                    "Only 'live' mode with 'binance_usdtm' exchange is supported. "
+                    "Paper trading has been removed."
                 )
 
             self.execs[sym] = Executor(
@@ -496,7 +545,15 @@ class Worker:
                     lot_usd=50_000.0,
                 )
             if IndiEngine is not None:
+                # Reversion strategy for GALAUSDT uses 1-minute candles.
+                # IndiEngine uses bb_win=60 (default) which represents ~60 ticks,
+                # approximately 1 minute of data for active symbols.
+                # All indicators (bb_z, ema21, rsi, realized_vol_bp) are computed from 1-minute timeframe.
                 self._indi_eng[sym] = IndiEngine(price_step=spec.price_tick)
+            if BollingerEngine is not None:
+                # Bollinger Bands with default window=20, k=2.0
+                # Can be customized via settings if needed
+                self._bollinger_eng[sym] = BollingerEngine(window=20, k=2.0)
 
         # 6.5 Live Binance: sanity-check + margin/leverage
         is_live = (mode == "live" and exch_name == "binance_usdtm")
@@ -515,14 +572,19 @@ class Worker:
         if is_live:
             adapter_for_account = self._get_live_adapter()
         else:
-            # Use first executor's adapter (PaperAdapter)
+            # Use first executor's adapter (BinanceUSDTMAdapter)
             if self.execs:
                 first_ex = next(iter(self.execs.values()))
                 adapter_for_account = getattr(first_ex, "a", None) or getattr(first_ex, "adapter", None)
 
         if adapter_for_account:
             try:
-                self._account_state = AccountState(adapter=adapter_for_account, is_live=is_live)
+                # Pass hub as price_provider so AccountState can get current mid prices for uPnL calculation
+                self._account_state = AccountState(
+                    adapter=adapter_for_account, 
+                    is_live=is_live,
+                    price_provider=self.hub
+                )
                 # Initial refresh to get starting snapshot
                 await self._account_state.refresh()
                 logger.info("[worker.start] AccountState initialized (is_live=%s)", is_live)
@@ -542,9 +604,18 @@ class Worker:
         # ---------------------------------------------------
         # 7. Старт WS + коалесер + watchdog
         # ---------------------------------------------------
-        await self.ws.connect(self._on_ws_raw)
+        logger.info("[worker.start] connecting WebSocket for symbols=%s", self.symbols)
+        try:
+            await self.ws.connect(self._on_ws_raw)
+            logger.info("[worker.start] WebSocket connection initiated successfully")
+        except Exception as e:
+            logger.error("[worker.start] WebSocket connection failed: %s", e, exc_info=True)
+            raise
+        
+        logger.info("[worker.start] starting coalescer and watchdog")
         self._tasks.append(asyncio.create_task(self.coal.run(self._on_tick), name="coal.run"))
         self._wd_task = asyncio.create_task(self._watchdog_loop(), name="watchdog")
+        logger.info("[worker.start] coalescer and watchdog tasks created")
 
         logger.info("[worker.start] started with symbols=%s, mode=%s, exchange=%s", self.symbols, mode, exch_name)
 
@@ -629,6 +700,7 @@ class Worker:
         try:
             me = self._micro_eng.get(tick.symbol)
             ie = self._indi_eng.get(tick.symbol)
+            be = self._bollinger_eng.get(tick.symbol)
 
             if me is not None:
                 mf = me.update(
@@ -658,8 +730,56 @@ class Worker:
                     "rsi": float(ii.rsi),
                     "realized_vol_bp": float(ii.realized_vol_bp),
                 }
+
+            # Bollinger Bands features
+            if be is not None:
+                bf = be.update(price=float(tick.price or 0.0))
+                # Add Bollinger features to _last_indi dict
+                if tick.symbol not in self._last_indi:
+                    self._last_indi[tick.symbol] = {}
+                self._last_indi[tick.symbol].update({
+                    "boll_mid": float(bf["boll_mid"]) if bf["boll_mid"] is not None else None,
+                    "boll_up": float(bf["boll_up"]) if bf["boll_up"] is not None else None,
+                    "boll_low": float(bf["boll_low"]) if bf["boll_low"] is not None else None,
+                    "boll_bandwidth": float(bf["boll_bandwidth"]) if bf["boll_bandwidth"] is not None else None,
+                    "boll_position": float(bf["boll_position"]) if bf["boll_position"] is not None else None,
+                })
+                # Log at DEBUG level (only when features are computed successfully)
+                if bf["boll_mid"] is not None:
+                    logger.debug(
+                        "[FEATURES] bollinger computed symbol=%s mid=%.6f up=%.6f low=%.6f bandwidth=%.6f position=%.4f",
+                        tick.symbol,
+                        bf["boll_mid"],
+                        bf["boll_up"] or 0.0,
+                        bf["boll_low"] or 0.0,
+                        bf["boll_bandwidth"] or 0.0,
+                        bf["boll_position"] or 0.0,
+                    )
         except Exception:
             # индикаторы не критичны — не роняем пайплайн
+            pass
+
+        # ---------- SL/TP monitoring (lightweight check) ----------
+        try:
+            pos_state = get_position_state(tick.symbol)
+            if not pos_state.is_flat() and tick.price:
+                hit = check_sl_tp_hit(tick.symbol, float(tick.price), pos_state)
+                if hit == "exit":
+                    # Determine which level was hit (SL or TP)
+                    which = "UNKNOWN"
+                    if pos_state.sl_price is not None and pos_state.tp_price is not None:
+                        price = float(tick.price)
+                        sl_dist = abs(price - float(pos_state.sl_price))
+                        tp_dist = abs(price - float(pos_state.tp_price))
+                        which = "SL" if sl_dist < tp_dist else "TP"
+                    logger.info(
+                        "[EXEC] sl/tp hit symbol=%s, side=%s, price=%.6f, which=%s",
+                        tick.symbol, pos_state.to_str_side(), float(tick.price), which
+                    )
+                    # Trigger exit asynchronously (don't block tick processing)
+                    asyncio.create_task(self._handle_sltp_exit(tick.symbol, pos_state))
+        except Exception:
+            # SL/TP monitoring is best-effort, don't break tick processing
             pass
 
         # ---------- exchange helpers (live Binance integration) ----------
@@ -687,11 +807,12 @@ class Worker:
         - обновляет side / qty / entry_px
         - подтягивает sl_px / tp_px и sl_order_id / tp_order_id из reduceOnly-ордеров
 
-        Ничего не ломает, если что-то пойдёт не так — просто пишет warning.
+        Если на бирже позиция закрылась, а локально была OPEN с trade_id — считаем это
+        внешним закрытием (manual close) и регистрируем сделку.
         """
         adapter = self._get_live_adapter()
         if adapter is None:
-            # paper режим или нет live-адаптера — ничего не делаем
+            # paper-режим или нет live-адаптера — ничего не делаем
             return
 
         sym_u = symbol.upper()
@@ -703,7 +824,7 @@ class Worker:
             logger.warning("[exchange_sync] get_positions failed: %s", e)
             return
 
-        pos_row = None
+        pos_row: Optional[Dict[str, Any]] = None
         for p in positions or []:
             try:
                 if str(p.get("symbol", "")).upper() == sym_u:
@@ -714,7 +835,7 @@ class Worker:
 
         ext_amt = 0.0
         entry_px = 0.0
-        side: Optional[str] = None
+        side: Optional[str] = None  # BUY / SELL с точки зрения биржи
 
         if pos_row is not None:
             try:
@@ -729,7 +850,7 @@ class Worker:
             if abs(ext_amt) > 1e-9:
                 side = "BUY" if ext_amt > 0 else "SELL"
 
-        # --- 2. Читаем открытые ордера (чтобы понять SL/TP) ---
+        # --- 2. Читаем открытые ордера (SL/TP reduceOnly) ---
         sl_px: Optional[float] = None
         tp_px: Optional[float] = None
         sl_oid: Optional[str] = None
@@ -760,7 +881,6 @@ class Worker:
                         sl_px = sp
                         sl_oid = coid
                 elif otype in ("TAKE_PROFIT_MARKET", "LIMIT"):
-                    # TP может быть TP_MARKET(stopPrice) или LIMIT(price)
                     price = float(od.get("stopPrice") or od.get("price") or 0.0)
                     if price > 0:
                         tp_px = price
@@ -768,42 +888,171 @@ class Worker:
             except Exception:
                 continue
 
-        # --- 3. Обновляем локальный snapshot ---
+        # --- 3. Берём предыдущий локальный стейт ---
         prev = self._pos.get(sym_u)
-        # таймаут возьмём из предыдущего snapshot'а или дефолт
         default_timeout_ms = 180_000
         timeout_ms = prev.timeout_ms if prev is not None else default_timeout_ms
         trade_id = prev.trade_id if prev is not None else None
+        opened_ts_ms = prev.opened_ts_ms if prev is not None else 0
 
-        # CRITICAL FIX: Preserve existing SL/TP order IDs if not found on exchange
-        # This prevents losing order IDs due to timing issues or temporary API glitches
-        prev_sl_oid = prev.sl_order_id if prev is not None else None
-        prev_tp_oid = prev.tp_order_id if prev is not None else None
-        prev_sl_px = prev.sl_px if prev is not None else None
-        prev_tp_px = prev.tp_px if prev is not None else None
-        
-        # If we have existing order IDs but didn't find them on exchange, preserve them
-        # (they might be temporarily not visible or there's a timing issue)
-        if prev_sl_oid and not sl_oid:
-            sl_oid = prev_sl_oid
-            if not sl_px and prev_sl_px:
-                sl_px = prev_sl_px
-            logger.warning(
-                "[exchange_sync] %s: SL order ID not found on exchange, preserving existing: %s",
-                sym_u, prev_sl_oid
-            )
-        
-        if prev_tp_oid and not tp_oid:
-            tp_oid = prev_tp_oid
-            if not tp_px and prev_tp_px:
-                tp_px = prev_tp_px
-            logger.warning(
-                "[exchange_sync] %s: TP order ID not found on exchange, preserving existing: %s",
-                sym_u, prev_tp_oid
-            )
-
+        # --- 4. На бирже FLAT: обрабатываем возможное внешнее закрытие ---
         if side is None or abs(ext_amt) <= 1e-9:
-            # Позиции на бирже нет → локально FLAT
+            try:
+                # WARNING if we detect external close but have no trade_id
+                if (
+                    prev is not None
+                    and prev.state == "OPEN"
+                    and float(prev.qty or 0.0) > 0.0
+                    and not trade_id
+                ):
+                    logger.warning(
+                        "[exchange_sync] %s external close detected but trade_id is None! "
+                        "Trade will NOT be recorded in DB. "
+                        "Position: side=%s, qty=%.6f, entry_px=%.2f, opened_ts_ms=%d",
+                        sym_u,
+                        prev.side,
+                        float(prev.qty or 0.0),
+                        float(prev.entry_px or 0.0),
+                        prev.opened_ts_ms or 0,
+                    )
+                
+                if (
+                    prev is not None
+                    and prev.state == "OPEN"
+                    and float(prev.qty or 0.0) > 0.0
+                    and trade_id
+                ):
+                    exit_px: Optional[float] = None
+
+                    # 4.1. Пытаемся взять mid-цену через hub.best_bid_ask
+                    with contextlib.suppress(Exception):
+                        bid, ask = self.hub.best_bid_ask(sym_u)
+                        if bid > 0.0 and ask > 0.0:
+                            exit_px = (float(bid) + float(ask)) / 2.0
+                        else:
+                            exit_px = float(max(bid, ask))
+
+                    # 4.2. Fallback: используем entry_px / prev.entry_px
+                    if exit_px is None or exit_px <= 0.0:
+                        exit_px = float(entry_px or prev.entry_px or 0.0)
+
+                    if exit_px and exit_px > 0.0:
+                        # 4.3. Cancel bracket orders (SL/TP) if they exist
+                        sl_oid = getattr(prev, "sl_order_id", None)
+                        tp_oid = getattr(prev, "tp_order_id", None)
+                        if sl_oid or tp_oid:
+                            ex = self.execs.get(sym_u)
+                            if ex is not None:
+                                cancel_bracket = getattr(ex, "cancel_bracket", None)
+                                cancel_order = getattr(ex, "cancel_order", None)
+
+                                if callable(cancel_bracket):
+                                    try:
+                                        result = await cancel_bracket(
+                                            sym_u,
+                                            sl_order_id=sl_oid,
+                                            tp_order_id=tp_oid,
+                                        )
+                                        logger.info(
+                                            "[exchange_sync] cancel_bracket for external_close on %s: sl_order_id=%s, tp_order_id=%s, result=%s",
+                                            sym_u, sl_oid, tp_oid, result
+                                        )
+                                    except Exception as e_cancel:
+                                        logger.error(
+                                            "[exchange_sync] cancel_bracket failed for %s: sl_order_id=%s, tp_order_id=%s, error=%s",
+                                            sym_u, sl_oid, tp_oid, e_cancel
+                                        )
+                                elif callable(cancel_order):
+                                    for oid in (sl_oid, tp_oid):
+                                        if oid:
+                                            with contextlib.suppress(Exception):
+                                                await cancel_order(sym_u, oid)
+                                                logger.info(
+                                                    "[exchange_sync] cancel_order for external_close on %s: order_id=%s",
+                                                    sym_u, oid
+                                                )
+
+                        # 4.4. Compute PnL estimate
+                        entry_px_val = float(prev.entry_px or 0.0)
+                        qty_val = float(prev.qty or 0.0)
+                        exit_px_val = float(exit_px)
+                        side_val = str(prev.side or "").upper()
+
+                        # Calculate gross PnL based on position side
+                        pnl_gross = 0.0
+                        if side_val == "BUY":
+                            # LONG: profit when exit > entry
+                            pnl_gross = (exit_px_val - entry_px_val) * qty_val
+                        elif side_val == "SELL":
+                            # SHORT: profit when entry > exit
+                            pnl_gross = (entry_px_val - exit_px_val) * qty_val
+
+                        # R estimate is approximate (we don't have clean risk info for external close)
+                        r_est = 0.0
+
+                        logger.info(
+                            "[exchange_sync] %s external close detected: trade_id=%s, side=%s, qty=%.6f, entry_px=%s, exit_px=%s, pnl_gross=%.4f",
+                            sym_u,
+                            trade_id,
+                            side_val,
+                            qty_val,
+                            entry_px_val,
+                            exit_px_val,
+                            pnl_gross,
+                        )
+
+                        # 4.5. Закрываем трейд в БД
+                        repo_close_trade = None
+                        try:
+                            from storage.repo import close_trade as repo_close_trade  # type: ignore
+                        except Exception as e_imp:
+                            logger.warning(
+                                "[exchange_sync] cannot import repo.close_trade for %s trade_id=%s: %s",
+                                sym_u,
+                                trade_id,
+                                e_imp,
+                            )
+
+                        if repo_close_trade is not None:
+                            try:
+                                repo_close_trade(
+                                    trade_id=trade_id,
+                                    exit_px=exit_px_val,
+                                    r=r_est,
+                                    pnl_usd=pnl_gross,
+                                    reason_close="external_close",
+                                )
+                            except Exception as e_close:
+                                logger.warning(
+                                    "[exchange_sync] repo_close_trade failed for %s trade_id=%s: %s",
+                                    sym_u,
+                                    trade_id,
+                                    e_close,
+                                )
+
+                        # 4.6. Обновляем in-memory статистику, если есть helper'ы
+                        with contextlib.suppress(Exception):
+                            if hasattr(self, "_build_trade_record") and hasattr(self, "_register_trade"):
+                                entry_steps = self._entry_steps.get(sym_u, [])
+                                trade_rec = self._build_trade_record(  # type: ignore[attr-defined]
+                                    sym_u,
+                                    prev,
+                                    exit_px_val,
+                                    reason="external_close",
+                                    entry_steps=entry_steps,
+                                    exit_steps=[],
+                                )
+                                self._register_trade(trade_rec)  # type: ignore[attr-defined]
+
+            except Exception as e:
+                logger.warning(
+                    "[exchange_sync] failed to register external close for %s trade_id=%s: %s",
+                    sym_u,
+                    trade_id,
+                    e,
+                )
+
+            # Приводим локальный стейт к FLAT
             self._pos[sym_u] = PositionState(
                 state="FLAT",
                 side=None,
@@ -813,40 +1062,209 @@ class Worker:
                 tp_px=None,
                 opened_ts_ms=0,
                 timeout_ms=timeout_ms,
-                trade_id=trade_id,
+                trade_id=None,
                 sl_order_id=None,
                 tp_order_id=None,
             )
+            # Update unified PositionState
+            self._update_unified_position_state(sym_u)
             logger.info("[exchange_sync] %s -> FLAT (no position on exchange)", sym_u)
-        else:
-            # На бирже открыта позиция → подстраиваемся под неё
-            now_ms = self._now_ms()
-            opened_ts_ms = prev.opened_ts_ms if (prev is not None and prev.state == "OPEN") else now_ms
+            
+            # Чистим все stray reduceOnly ордера после обновления стейта
+            await self._cleanup_brackets_for_symbol(sym_u)
+            return
 
-            self._pos[sym_u] = PositionState(
-                state="OPEN",
-                side=side,  # type: ignore[arg-type]
-                qty=abs(ext_amt),
-                entry_px=float(entry_px),
-                sl_px=sl_px,
-                tp_px=tp_px,
-                opened_ts_ms=opened_ts_ms,
-                timeout_ms=timeout_ms,
-                trade_id=trade_id,
-                sl_order_id=sl_oid,
-                tp_order_id=tp_oid,
+        # --- 5. На бирже есть позиция: синхронизируем OPEN-состояние ---
+        now_ms = self._now_ms()
+        if prev is not None and prev.state == "OPEN":
+            opened_ts_ms = prev.opened_ts_ms or now_ms
+        else:
+            opened_ts_ms = now_ms
+
+        # Preserve previous SL/TP if not found in open orders (defensive: don't overwrite valid values with None)
+        # This handles cases where TP order already filled, was cancelled, or parsing failed
+        if sl_px is None and prev is not None and prev.sl_px is not None:
+            sl_px = prev.sl_px
+        if tp_px is None and prev is not None and prev.tp_px is not None:
+            tp_px = prev.tp_px
+
+        self._pos[sym_u] = PositionState(
+            state="OPEN",
+            side=side,  # type: ignore[arg-type]
+            qty=abs(ext_amt),
+            entry_px=float(entry_px),
+            sl_px=sl_px,
+            tp_px=tp_px,
+            opened_ts_ms=opened_ts_ms,
+            timeout_ms=timeout_ms,
+            trade_id=trade_id,
+            sl_order_id=sl_oid,
+            tp_order_id=tp_oid,
+        )
+
+        logger.info(
+            "[exchange_sync] %s synced from exchange: side=%s qty=%.6f entry_px=%s sl=%s tp=%s sl_oid=%s tp_oid=%s",
+            sym_u,
+            side,
+            abs(ext_amt),
+            entry_px,
+            sl_px,
+            tp_px,
+            sl_oid,
+            tp_oid,
+        )
+        
+        # Чистим все stray reduceOnly ордера после обновления стейта
+        await self._cleanup_brackets_for_symbol(sym_u)
+
+    async def _cleanup_brackets_for_symbol(self, symbol: str) -> None:
+        """
+        Агрессивная очистка всех stray SL/TP (reduceOnly) ордеров для символа.
+
+        Правила:
+        - Если локальная позиция FLAT → отменяем ВСЕ reduceOnly ордера.
+        - Если локальная позиция OPEN → отменяем reduceOnly ордера, чей origQty значительно
+          больше текущего размера позиции (> pos.qty * 1.01), т.к. это остатки от старых сделок.
+
+        Вызывается:
+        1) После _sync_symbol_from_exchange (гарантия чистоты после обновления стейта)
+        2) Перед открытием новой позиции (гарантия отсутствия ghost-ордеров)
+
+        ВАЖНО:
+        - НИКОГДА не падает наружу (все ошибки логируются и suppress'ятся).
+        - Явно логирует список отменённых ордеров (INFO).
+        - Логирует ошибки отмены как WARNING (не блокирует основной флоу).
+        """
+        adapter = self._get_live_adapter()
+        if adapter is None:
+            # paper-режим или нет live-адаптера — ничего не делаем
+            return
+
+        sym_u = symbol.upper()
+
+        # --- 1. Читаем открытые ордера ---
+        open_orders: list[dict[str, Any]] = []
+        try:
+            open_orders = await adapter.get_open_orders(symbol=sym_u)  # type: ignore[arg-type]
+        except asyncio.CancelledError:
+            # Shutdown in progress - don't log as error
+            return
+        except Exception as e:
+            logger.warning(
+                "[bracket_gc] get_open_orders(%s) failed: %s", sym_u, e
+            )
+            return
+
+        if not open_orders:
+            # Нет открытых ордеров — нечего чистить
+            return
+
+        # --- 2. Фильтруем только reduceOnly ордера ---
+        reduce_only_orders: list[dict[str, Any]] = []
+        for od in open_orders:
+            try:
+                if str(od.get("symbol", "")).upper() != sym_u:
+                    continue
+
+                # Проверяем флаг reduceOnly (может быть bool или string "true"/"false")
+                reduce_only = od.get("reduceOnly")
+                if isinstance(reduce_only, bool):
+                    is_reduce_only = reduce_only
+                else:
+                    is_reduce_only = str(reduce_only or "").lower() in ("true", "1")
+
+                if is_reduce_only:
+                    reduce_only_orders.append(od)
+            except Exception as e:
+                logger.debug(
+                    "[bracket_gc] failed to parse order %r for %s: %s",
+                    od, sym_u, e
+                )
+                continue
+
+        if not reduce_only_orders:
+            # Нет reduceOnly ордеров — нечего чистить
+            return
+
+        # --- 3. Проверяем локальный стейт позиции ---
+        pos = self._pos.get(sym_u)
+        local_is_flat = (
+            pos is None
+            or pos.state == "FLAT"
+            or abs(float(pos.qty or 0.0)) <= 1e-9
+        )
+
+        local_qty = 0.0
+        if pos is not None and pos.state == "OPEN":
+            local_qty = abs(float(pos.qty or 0.0))
+
+        # --- 4. Определяем, какие ордера нужно отменить ---
+        to_cancel: list[tuple[str, str]] = []  # (client_order_id, reason)
+
+        for od in reduce_only_orders:
+            try:
+                coid = str(od.get("clientOrderId") or "")
+                if not coid:
+                    # Нет clientOrderId — пропускаем (не можем отменить)
+                    continue
+
+                # Если локально FLAT → отменяем все reduceOnly
+                if local_is_flat:
+                    to_cancel.append((coid, "local_flat"))
+                    continue
+
+                # Если локально OPEN → проверяем размер ордера
+                try:
+                    orig_qty = float(od.get("origQty") or 0.0)
+                except Exception:
+                    orig_qty = 0.0
+
+                # Если origQty значительно больше текущей позиции → это stray order
+                if orig_qty > local_qty * 1.01 and local_qty > 0.0:
+                    to_cancel.append((coid, "qty_mismatch"))
+                    continue
+
+            except Exception as e:
+                logger.debug(
+                    "[bracket_gc] failed to check order %r for %s: %s",
+                    od, sym_u, e
+                )
+                continue
+
+        if not to_cancel:
+            # Нет ордеров для отмены
+            return
+
+        # --- 5. Отменяем stray ордера ---
+        canceled: list[str] = []
+        failed: list[tuple[str, str]] = []  # (coid, error_msg)
+
+        for coid, reason in to_cancel:
+            try:
+                await adapter.cancel_order(sym_u, client_order_id=coid)  # type: ignore[arg-type]
+                canceled.append(coid)
+                logger.debug(
+                    "[bracket_gc] %s canceled order %s (reason=%s)",
+                    sym_u, coid, reason
+                )
+            except Exception as e:
+                failed.append((coid, str(e)))
+                logger.warning(
+                    "[bracket_gc] %s failed to cancel order %s (reason=%s): %s",
+                    sym_u, coid, reason, e
+                )
+
+        # --- 6. Итоговый лог ---
+        if canceled:
+            logger.info(
+                "[bracket_gc] %s cleaned up %d stray reduceOnly orders: %s",
+                sym_u, len(canceled), canceled
             )
 
+        if failed:
             logger.warning(
-                "[exchange_sync] %s synced from exchange: side=%s qty=%.6f entry_px=%s sl=%s tp=%s sl_oid=%s tp_oid=%s",
-                sym_u,
-                side,
-                abs(ext_amt),
-                entry_px,
-                sl_px,
-                tp_px,
-                sl_oid,
-                tp_oid,
+                "[bracket_gc] %s failed to cancel %d orders: %s",
+                sym_u, len(failed), [f"{c}({e})" for c, e in failed]
             )
 
     async def _sanity_check_live_start(self, account_cfg: Any) -> None:
@@ -937,7 +1355,9 @@ class Worker:
             margin_mode = "ISOLATED"
 
         for sym in self.symbols:
+            # TEMP: single-symbol mode GALAUSDT, 10x leverage
             # --- leverage: per-symbol если есть метод _leverage_for_symbol, иначе общий ---
+            # Leverage is read from config (per_symbol_leverage or account.leverage), fixed at 10x for GALAUSDT
             try:
                 if hasattr(self, "_leverage_for_symbol"):
                     lev = int(self._leverage_for_symbol(sym))
@@ -951,7 +1371,12 @@ class Worker:
                 if hasattr(adapter, "set_margin_type"):
                     await adapter.set_margin_type(sym, margin_mode)
             except Exception as e:
-                logger.warning("[worker.live] set_margin_type(%s, %s) failed: %s", sym, margin_mode, e)
+                # Binance returns -4046 when margin type is already set (harmless)
+                binance_code = getattr(e, "binance_code", None)
+                if binance_code == -4046:
+                    logger.info("[worker.live] set_margin_type(%s, %s): already set (code=-4046)", sym, margin_mode)
+                else:
+                    logger.warning("[worker.live] set_margin_type(%s, %s) failed: %s", sym, margin_mode, e)
 
             # leverage
             try:
@@ -968,131 +1393,180 @@ class Worker:
         """
         Периодическая сверка локального FSM с биржей (positionRisk).
 
-        Новая логика:
+        Логика (согласно SPEC 2.1–2.3):
 
-        1) Биржа считается источником истины.
-        2) Если ext_amt != local_amt → пробуем auto-sync через _sync_symbol_from_exchange().
-        3) Если после sync всё сошлось → просто логируем и живём дальше.
-        4) Если после sync всё равно mismatch → выключаем авто-режим и отмечаем
-           GLOBAL:exchange_mismatch (как и раньше).
+        1) Биржа считается источником истины (SPEC 2.1).
+        2) Для каждого символа периодически вызываем _sync_symbol_from_exchange(symbol),
+           который является ЕДИНСТВЕННОЙ точкой входа для синхронизации позиций.
+        3) После синхронизации проверяем, сошлось ли состояние; если нет — логируем
+           и выключаем авто-режим.
 
-        Это лечит:
-          - ситуацию, когда лимитка исполнилась, а мы подумали, что она "CANCELED"
-            и оставили локально FLAT;
-          - ситуацию после перезапуска, когда на бирже уже есть открытая позиция,
-            а локальный FSM ещё FLAT.
+        Это гарантирует:
+          - Все изменения позиций на бирже автоматически подхватываются,
+          - Нет конфликтующей логики, которая напрямую мутирует self._pos[sym],
+          - _sync_symbol_from_exchange обрабатывает все кейсы (FLAT/OPEN, trade_id).
         """
         logger.info("[exchange_guard] consistency loop started, interval_s=%s", interval_s)
 
-        while not self._stop_event.is_set():
-            await asyncio.sleep(interval_s)
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.sleep(interval_s)
 
-            # CRITICAL FIX: Refresh AccountState periodically to keep it synchronized
-            try:
-                if hasattr(self, "_account_state") and self._account_state:
-                    await self._account_state.refresh()
-            except Exception as e:
-                logger.warning("[exchange_guard] AccountState refresh failed: %s", e)
-
-            adapter = self._get_live_adapter()
-            if adapter is None:
-                # paper или нет live-адаптера — нечего сверять
-                continue
-
-            try:
-                positions = await adapter.get_positions()
-            except Exception as e:
-                logger.warning("[exchange_guard] get_positions error: %s", e)
-                continue
-
-            external_amt: dict[str, float] = {}
-            for p in positions or []:
+                # Refresh AccountState periodically to keep it synchronized
                 try:
-                    sym = str(p.get("symbol", "")).upper()
-                    if sym not in self.symbols:
-                        continue
-                    amt = float(p.get("positionAmt") or 0.0)
-                    external_amt[sym] = amt
-                except Exception:
-                    continue
-
-            mismatches: list[str] = []
-
-            for sym in self.symbols:
-                sym_u = sym.upper()
-                ext_amt = float(external_amt.get(sym_u, 0.0))
-
-                local = self._pos.get(sym_u)
-                local_amt = 0.0
-                if local and local.state != "FLAT" and local.qty > 0:
-                    local_amt = local.qty if local.side == "BUY" else -local.qty
-
-                # Уже совпадает → ок
-                if abs(ext_amt - local_amt) <= 1e-8:
-                    continue
-
-                # --- сначала пытаемся синкануться с биржей ---
-                try:
-                    await self._sync_symbol_from_exchange(sym_u)
-                    local2 = self._pos.get(sym_u)
-                    local_amt2 = 0.0
-                    if local2 and local2.state != "FLAT" and local2.qty > 0:
-                        local_amt2 = local2.qty if local2.side == "BUY" else -local2.qty
-
-                    if abs(ext_amt - local_amt2) <= 1e-8:
-                        # auto-heal прошёл успешно
-                        logger.warning(
-                            "[exchange_guard] auto-synced %s: ext=%.6f, local_before=%.6f, local_after=%.6f",
-                            sym_u,
-                            ext_amt,
-                            local_amt,
-                            local_amt2,
-                        )
-                        continue
+                    if hasattr(self, "_account_state") and self._account_state:
+                        await self._account_state.refresh()
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    logger.warning("[exchange_guard] auto-sync failed for %s: %s", sym_u, e)
+                    logger.warning("[exchange_guard] AccountState refresh failed: %s", e)
 
-                # Если сюда дошли — mismatch не смогли вылечить
-                mismatches.append(f"{sym_u}: ext={ext_amt}, local={local_amt}")
+                adapter = self._get_live_adapter()
+                if adapter is None:
+                    # нет live-адаптера — нечего сверять
+                    continue
 
-            if mismatches:
-                msg = ", ".join(mismatches)
-
-                # Выключаем только один раз, чтобы не спамить логами
-                if self._auto_enabled:
-                    logger.error(
-                        "[exchange_guard] exchange/worker mismatch, disabling auto: %s",
-                        msg,
-                    )
-                    self._auto_enabled = False
-
+                # Предварительно читаем позиции для последующей валидации
                 try:
-                    self._block_reasons["GLOBAL:exchange_mismatch"] = (
-                        self._block_reasons.get("GLOBAL:exchange_mismatch", 0) + 1
+                    positions = await adapter.get_positions()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("[exchange_guard] get_positions error: %s", e)
+                    continue
+
+                external_amt: dict[str, float] = {}
+                for p in positions or []:
+                    try:
+                        sym = str(p.get("symbol", "")).upper()
+                        if sym not in self.symbols:
+                            continue
+                        amt = float(p.get("positionAmt") or 0.0)
+                        external_amt[sym] = amt
+                    except Exception:
+                        continue
+
+                mismatches: list[str] = []
+
+                # --- Синхронизируем каждый символ через _sync_symbol_from_exchange ---
+                for sym in self.symbols:
+                    sym_u = sym.upper()
+                    ext_amt = float(external_amt.get(sym_u, 0.0))
+
+                    # Запоминаем локальное состояние ДО синхронизации для логирования
+                    local_before = self._pos.get(sym_u)
+                    local_amt_before = 0.0
+                    if local_before and local_before.state != "FLAT" and local_before.qty > 0:
+                        local_amt_before = (
+                            local_before.qty if local_before.side == "BUY" else -local_before.qty
+                        )
+
+                    # --- Вызываем _sync_symbol_from_exchange как единственную точку входа ---
+                    try:
+                        await self._sync_symbol_from_exchange(sym_u)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "[exchange_guard] _sync_symbol_from_exchange failed for %s: %s", sym_u, e
+                        )
+                        # Если синхронизация упала — считаем это mismatch
+                        mismatches.append(f"{sym_u}: sync_failed ({e})")
+                        continue
+
+                    # Проверяем локальное состояние ПОСЛЕ синхронизации
+                    local_after = self._pos.get(sym_u)
+                    local_amt_after = 0.0
+                    if local_after and local_after.state != "FLAT" and local_after.qty > 0:
+                        local_amt_after = (
+                            local_after.qty if local_after.side == "BUY" else -local_after.qty
+                        )
+
+                    # Если после синхронизации локальное состояние совпадает с биржей — ок
+                    if abs(ext_amt - local_amt_after) <= 1e-8:
+                        # Логируем только если было изменение
+                        if abs(local_amt_before - local_amt_after) > 1e-8:
+                            logger.info(
+                                "[exchange_guard] synced %s: ext=%.6f, local_before=%.6f, local_after=%.6f",
+                                sym_u,
+                                ext_amt,
+                                local_amt_before,
+                                local_amt_after,
+                            )
+                        continue
+
+                    # Если после синхронизации всё ещё mismatch — это ошибка
+                    logger.warning(
+                        "[exchange_guard] mismatch after sync for %s: ext=%.6f, local_after=%.6f",
+                        sym_u,
+                        ext_amt,
+                        local_amt_after,
                     )
-                except Exception:
-                    pass
+                    mismatches.append(f"{sym_u}: ext={ext_amt}, local={local_amt_after}")
+
+                if mismatches:
+                    msg = ", ".join(mismatches)
+                    
+                    # Increment desync counter
+                    self._desync_count += 1
+                    logger.warning(
+                        "[exchange_guard] desync detected (count=%d): %s",
+                        self._desync_count, msg
+                    )
+                    
+                    # If 3 consecutive desyncs, disable auto-trading
+                    if self._desync_count >= 3:
+                        if self._auto_enabled:
+                            logger.error(
+                                "[exchange_guard] persistent desync detected (%d consecutive iterations), disabling auto-trading: %s",
+                                self._desync_count, msg
+                            )
+                            self._auto_enabled = False
+                        else:
+                            # Already disabled, just log the persistent desync
+                            logger.error(
+                                "[exchange_guard] persistent desync continues (%d consecutive iterations): %s",
+                                self._desync_count, msg
+                            )
+
+                    try:
+                        self._block_reasons["GLOBAL:exchange_mismatch"] = (
+                            self._block_reasons.get("GLOBAL:exchange_mismatch", 0) + 1
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # No mismatches, reset desync counter
+                    if self._desync_count > 0:
+                        logger.info("[exchange_guard] desync cleared, resetting counter from %d to 0", self._desync_count)
+                    self._desync_count = 0
+        except asyncio.CancelledError:
+            logger.info("[exchange_guard] consistency loop cancelled, exiting")
+            raise
+        except Exception as e:
+            logger.exception("[exchange_guard] consistency loop error: %s", e)
 
 
     # ---------- strategy loop (авто-сигналы) ----------
 
     async def _strategy_loop(self) -> None:
         """
-        Боевой авто-скальпер (MVP):
+        Боевой авто-скальпер (Bollinger reversion MVP):
 
-        - Работает по времени: окна ~7s (long) и ~2s (short).
+        - Работает по времени: одно «длинное» окно для расчёта Bollinger.
         - Включается только когда _auto_enabled == True.
         - Учитывает:
             * cooldown между входами по символу
             * min_flat_ms после FLAT
             * глобальный cooldown после SL (из risk_cfg)
-        - Простые сигналы:
-            * momentum (пробой края диапазона + локальный тренд)
-            * reversion (отскок от края, когда тренд не сильный)
-            * micro-momentum по микрофичам, если доступны
-        - Safety:
-            * спред / ликвидность через risk.filters
             * day_limits из diag()
+            * максимум 1 активная позиция суммарно
+        - Простые сигналы:
+            * reversion по Bollinger: LONG от нижней полосы к центру,
+            SHORT от верхней полосы к центру.
+        - Safety:
+            * спред / ликвидность через risk.filters (если настроены)
+            * лимиты по дню (day_limits)
         - Все отказы пишутся в _block_reasons через self._inc_block_reason(reason).
         """
         import asyncio
@@ -1102,6 +1576,20 @@ class Worker:
         from typing import Dict, Any, List
 
         log = logging.getLogger(__name__ + "._strategy")
+        logger.info("[WORKER] strategy loop started")
+        
+        # Get strategy mode from settings
+        strategy_mode = "reversion_only"  # default
+        try:
+            if get_settings:
+                s = get_settings()
+                strat_cfg = getattr(s, "strategy", None)
+                if strat_cfg:
+                    strategy_mode = str(getattr(strat_cfg, "mode", strategy_mode))
+        except Exception:
+            pass
+        
+        log.info("[strategy] _strategy_loop started: symbols=%s, mode=%s", list(self.symbols), strategy_mode)
 
         # --- cfg стратегии из settings (если есть) ---
         cfg: Dict[str, Any] = {}
@@ -1112,11 +1600,24 @@ class Worker:
             log.warning("[strategy] _load_strategy_cfg failed: %s", e)
             cfg = {}
         self._strategy_cfg = dict(cfg or {})
+        
+        # Load StrategyCfg for router
+        router_cfg = None
+        try:
+            if get_settings:
+                s = get_settings()
+                strat_cfg = getattr(s, "strategy", None)
+                if strat_cfg:
+                    router_cfg = StrategyCfg.from_pydantic(strat_cfg)
+        except Exception as e:
+            log.warning("[strategy] failed to load StrategyCfg for router: %s", e)
+            router_cfg = StrategyCfg()  # use defaults
 
         symbols = list(self.symbols)
         if not symbols:
-            log.warning("[strategy] no symbols configured, exit.")
+            log.warning("[WORKER] strategy loop: no symbols configured, exit.")
             return
+        logger.info(f"[WORKER] strategy loop: monitoring symbols={symbols}")
 
         # --- тайминги ---
         cooldown_ms = int(cfg.get("cooldown_ms", getattr(self, "_auto_cooldown_ms", 2000)))
@@ -1128,17 +1629,19 @@ class Worker:
         warmup_ms = int(cfg.get("warmup_ms", 15_000))
         stale_ms  = int(cfg.get("stale_ms", 3_000))
 
-        long_ms   = int(cfg.get("long_ms", 7_000))
-        short_ms  = int(cfg.get("short_ms", 2_000))
+        # окно для Bollinger (по умолчанию 7s как «long_ms» раньше)
+        bb_window_ms = int(cfg.get("bb_window_ms", cfg.get("long_ms", 7_000)))
+        bb_window_ms = max(3_000, bb_window_ms)
 
-        # --- пороги логики ---
-        ma_edge_mom    = float(cfg.get("ma_edge_mom", 0.00005))
-        slope_edge_mom = float(cfg.get("slope_edge_mom", 0.000004))
-
-        ma_edge_rev    = float(cfg.get("ma_edge_rev", 0.00003))
+        # --- пороги Bollinger ---
+        bb_k          = float(cfg.get("bb_k", 2.0))          # ширина полос в сигмах
+        bb_entry_z    = float(cfg.get("bb_entry_z", 1.5))    # сколько сигм от центра для входа
+        bb_stop_k     = float(cfg.get("bb_stop_k", 1.0))     # стоп в сигмах за полосой
+        min_sigma_rel = float(cfg.get("min_sigma_rel", 0.0001))  # минимальная относительная вола
 
         min_range_bps   = float(cfg.get("min_range_bps", 0.3))
         min_range_ticks = int(cfg.get("min_range_ticks", 1))
+        bb_min_points   = int(cfg.get("bb_min_points", 32))
 
         # пер-символьный cooldown
         last_entry_ts: Dict[str, int] = {s: 0 for s in symbols}
@@ -1222,9 +1725,13 @@ class Worker:
 
                     if mid > 0.0:
                         try:
-                            tick_sz = float(self.hub.price_tick(sym))
+                            spec = self.specs.get(sym)
+                            if spec:
+                                tick_sz = float(getattr(spec, "price_tick", 0.01))
+                            else:
+                                tick_sz = 0.01
                         except Exception:
-                            tick_sz = 0.0
+                            tick_sz = 0.01
                         if tick_sz <= 0.0:
                             tick_sz = mid * 0.0001
                         bid = mid - tick_sz
@@ -1257,13 +1764,36 @@ class Worker:
 
         base_delay_s = max(0.1, cooldown_ms / 4000.0)
 
+        # Track last heartbeat log time for periodic logging
+        last_heartbeat_log_ms = 0
+        heartbeat_log_interval_ms = 5000  # 5 seconds
+        
         try:
             while True:
                 try:
                     now = _now_ms()
                     self._strategy_heartbeat_ms = now
+                    auto_enabled = bool(getattr(self, "_auto_enabled", False))
 
-                    if not bool(getattr(self, "_auto_enabled", False)):
+                    # Periodic strategy heartbeat log (every 5 seconds) - log even when disabled
+                    if now - last_heartbeat_log_ms >= heartbeat_log_interval_ms:
+                        last_heartbeat_log_ms = now
+                        # Collect last price for each symbol
+                        heartbeat_info = []
+                        for sym in symbols:
+                            try:
+                                bid, ask = _load_best(sym, {}, now)
+                                if bid > 0 and ask > 0:
+                                    price = (bid + ask) / 2.0
+                                    heartbeat_info.append(f"{sym}: price={price:.6f}")
+                            except Exception:
+                                pass
+                        if heartbeat_info:
+                            logger.info(f"[WORKER] strategy heartbeat: auto_enabled={auto_enabled}, symbols: {', '.join(heartbeat_info)}")
+                        else:
+                            logger.info(f"[WORKER] strategy heartbeat: auto_enabled={auto_enabled}, no price data yet")
+
+                    if not auto_enabled:
                         await asyncio.sleep(0.3)
                         continue
 
@@ -1293,8 +1823,8 @@ class Worker:
                         await asyncio.sleep(1.0)
                         continue
 
-                    positions = d.get("positions") or {}
-                    best_all = d.get("best") or {}
+                    positions    = d.get("positions") or {}
+                    best_all     = d.get("best") or {}
                     history_meta = d.get("history") or {}
 
                     # --- глобальный лимит по числу позиций (MVP: максимум 1) ---
@@ -1309,10 +1839,12 @@ class Worker:
 
                     for sym in symbols:
                         try:
+                            log.debug(f"[WORKER] evaluating strategy for symbol={sym}")
                             pos = positions.get(sym) or {}
                             st = str(pos.get("state", "")).upper()
                             if st in ("OPEN", "ENTERING", "EXITING"):
                                 # по этому символу уже что-то есть
+                                log.debug(f"[WORKER] symbol={sym} already has position state={st}, skipping")
                                 continue
 
                             # если где-то уже есть открытая/входящая/выходящая позиция —
@@ -1321,6 +1853,7 @@ class Worker:
                                 _inc_block(f"{sym}:global_pos_limit")
                                 continue
 
+                            # пер-символьный cooldown
                             if now - last_entry_ts.get(sym, 0) < cooldown_ms:
                                 _inc_block(f"{sym}:cooldown_symbol")
                                 continue
@@ -1356,6 +1889,90 @@ class Worker:
                                 _inc_block(f"{sym}:stale_history_meta")
                                 continue
 
+                            # Get current position side for router
+                            current_pos_side = None
+                            try:
+                                pos_state = get_position_state(sym)
+                                if not pos_state.is_flat():
+                                    current_pos_side = pos_state.to_str_side()
+                            except Exception:
+                                pass
+
+                            # If using bollinger_basic mode, use pick_candidate from router
+                            if router_cfg and router_cfg.mode == "bollinger_basic":
+                                try:
+                                    micro = self._last_micro.get(sym, {}) or {}
+                                    indi = self._last_indi.get(sym, {}) or {}
+                                    
+                                    # Safety and limits checks
+                                    safety_ok = True
+                                    limits_ok = bool(day_limits.get("can_trade", True))
+                                    
+                                    # Check safety filters
+                                    if HAS_FILTERS and getattr(self, "_safety_cfg", None) is not None:
+                                        try:
+                                            lm = micro or {}
+                                            eff_liq = float(lm.get("top5_liq_usd") or 0.0)
+                                            if eff_liq <= 0.0:
+                                                tl = float(lm.get("top_liq_usd") or 0.0)
+                                                eff_liq = tl * 3.0 if tl > 0.0 else 0.0
+                                            
+                                            micro_ctx = MicroCtx(
+                                                spread_ticks=float(sprticks),
+                                                top5_liq_usd=float(eff_liq if eff_liq > 0.0 else 1e9),
+                                            )
+                                            tctx = TimeCtx(
+                                                ts_ms=now,
+                                                server_time_offset_ms=getattr(self, "_server_time_offset_ms", 0),
+                                            )
+                                            # For bollinger_basic, we don't have entry_px/sl_px yet, so pass None
+                                            dec = check_entry_safety(
+                                                "BUY",  # dummy side for pre-check
+                                                micro=micro_ctx,
+                                                time_ctx=tctx,
+                                                pos_ctx=None,
+                                                safety=self._safety_cfg,
+                                            )
+                                            safety_ok = dec.allow
+                                        except Exception:
+                                            safety_ok = True  # allow if check fails
+                                    
+                                    # Call pick_candidate
+                                    candidate = pick_candidate(
+                                        symbol=sym,
+                                        micro=micro,
+                                        indi=indi,
+                                        safety_ok=safety_ok,
+                                        limits_ok=limits_ok,
+                                        cfg=router_cfg,
+                                        current_position_side=current_pos_side,
+                                    )
+                                    
+                                    if candidate:
+                                        # Execute Bollinger entry
+                                        logger.info(
+                                            "[BOLL] candidate symbol=%s, side=%s, tp_pct=%.4f, sl_pct=%.4f, reason=%s",
+                                            sym, candidate.side, 
+                                            router_cfg.bollinger_basic.tp_pct if router_cfg.bollinger_basic else 0.004,
+                                            router_cfg.bollinger_basic.sl_pct if router_cfg.bollinger_basic else 0.0025,
+                                            getattr(candidate, "reason_tags", [])
+                                        )
+                                        rep = await self.execute_bollinger_entry(candidate)
+                                        if isinstance(rep, dict) and rep.get("ok", False):
+                                            last_entry_ts[sym] = now
+                                            logger.info("[strategy] bollinger_basic entry executed successfully for %s", sym)
+                                        else:
+                                            reason = (rep or {}).get("reason", "unknown")
+                                            _inc_block(f"{sym}:bollinger_entry_failed:{reason}")
+                                    else:
+                                        _inc_block(f"{sym}:no_bollinger_candidate")
+                                    
+                                    continue  # Skip hardcoded logic when using bollinger_basic
+                                except Exception as e:
+                                    log.exception("[strategy] pick_candidate failed for %s: %s", sym, e)
+                                    _inc_block(f"{sym}:pick_candidate_error")
+                                    continue
+
                             try:
                                 ticks = self.history_ticks(sym, since_ms=now - warmup_ms, limit=800)
                             except Exception:
@@ -1381,7 +1998,7 @@ class Worker:
                                     if px is None:
                                         b_ = getattr(t, "bid", None); a_ = getattr(t, "ask", None)
                                         if b_ and a_:
-                                            px = (float(b_) + float(a_)) / 2.0
+                                            px = (float(b_) + float(a_) ) / 2.0
                                     vol = getattr(t, "volume", getattr(t, "qty", getattr(t, "size", 0.0)))
 
                                 if ts > 0 and px is not None:
@@ -1392,34 +2009,27 @@ class Worker:
                                     except Exception:
                                         vols.append(0.0)
 
-                            if len(prices) < 24:
+                            if len(prices) < bb_min_points:
                                 _inc_block(f"{sym}:skip_warmup")
                                 continue
                             if ts_list and now - ts_list[-1] > stale_ms:
                                 _inc_block(f"{sym}:stale_tick")
                                 continue
 
+                            # --- окно для Bollinger ---
                             def slice_since(window_ms: int) -> List[float]:
                                 if not ts_list:
                                     return []
                                 lo = ts_list[-1] - window_ms
                                 return [p for p, ts in zip(prices, ts_list) if ts >= lo]
 
-                            arr_short = slice_since(short_ms)
-                            arr_long = slice_since(long_ms)
-
-                            if len(arr_short) < 6 or len(arr_long) < 12:
-                                _inc_block(f"{sym}:skip_warmup")
+                            arr_win = slice_since(bb_window_ms)
+                            if len(arr_win) < bb_min_points:
+                                _inc_block(f"{sym}:skip_warmup_bb")
                                 continue
 
-                            short_ma = sum(arr_short) / len(arr_short)
-                            long_ma  = sum(arr_long) / len(arr_long)
-                            if long_ma <= 0.0:
-                                _inc_block(f"{sym}:no_baseline")
-                                continue
-
-                            local_high = max(arr_long)
-                            local_low  = min(arr_long)
+                            local_high = max(arr_win)
+                            local_low  = min(arr_win)
                             range_px   = max(0.0, local_high - local_low)
 
                             min_range_px_ticks = step * float(min_range_ticks)
@@ -1429,106 +2039,68 @@ class Worker:
                                 _inc_block(f"{sym}:chop_range")
                                 continue
 
-                            k = max(4, int(0.4 * len(arr_short)))
-                            if len(arr_short) > k:
-                                prev_short_ma = sum(arr_short[:-k]) / max(1, len(arr_short) - k)
-                            else:
-                                prev_short_ma = short_ma
+                            # --- расчёт Bollinger: mid, sigma, полосы ---
+                            mean_px = sum(arr_win) / len(arr_win)
+                            var = sum((p - mean_px) ** 2 for p in arr_win) / max(1, len(arr_win))
+                            sigma = math.sqrt(var)
 
-                            last_px   = prices[-1]
-                            diff_rel  = (short_ma - long_ma) / long_ma
-                            slope_rel = (short_ma - prev_short_ma) / prev_short_ma if prev_short_ma > 0.0 else 0.0
+                            if mean_px <= 0.0 or not math.isfinite(sigma):
+                                _inc_block(f"{sym}:bad_bb_stats")
+                                continue
 
-                            try:
-                                sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid))
-                            except Exception:
-                                if len(arr_long) >= 20:
-                                    m = sum(arr_long[-20:]) / 20.0
-                                    var = sum((p - m) ** 2 for p in arr_long[-20:]) / 20.0
-                                    sigma = math.sqrt(var)
-                                else:
-                                    sigma = range_px / 6.0 if range_px > 0.0 else step * max(1, min_range_ticks)
-                                sl_distance_px = max(
-                                    step * float(min_range_ticks),
-                                    1.2 * sigma,
-                                    spread * 2.0,
-                                )
+                            # минимальная волатильность
+                            if sigma / mean_px < min_sigma_rel:
+                                _inc_block(f"{sym}:sigma_too_small")
+                                continue
 
-                            if sl_distance_px <= 0.0:
+                            bb_mid = mean_px
+                            bb_hi  = bb_mid + bb_k * sigma
+                            bb_lo  = bb_mid - bb_k * sigma
+
+                            last_px = prices[-1]
+                            z = (last_px - bb_mid) / (sigma if sigma > 0.0 else 1e-9)
+
+                            side = None
+                            signal_kind = "bb_reversion"
+
+                            # --- сигналы: от нижней полосы к центру (LONG), от верхней к центру (SHORT) ---
+                            if z <= -bb_entry_z:
+                                side = "BUY"
+                            elif z >= bb_entry_z:
+                                side = "SELL"
+
+                            if side is None:
+                                _inc_block(f"{sym}:no_signal_bb")
+                                continue
+
+                            # --- стоп: за полосой на bb_stop_k * sigma ---
+                            if side == "BUY":
+                                sl_ref = bb_lo - bb_stop_k * sigma
+                                sl_distance_px = max(step * float(min_range_ticks), last_px - sl_ref, spread * 2.0)
+                            else:  # SELL
+                                sl_ref = bb_hi + bb_stop_k * sigma
+                                sl_distance_px = max(step * float(min_range_ticks), sl_ref - last_px, spread * 2.0)
+
+                            if sl_distance_px <= 0.0 or not math.isfinite(sl_distance_px):
                                 _inc_block(f"{sym}:bad_sl_distance")
                                 continue
 
-                            upper_trigger = local_high - 0.5 * sl_distance_px
-                            lower_trigger = local_low  + 0.5 * sl_distance_px
+                            # --- простой sanity-чек RR (опционально) ---
+                            try:
+                                # TP условно около bb_mid
+                                if side == "BUY":
+                                    tp_px = bb_mid
+                                    rr = (tp_px - last_px) / sl_distance_px if sl_distance_px > 0 else 0.0
+                                else:
+                                    tp_px = bb_mid
+                                    rr = (last_px - tp_px) / sl_distance_px if sl_distance_px > 0 else 0.0
+                            except Exception:
+                                rr = 1.0
 
-                            side: Optional[str] = None
-                            signal_kind: Optional[str] = None
-
-                            # momentum
-                            if (
-                                last_px >= upper_trigger
-                                and diff_rel > ma_edge_mom
-                                and slope_rel > slope_edge_mom
-                            ):
-                                side = "BUY"
-                                signal_kind = "momentum"
-                            elif (
-                                last_px <= lower_trigger
-                                and diff_rel < -ma_edge_mom
-                                and slope_rel < -slope_edge_mom
-                            ):
-                                side = "SELL"
-                                signal_kind = "momentum"
-
-                            # reversion
-                            if side is None:
-                                trend_strong = abs(diff_rel) > ma_edge_mom * 2.0
-                                if not trend_strong:
-                                    edge_zone = 0.25 * range_px
-                                    if (
-                                        last_px <= local_low + edge_zone
-                                        and diff_rel > ma_edge_rev
-                                        and slope_rel > 0.0
-                                    ):
-                                        side = "BUY"
-                                        signal_kind = "reversion"
-                                    elif (
-                                        last_px >= local_high - edge_zone
-                                        and diff_rel < -ma_edge_rev
-                                        and slope_rel < 0.0
-                                    ):
-                                        side = "SELL"
-                                        signal_kind = "reversion"
-
-                            # micro-momentum
-                            if side is None and getattr(self, "_last_micro", None):
-                                lm = (self._last_micro or {}).get(sym) or {}
-                                drift = float(lm.get("microprice_drift") or 0.0)
-                                tvel  = float(lm.get("tick_velocity") or 0.0)
-                                if sprticks <= max_spread_ticks_default and abs(drift) > 0.3 and abs(tvel) > 0.5:
-                                    if drift > 0.0 and tvel > 0.0:
-                                        side = "BUY"
-                                        signal_kind = "momentum"
-                                    elif drift < 0.0 and tvel < 0.0:
-                                        side = "SELL"
-                                        signal_kind = "momentum"
-
-                            if side is None:
-                                _inc_block(f"{sym}:no_signal")
+                            min_rr = float(cfg.get("min_rr", 1.1))
+                            if rr < min_rr:
+                                _inc_block(f"{sym}:rr_too_low")
                                 continue
-                            ok_cross, why_cross = self._cross_guard_allow(sym, side)
-                            if not ok_cross:
-                                self._inc_block_reason(f"{sym}:{why_cross}")
-                                continue
-
-                            # объём
-                            if vols and sum(vols) > 0.0:
-                                base_slice = vols[:-5] if len(vols) > 12 else vols
-                                recent = sum(vols[-5:])
-                                base = sum(base_slice) / max(1, len(base_slice)) if base_slice else 0.0
-                                if base > 0.0 and recent < 0.25 * base:
-                                    _inc_block(f"{sym}:low_volume")
-                                    continue
 
                             # safety
                             if HAS_FILTERS and getattr(self, "_safety_cfg", None) is not None:
@@ -1547,9 +2119,9 @@ class Worker:
                                         ts_ms=now,
                                         server_time_offset_ms=getattr(self, "_server_time_offset_ms", 0),
                                     )
-                                    sl_px_eff = mid - sl_distance_px if side == "BUY" else mid + sl_distance_px
+                                    sl_px_eff = last_px - sl_distance_px if side == "BUY" else last_px + sl_distance_px
                                     pos_ctx = PositionalCtx(
-                                        entry_px=float(mid),
+                                        entry_px=float(last_px),
                                         sl_px=float(sl_px_eff),
                                         leverage=float(getattr(self, "_leverage", 10.0)),
                                     )
@@ -1573,7 +2145,7 @@ class Worker:
                                     side,
                                     signal_kind,
                                     sl_distance_px,
-                                    mid,
+                                    last_px,
                                     bid,
                                     ask,
                                 )
@@ -1607,9 +2179,61 @@ class Worker:
         except asyncio.CancelledError:
             log.info("[strategy] _strategy_loop cancelled (outer)")
         except Exception as e:
-            log.exception("[strategy] fatal error: %s", e)
+            log.exception("[WORKER] strategy loop fatal error: %s", e)
             self._last_strategy_error = f"{type(e).__name__}: {e}"
             await asyncio.sleep(1.0)
+    
+    def _update_unified_position_state(self, symbol: str) -> None:
+        """
+        Update unified PositionState from Worker's _pos dict.
+        
+        This keeps the unified PositionState in sync with Worker._pos[symbol].
+        Called whenever Worker._pos[symbol] is updated.
+        """
+        try:
+            pos = self._pos.get(symbol)
+            if pos is None:
+                # No position, set to FLAT
+                save_position_state(flat_state(symbol))
+                return
+            
+            state_str = getattr(pos, "state", "FLAT")
+            side_raw = getattr(pos, "side", None)
+            qty = getattr(pos, "qty", 0.0)
+            entry_px = getattr(pos, "entry_px", 0.0)
+            
+            # Convert Worker PositionState to unified PositionState
+            if state_str == "FLAT" or qty <= 1e-9:
+                new_state = flat_state(symbol)
+            elif side_raw == "BUY" or side_raw == Side.BUY:
+                new_state = with_long(symbol, entry_px, qty)
+            elif side_raw == "SELL" or side_raw == Side.SELL:
+                new_state = with_short(symbol, entry_px, qty)
+            else:
+                new_state = flat_state(symbol)
+            
+            save_position_state(new_state)
+        except Exception as e:
+            logger.debug("[worker] _update_unified_position_state failed for %s: %s", symbol, e)
+    
+    def get_current_position_side(self, symbol: str) -> Optional[Literal["LONG", "SHORT"]]:
+        """
+        Get current position side for a symbol.
+        
+        This is the unified way to get the current position side for use by strategies/routers.
+        
+        Args:
+            symbol: Trading symbol
+        
+        Returns:
+            "LONG", "SHORT", or None (for FLAT)
+        """
+        try:
+            pos_state = get_position_state(symbol)
+            return pos_state.to_str_side()
+        except Exception as e:
+            logger.debug("[worker] get_current_position_side failed for %s: %s", symbol, e)
+            return None
     
     def _compute_sl_distance_px(self, symbol: str, spread_ticks: float) -> float:
         """
@@ -2036,7 +2660,7 @@ class Worker:
                     break
             
             if any_open:
-                log.warning(
+                logger.warning(
                     "[place_entry] BLOCKED: Another position is already open. Cannot open %s %s",
                     sym, s
                 )
@@ -2058,6 +2682,17 @@ class Worker:
                         await self._account_state.refresh()
                         snapshot = self._account_state.get_snapshot()
 
+                        # Reconciliation: проверяем соответствие PnL памяти и БД раз в минуту
+                        from storage.repo import now_ms, day_utc_from_ms
+                        current_ts_ms = now_ms()
+                        if current_ts_ms - self._last_reconcile_ts_ms >= 60_000:
+                            self._last_reconcile_ts_ms = current_ts_ms
+                            try:
+                                day_str = day_utc_from_ms(current_ts_ms)
+                                self._account_state.reconcile_realized_pnl_with_db(day_str)
+                            except Exception as e:
+                                logger.warning("[worker] PnL reconciliation failed: %s", e)
+
                     # если после refresh всё равно нет данных или много ошибок — просто не входим
                     if snapshot is None or self._account_state.consecutive_errors >= 3:
                         self._inc_block_reason("account_state_stale")
@@ -2067,6 +2702,23 @@ class Worker:
                             "symbol": sym,
                             "side": s,
                             "qty": qty,
+                        }
+
+                    # Block new entries if daily realized PnL is below the max_daily_loss_usd threshold (daily stop)
+                    from risk.filters import check_daily_loss_usd
+                    realized_pnl_today = float(snapshot.realized_pnl_today or 0.0)
+                    daily_loss_dec = check_daily_loss_usd(realized_pnl_today, self._risk_cfg)
+                    if not daily_loss_dec.allow:
+                        reasons = [f"daily_loss_usd_{r}" for r in daily_loss_dec.reasons]
+                        for r in reasons:
+                            self._inc_block_reason(r)
+                        return {
+                            "ok": False,
+                            "reason": ",".join(reasons),
+                            "symbol": sym,
+                            "side": s,
+                            "qty": qty,
+                            "realized_pnl_today": realized_pnl_today,
                         }
 
                     # 1) количество сделок за день — из AccountState (userTrades+DB)
@@ -2117,7 +2769,7 @@ class Worker:
                         "max_trades": max_trades_per_day,
                     }
             except Exception as e:
-                log.warning("[place_entry] Error checking daily limits: %s", e)
+                logger.warning("[place_entry] Error checking daily limits: %s", e)
                 # на ошибке лимитов не входим, но и не падаем
                 # Don't block on error, but log it
             
@@ -2198,7 +2850,7 @@ class Worker:
                 try:
                     raw_positions = await adapter.get_positions()
                 except Exception as e:
-                    log.warning("[place_entry] get_positions failed for %s: %s", sym, e)
+                    logger.warning("[place_entry] get_positions failed for %s: %s", sym, e)
                     return 0.0, None
 
                 try:
@@ -2210,11 +2862,98 @@ class Worker:
                         entry_price = float(p.get("entryPrice") or 0.0)
                         return amt, (entry_price if entry_price > 0.0 else None)
                 except Exception as e:
-                    log.warning("[place_entry] error parsing positionRisk for %s: %s", sym, e)
+                    logger.warning("[place_entry] error parsing positionRisk for %s: %s", sym, e)
                 return 0.0, None
 
             # состояние позиции до входа (для live-режима)
             ext_amt_before, _ = await _exchange_snapshot()
+
+            # --- КРИТИЧЕСКИ ВАЖНО: создаём trade_id ДО вызова executor ---
+            # это гарантирует, что все ордера (entry, SL, TP) будут привязаны к одному trade
+            trade_id: Optional[str] = None
+            prev = self._pos.get(sym)
+            trade_id_existing = getattr(prev, "trade_id", None)
+            
+            # Если позиции нет или у неё нет trade_id, создаём новый trade
+            if not trade_id_existing:
+                try:
+                    from storage.repo import TradeOpenCtx, open_trade  # lazy import
+
+                    side_pos = "LONG" if s == "BUY" else "SHORT"
+                    # Используем планируемую цену входа для создания записи
+                    entry_px_for_trade = entry_px_plan or mid
+                    ctx = TradeOpenCtx(
+                        symbol=sym,
+                        side=side_pos,
+                        qty=qty,
+                        entry_px=entry_px_for_trade,
+                        sl_px=float(sl_px) if sl_px is not None else None,
+                        tp_px=float(tp_px) if tp_px is not None else None,
+                        reason_open="auto_entry",
+                        meta={
+                            "source": "worker.place_entry",
+                            "ts_ms": int(time.time() * 1000),
+                        },
+                    )
+                    trade_id = open_trade(ctx)
+                    logger.info(
+                        "[place_entry] Created new trade_id=%s for %s %s",
+                        trade_id, sym, s
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[place_entry] open_trade failed for %s %s: %s",
+                        sym,
+                        s,
+                        e,
+                    )
+                    # Если не получилось создать trade_id, продолжаем без него
+                    trade_id = None
+            else:
+                trade_id = trade_id_existing
+
+            # --- Safety margin check: ensure required margin for this trade fits comfortably within available margin (with safety factor) ---
+            if hasattr(self, "_account_state") and self._account_state:
+                try:
+                    snapshot = self._account_state.get_snapshot()
+                    if snapshot is not None:
+                        # Get leverage for this symbol
+                        try:
+                            if hasattr(self, "_leverage_for_symbol"):
+                                leverage = float(self._leverage_for_symbol(sym))
+                            else:
+                                leverage = float(getattr(self, "_leverage", 10.0))
+                        except Exception:
+                            leverage = 10.0
+                        
+                        # Estimate initial margin required for the planned position
+                        # For linear USDT-M: required_margin ≈ entry_price * qty / leverage
+                        entry_px_est = entry_px_plan if entry_px_plan > 0.0 else mid
+                        if entry_px_est > 0.0 and leverage > 0.0:
+                            required_margin = abs(entry_px_est * qty) / leverage
+                            available_margin = float(snapshot.available_margin or 0.0)
+                            safety_factor = 0.9
+                            
+                            # Safety margin check: ensure required margin for this trade fits comfortably within available margin (with safety factor)
+                            if required_margin > available_margin * safety_factor:
+                                self._inc_block_reason(f"{sym}:insufficient_margin")
+                                logger.warning(
+                                    "[place_entry] Margin check failed: required=%.2f, available=%.2f, safety_factor=%.2f",
+                                    required_margin, available_margin, safety_factor
+                                )
+                                return {
+                                    "ok": False,
+                                    "reason": "insufficient_margin",
+                                    "symbol": sym,
+                                    "side": s,
+                                    "qty": qty,
+                                    "required_margin": float(required_margin),
+                                    "available_margin": float(available_margin),
+                                    "safety_factor": safety_factor,
+                                }
+                except Exception as e:
+                    logger.warning("[place_entry] Margin check failed with error: %s", e)
+                    # Don't block on margin check error, but log it
 
             # --- вызываем Executor.place_entry с временными override-ами конфига ---
             with self._temporary_exec_overrides(
@@ -2222,9 +2961,9 @@ class Worker:
                 limit_offset_ticks=limit_offset_ticks,
             ):
                 try:
-                    rep = await ex.place_entry(sym, s, qty, reduce_only=False)
+                    rep = await ex.place_entry(sym, s, qty, reduce_only=False, trade_id=trade_id)
                 except Exception as e:
-                    log.exception("[place_entry] executor failed for %s %s: %s", sym, s, e)
+                    logger.exception("[place_entry] executor failed for %s %s: %s", sym, s, e)
                     self._inc_block_reason(f"{sym}:entry_error")
                     return {"ok": False, "reason": "entry_error", "error": str(e)}
 
@@ -2242,7 +2981,7 @@ class Worker:
             limit_oid = getattr(rep, "limit_oid", None)
             market_oid = getattr(rep, "market_oid", None)
 
-            log.debug(
+            logger.debug(
                 "[place_entry] exec report %s %s: status=%s filled=%.6f avg_px=%s limit_oid=%s market_oid=%s steps=%s",
                 sym, s, status, filled, avg_px, limit_oid, market_oid, steps,
             )
@@ -2261,7 +3000,7 @@ class Worker:
                     avg_px = ext_entry_px
                 s = real_side
 
-                log.info(
+                logger.info(
                     "[place_entry] corrected from exchange for %s: side=%s qty=%.6f entry_px=%s",
                     sym, s, real_qty, avg_px,
                 )
@@ -2280,6 +3019,35 @@ class Worker:
             filled_qty = float(filled)
             entry_px_effective = float(avg_px or entry_px_plan or mid)
 
+            # --- CRITICAL: Validate strategy-provided SL/TP prices before proceeding ---
+            # After entry fill, immediately place exchange-level SL and TP orders based on strategy levels (reduce_only).
+            # These SL/TP orders define the actual exit and are required for enforcing risk-reward.
+            if filled_qty > 0.0:
+                if sl_px is None or sl_px <= 0.0:
+                    logger.error(
+                        "[place_entry] CRITICAL: Entry filled for %s but sl_px is missing/invalid (sl_px=%s). "
+                        "Cannot place protective orders. Rejecting trade.",
+                        sym, sl_px
+                    )
+                    self._inc_block_reason(f"{sym}:missing_sl_px")
+                    return {
+                        "ok": False,
+                        "reason": "missing_sl_px",
+                        "symbol": sym,
+                        "side": s,
+                        "filled_qty": filled_qty,
+                        "status": status,
+                    }
+                
+                if tp_px is None or tp_px <= 0.0:
+                    logger.warning(
+                        "[place_entry] WARNING: Entry filled for %s but tp_px is missing/invalid (tp_px=%s). "
+                        "Proceeding without TP order (SL only).",
+                        sym, tp_px
+                    )
+                    # Allow SL-only, but log warning
+                    tp_px = None
+
             # --- обновляем runtime-позицию и навешиваем SL/TP-брекеты ---
             now_ms = int(time.time() * 1000)
             lock = self._locks[sym]
@@ -2290,92 +3058,95 @@ class Worker:
                 sl_oid: Optional[str] = None
                 tp_oid: Optional[str] = None
 
-                # навешиваем защитные ордера, только если есть что защищать
-                if filled_qty > 0.0 and (sl_px is not None or tp_px is not None):
+                # --- After entry fill, immediately place exchange-level SL and TP orders based on strategy levels (reduce_only) ---
+                # These SL/TP orders define the actual exit and are required for enforcing risk-reward.
+                if filled_qty > 0.0 and sl_px is not None and sl_px > 0.0:
                     try:
+                        # Place SL/TP orders immediately after entry fill using strategy-provided prices.
+                        # All SL/TP orders must be reduce_only=True to prevent position size increases.
+                        logger.info(
+                            "[place_entry] Placing SL/TP orders for %s %s: sl_px=%.8f tp_px=%s qty=%.6f",
+                            sym, s, float(sl_px), (f"{tp_px:.8f}" if tp_px else "None"), filled_qty
+                        )
                         br = await ex.place_bracket(
                             symbol=sym,
                             side=s,
                             qty=filled_qty,
-                            sl_px=sl_px,
-                            tp_px=tp_px,
+                            sl_px=float(sl_px),
+                            tp_px=float(tp_px) if tp_px is not None and tp_px > 0.0 else None,
+                            trade_id=trade_id,
                         )
-                        if isinstance(br, dict):
-                            if not br.get("ok", True):
-                                log.warning(
-                                    "[place_entry] place_bracket failed for %s %s: %s",
-                                    sym, s, br,
-                                )
-                            sl_oid = br.get("sl_order_id") or None
-                            tp_oid = br.get("tp_order_id") or None
-                            
-                            # CRITICAL FIX #5 & #6: Verify SL/TP orders are actually placed and are reduce_only
+                        if isinstance(br, dict) and not br.get("ok", True):
+                            logger.warning(
+                                "[place_entry] place_bracket failed for %s %s: %s",
+                                sym,
+                                s,
+                                br,
+                            )
+                        sl_oid = br.get("sl_order_id") or None
+                        tp_oid = br.get("tp_order_id") or None
+
+                        # best-effort проверка reduce_only и наличия SL/TP, как было у тебя
+                        try:
                             if hasattr(ex, "a") or hasattr(ex, "adapter"):
                                 adapter = getattr(ex, "a", None) or getattr(ex, "adapter", None)
                                 if adapter and hasattr(adapter, "get_open_orders"):
-                                    try:
-                                        open_orders = await adapter.get_open_orders(symbol=sym)
-                                        sl_found = False
-                                        tp_found = False
-                                        sl_is_reduce_only = False
-                                        tp_is_reduce_only = False
-                                        
-                                        for o in open_orders or []:
-                                            oid = str(o.get("clientOrderId") or o.get("orderId") or "")
-                                            reduce_only = str(o.get("reduceOnly") or "").lower() in ("true", "1")
-                                            
-                                            if sl_oid and oid == str(sl_oid):
-                                                sl_found = True
-                                                sl_is_reduce_only = reduce_only
-                                            if tp_oid and oid == str(tp_oid):
-                                                tp_found = True
-                                                tp_is_reduce_only = reduce_only
-                                        
-                                        # CRITICAL FIX #5: If fallback happened and order is NOT reduce_only, cancel it immediately
-                                        if sl_oid and sl_found and not sl_is_reduce_only:
-                                            log.error(
-                                                "[place_entry] CRITICAL: SL order %s is NOT reduce_only! Canceling immediately.",
-                                                sl_oid
-                                            )
-                                            try:
-                                                if hasattr(ex, "cancel_order"):
-                                                    await ex.cancel_order(sym, sl_oid)
-                                                elif hasattr(adapter, "cancel_order"):
-                                                    await adapter.cancel_order(sym, client_order_id=sl_oid)
-                                                sl_oid = None
-                                            except Exception as cancel_err:
-                                                log.error("[place_entry] Failed to cancel non-reduce_only SL: %s", cancel_err)
-                                        
-                                        if tp_oid and tp_found and not tp_is_reduce_only:
-                                            log.error(
-                                                "[place_entry] CRITICAL: TP order %s is NOT reduce_only! Canceling immediately.",
-                                                tp_oid
-                                            )
-                                            try:
-                                                if hasattr(ex, "cancel_order"):
-                                                    await ex.cancel_order(sym, tp_oid)
-                                                elif hasattr(adapter, "cancel_order"):
-                                                    await adapter.cancel_order(sym, client_order_id=tp_oid)
-                                                tp_oid = None
-                                            except Exception as cancel_err:
-                                                log.error("[place_entry] Failed to cancel non-reduce_only TP: %s", cancel_err)
-                                        
-                                        if (sl_px and not sl_found) or (tp_px and not tp_found):
-                                            log.warning(
-                                                "[place_entry] SL/TP orders not found on exchange for %s: sl_found=%s tp_found=%s",
-                                                sym, sl_found, tp_found
-                                            )
-                                    except Exception as verify_err:
-                                        log.warning("[place_entry] Failed to verify SL/TP orders: %s", verify_err)
+                                    open_orders = await adapter.get_open_orders(symbol=sym)
+                                    sl_found = False
+                                    tp_found = False
+                                    sl_is_reduce_only = False
+                                    tp_is_reduce_only = False
+
+                                    for o in open_orders or []:
+                                        oid = str(o.get("clientOrderId") or o.get("orderId") or "")
+                                        reduce_only = str(o.get("reduceOnly") or "").lower() in ("true", "1")
+
+                                        if sl_oid and oid == str(sl_oid):
+                                            sl_found = True
+                                            sl_is_reduce_only = reduce_only
+                                        if tp_oid and oid == str(tp_oid):
+                                            tp_found = True
+                                            tp_is_reduce_only = reduce_only
+
+                                    if sl_oid and sl_found and not sl_is_reduce_only:
+                                        logger.error(
+                                            "[place_entry] CRITICAL: SL order %s for %s is NOT reduce_only.",
+                                            sl_oid,
+                                            sym,
+                                        )
+                                    if tp_oid and tp_found and not tp_is_reduce_only:
+                                        logger.error(
+                                            "[place_entry] CRITICAL: TP order %s for %s is NOT reduce_only.",
+                                            tp_oid,
+                                            sym,
+                                        )
+                        except Exception as verify_err:
+                            logger.warning("[place_entry] Failed to verify SL/TP orders: %s", verify_err)
+
                     except Exception as e:
-                        log.warning(
+                        logger.warning(
                             "[place_entry] place_bracket error for %s %s: %s",
                             sym,
                             s,
                             e,
                         )
 
-                # обновляем runtime-позицию
+                # --- trade_id уже создан выше (BEFORE executor call) ---
+                # Если фактический filled_qty отличается от запланированного qty,
+                # обновим запись в БД (это нужно для точности учёта)
+                if filled_qty > 0.0 and trade_id and abs(filled_qty - qty) > 1e-6:
+                    try:
+                        from storage.repo import get_trade  # lazy import
+                        # Пробуем обновить qty/entry_px в trade (опционально)
+                        # Но это не критично, т.к. close_trade пересчитает PnL по фактическим fills
+                        logger.debug(
+                            "[place_entry] trade_id=%s: planned qty=%.6f, actual filled=%.6f",
+                            trade_id, qty, filled_qty
+                        )
+                    except Exception as e:
+                        logger.debug("[place_entry] Could not log trade update: %s", e)
+
+                # --- обновляем runtime-позицию ---
                 self._pos[sym] = PositionState(
                     state="OPEN",
                     side=s,
@@ -2385,10 +3156,13 @@ class Worker:
                     tp_px=float(tp_px) if tp_px is not None else None,
                     opened_ts_ms=now_ms,
                     timeout_ms=timeout_ms,
-                    trade_id=getattr(prev, "trade_id", None),
+                    trade_id=trade_id,
                     sl_order_id=sl_oid,
                     tp_order_id=tp_oid,
                 )
+
+                # Update unified PositionState
+                self._update_unified_position_state(sym)
 
                 # FSM: переводим в OPEN (best-effort)
                 with _ctx.suppress(Exception):
@@ -2410,138 +3184,142 @@ class Worker:
 
     async def place_entry_auto(self, symbol: str, side: str) -> dict:
         """
-        Auto entry with risk-based sizing and fee-aware SL/TP planning (prod-tuned).
-        Ничего не ломает: использует ваши хелперы и executor, усиливает экономику.
+        Auto entry with risk-based sizing and fee-aware SL/TP planning.
+
+        Ключевые свойства:
+        - Размер позиции считает _compute_auto_qty (risk + комиссии + плечо + liq-buffer).
+        - SL/TP планируются через compute_sltp_fee_aware (если доступен) или безопасный fallback.
+        - Для входа применяются edge-проверки (RR/edge) до и после планирования.
+        - На live не лезем в сделку, если размер не проходит по марже/плечу/liq-buffer.
         """
-        import math, logging
-        log = logging.getLogger(__name__ + ".place_entry_auto")
 
-        # --- normalize ---
+        import math
+        import logging
+
+        logger = logging.getLogger(__name__ + ".place_entry_auto")
+
+        # === 1. Нормализация символа и стороны ===
         sym = str(symbol).upper()
-        s = str(side).upper()
-        if s in ("LONG", "BUY"): s = "BUY"
-        elif s in ("SHORT", "SELL"): s = "SELL"
-        else: return {"ok": False, "reason": "bad_side"}
+        s_raw = str(side).upper()
+        if s_raw in ("LONG", "BUY"):
+            s = "BUY"
+        elif s_raw in ("SHORT", "SELL"):
+            s = "SELL"
+        else:
+            self._inc_block_reason(f"{sym}:bad_side")
+            return {"ok": False, "reason": "bad_side"}
 
-        # --- market snapshot ---
+        # === 1.5. Cleanup stray brackets before opening new position ===
+        # Это предотвращает конфликты с ghost SL/TP ордерами от предыдущих сделок
+        await self._cleanup_brackets_for_symbol(sym)
+
+        # === 2. Снэпшот рынка ===
         try:
             bid, ask = self.best_bid_ask(sym)
         except Exception:
             bid = ask = 0.0
-        if bid <= 0 or ask <= 0:
+
+        if bid <= 0.0 or ask <= 0.0:
             self._inc_block_reason(f"{sym}:no_best_bid_ask")
             return {"ok": False, "reason": "no_best_bid_ask"}
 
         mid = (bid + ask) / 2.0
-        if mid <= 0:
+        if mid <= 0.0:
+            self._inc_block_reason(f"{sym}:bad_mid")
             return {"ok": False, "reason": "bad_mid"}
 
-        # --- steps/quant ---
-        price_step = self._get_price_step(sym) or float(getattr(self, "_price_tick_fallback", 0.1) or 0.1)
-        try:
-            spec = (self.specs or {}).get(sym)
-            qty_step = float(getattr(spec, "qty_step", 0.001)) if spec else float(getattr(self, "_qty_step_fallback", 0.001) or 0.001)
-        except Exception:
-            qty_step = 0.001
-        if qty_step <= 0: qty_step = 0.001
-
-        # --- exec minima ---
-        exec_cfg = getattr(self, "_exec_cfg", {}) or {}
-        min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 12))
         spread = max(0.0, ask - bid)
 
-        # --- stop distance (вола/тик/спред + полы) ---
+        # === 3. Шаг цены / тиковая геометрия ===
         try:
-            sl_distance_px = float(self._compute_vol_stop_distance_px(sym, mid_px=mid, min_stop_ticks_cfg=min_stop_ticks))
+            price_step = float(self._get_price_step(sym) or 0.0)
+        except Exception:
+            price_step = 0.0
+        if price_step <= 0.0:
+            price_step = float(getattr(self, "_price_tick_fallback", 0.1) or 0.1)
+
+        exec_cfg = getattr(self, "_exec_cfg", {}) or {}
+        min_stop_ticks = int(exec_cfg.get("min_stop_ticks", 12))
+
+        # === 4. Дистанция до SL (вола + тики + спред) ===
+        try:
+            sl_distance_px = float(
+                self._compute_vol_stop_distance_px(
+                    sym,
+                    mid_px=mid,
+                    min_stop_ticks_cfg=min_stop_ticks,
+                )
+            )
         except Exception:
             sl_distance_px = 0.0
-        if sl_distance_px <= 0:
-            sl_distance_px = max(min_stop_ticks * price_step, 2.0 * spread, 6.0 * price_step)
-        if sl_distance_px <= 0:
+
+        if sl_distance_px <= 0.0:
+            sl_distance_px = max(
+                min_stop_ticks * price_step,
+                2.0 * spread,
+                6.0 * price_step,
+            )
+
+        if sl_distance_px <= 0.0:
+            self._inc_block_reason(f"{sym}:bad_sl_distance")
             return {"ok": False, "reason": "bad_sl_distance"}
 
-        # --- первичная edge-проверка (gross RR floor) ---
+        # === 5. Первичная edge-проверка (грубая RR) ===
         rr_gross = float(self._rr_floor_for_symbol(sym, 1.6))
         ok_edge, edge_info = self._entry_edge_ok(sym, mid, bid, ask, sl_distance_px, rr_gross)
         if not ok_edge:
             self._inc_block_reason(f"{sym}:edge_too_small")
-            return {"ok": False, "reason": "edge_too_small", "edge_diag": edge_info}
+            return {
+                "ok": False,
+                "reason": "edge_too_small",
+                "edge_diag": edge_info,
+            }
 
-         # --- account snapshot / risk target ---
-        # CRITICAL FIX: Use real account equity from AccountState (live mode) or fallback to simulated
-        equity_now = float(getattr(self, "_starting_equity_usd", 1000.0))
-        try:
-            if hasattr(self, "_account_state") and self._account_state:
-                snapshot = self._account_state.get_snapshot()
-                if snapshot and snapshot.equity > 0:
-                    equity_now = float(snapshot.equity)
-                    logger.debug("[place_entry_auto] Using real equity from AccountState: %.2f", equity_now)
-                else:
-                    # Fallback: refresh and try again
-                    await self._account_state.refresh()
-                    snapshot = self._account_state.get_snapshot()
-                    if snapshot and snapshot.equity > 0:
-                        equity_now = float(snapshot.equity)
-            else:
-                # Paper mode or AccountState not initialized: use simulated equity
-                equity_now = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
-        except Exception as e:
-            logger.warning("[place_entry_auto] Error getting equity from AccountState: %s, using fallback", e)
-            equity_now = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
-
-        # leverage: per-symbol override через хелпер
-        lev = float(self._leverage_for_symbol(sym))
-        if lev < 1.0:
-            lev = 1.0
-
-        min_notional = float(getattr(self, "_min_notional_usd", 5.0))
-        risk_cfg = getattr(self, "_risk_cfg", None)
-        risk_pct = float(getattr(risk_cfg, "risk_per_trade_pct", 0.30))
-        min_risk_usd_floor = float(getattr(risk_cfg, "min_risk_usd_floor", 3.0))
-        target_risk_usd = max(min_risk_usd_floor, equity_now * (risk_pct / 100.0))
-        if target_risk_usd <= 0:
-            return {"ok": False, "reason": "bad_risk_cfg"}
-
-        # --- первичный сайзинг ---
-        raw_qty = target_risk_usd / sl_distance_px
-        max_qty_by_lev = max(0.0, (equity_now * lev) / mid)
-        
-        # CRITICAL FIX #4: Check available margin before entry
-        available_margin = equity_now  # fallback
-        try:
-            if hasattr(self, "_account_state") and self._account_state:
-                snapshot = self._account_state.get_snapshot()
-                if snapshot:
-                    available_margin = float(snapshot.available_margin)
-        except Exception:
-            pass
-        
-        # Ensure we don't exceed available margin
-        max_notional_by_margin = available_margin * lev if available_margin > 0 else 0.0
-        max_qty_by_margin = max_notional_by_margin / mid if mid > 0 else 0.0
-        max_qty_by_lev = min(max_qty_by_lev, max_qty_by_margin)
-        
-        qty = min(raw_qty, max_qty_by_lev)
-        if qty_step > 0: qty = math.floor(qty / qty_step) * qty_step
-        if qty <= 0:
+        # === 6. Risk-based sizing через _compute_auto_qty ===
+        qty = float(self._compute_auto_qty(sym, s, sl_distance_px) or 0.0)
+        if qty <= 0.0:
             self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
             return {"ok": False, "reason": "qty_rounded_to_zero"}
 
-        if qty * mid < min_notional:
-            # подсказка по минимальному размеру
+        # min_notional safety check (на всякий случай, _compute_auto_qty уже учитывает)
+        min_notional = float(getattr(self, "_min_notional_usd", 5.0) or 5.0)
+        notional = qty * mid
+        if notional < min_notional:
+            # Посчитаем hint для пользователя
+            try:
+                # шаг объёма
+                spec = (self.specs or {}).get(sym)
+                qty_step = float(getattr(spec, "qty_step", 0.001)) if spec else float(
+                    getattr(self, "_qty_step_fallback", 0.001) or 0.001
+                )
+            except Exception:
+                qty_step = 0.001
+            if qty_step <= 0:
+                qty_step = 0.001
+
             min_qty = math.ceil((min_notional / mid) / qty_step) * qty_step
             self._inc_block_reason(f"{sym}:below_min_notional")
-            return {"ok": False, "reason": "below_min_notional", "hint": f"min ${min_notional} → qty ≥ {min_qty}"}
+            return {
+                "ok": False,
+                "reason": "below_min_notional",
+                "hint": f"min ${min_notional} → qty ≥ {min_qty}",
+            }
 
-        # --- SL/TP план (fee-aware, maker-first вход/TP, SL=market) ---
-        maker_bps, taker_bps = self._fees_for_symbol(sym)
-        spread_bps = (spread / mid) * 1e4 if mid > 0 else 0.0
+        # === 7. SL/TP план (fee-aware) ===
+        # maker-first вход, SL как taker, TP maker где возможно
+        try:
+            maker_bps, taker_bps = self._fees_for_symbol(sym)
+        except Exception:
+            maker_bps, taker_bps = 2.0, 4.0
+
+        spread_bps = (spread / mid) * 1e4 if mid > 0.0 else 0.0
         addl_exit_bps = 0.5 * max(spread_bps, 0.1)
 
-        # defaults
-        sl_px, tp_px = None, None
+        sl_px = None
+        tp_px = None
+
         try:
-            # если у тебя есть compute_sltp_fee_aware — используем
+            # compute_sltp_fee_aware должен быть доступен в модуле
             plan = compute_sltp_fee_aware(
                 side=s,
                 entry_px=float(mid),
@@ -2549,22 +3327,25 @@ class Worker:
                 price_tick=float(price_step),
                 sl_distance_px=float(sl_distance_px),
                 rr_target=float(rr_gross),
-                maker_bps=maker_bps,
-                taker_bps=taker_bps,
-                entry_taker_like=False,          # maker-first
+                maker_bps=float(maker_bps),
+                taker_bps=float(taker_bps),
+                entry_taker_like=False,          # в идеале maker-вход
                 exit_taker_like=True,            # SL будет taker
                 addl_exit_bps=float(addl_exit_bps),
                 min_stop_ticks=int(min_stop_ticks),
-                spread_px=spread,
+                spread_px=float(spread),
                 spread_mult=1.5,
                 min_sl_bps=float(getattr(self, "_min_sl_bps", 12.0) or 12.0),
                 min_net_rr=float(getattr(self, "_min_net_rr", 1.25) or 1.25),
                 allow_expand_tp=True,
             )
+
             sl_px = float(plan.sl_px)
-            tp_px = float(getattr(plan, "tp_px_maker", getattr(plan, "tp_px", 0.0)) or 0.0)
+            tp_px = float(
+                getattr(plan, "tp_px_maker", getattr(plan, "tp_px", 0.0)) or 0.0
+            )
         except Exception:
-            # безопасный фоллбэк
+            # безопасный fallback (geometric RR)
             if s == "BUY":
                 sl_px = mid - sl_distance_px
                 tp_px = mid + sl_distance_px * rr_gross
@@ -2572,47 +3353,61 @@ class Worker:
                 sl_px = mid + sl_distance_px
                 tp_px = mid - sl_distance_px * rr_gross
 
-        # --- точный риск и ресайз под target ---
-        risk_px = abs(sl_px - mid)
-        if risk_px <= 0:
+        if sl_px is None or float(sl_px) <= 0.0:
             self._inc_block_reason(f"{sym}:plan_bad_risk_px")
             return {"ok": False, "reason": "bad_sl_distance"}
 
-        adj_qty = min(target_risk_usd / risk_px, max_qty_by_lev)
-        adj_qty = max(adj_qty, (min_notional / mid))
-        if qty_step > 0: adj_qty = math.floor(adj_qty / qty_step) * qty_step
-        if adj_qty <= 0 or (adj_qty * mid) < min_notional:
-            self._inc_block_reason(f"{sym}:qty_rounded_to_zero")
-            return {"ok": False, "reason": "qty_rounded_to_zero"}
+        sl_px = float(sl_px)
+        tp_px = float(tp_px or 0.0)
 
-        qty = float(adj_qty)
+        # === 8. Точный риск по финальному SL ===
+        risk_px = abs(sl_px - mid)
+        if risk_px <= 0.0:
+            self._inc_block_reason(f"{sym}:plan_bad_risk_px")
+            return {"ok": False, "reason": "bad_sl_distance"}
+
         expected_risk_usd = round(risk_px * qty, 6)
 
-        # --- повторная edge-проверка на финале ---
+        # === 9. Финальная edge-проверка по обновлённому рынку ===
         try:
             bid2, ask2 = self.best_bid_ask(sym)
-            mid2 = (bid2 + ask2) / 2.0 if bid2 > 0 and ask2 > 0 else mid
+            if bid2 > 0.0 and ask2 > 0.0:
+                mid2 = (bid2 + ask2) / 2.0
+            else:
+                mid2 = mid
         except Exception:
             bid2 = ask2 = 0.0
             mid2 = mid
 
         sl_dist_final = abs(mid2 - sl_px)
-        ok_edge2, edge_meta2 = self._entry_edge_ok(sym, mid2, bid2, ask2, sl_dist_final, rr_gross)
+        ok_edge2, edge_info2 = self._entry_edge_ok(sym, mid2, bid2, ask2, sl_dist_final, rr_gross)
         if not ok_edge2:
             self._inc_block_reason(f"{sym}:edge_insufficient")
             return {
-                "ok": False, "reason": "edge_insufficient",
-                "edge_diag": edge_meta2, "entry_px": float(mid2),
-                "sl_px": float(sl_px), "tp_px": float(tp_px)
+                "ok": False,
+                "reason": "edge_insufficient",
+                "edge_diag": edge_info2,
+                "entry_px": float(mid2),
+                "sl_px": float(sl_px),
+                "tp_px": float(tp_px),
             }
-        # --- liq-buffer: не входим, если SL слишком близко к ликвидации ---
+
+        # === 10. Liq-buffer: SL не должен быть близко к ликвидации ===
         try:
+            lev = float(self._leverage_for_symbol(sym))
+            if lev < 1.0:
+                lev = 1.0
+
             lb_mult = self._liq_buffer_mult(float(mid2), float(sl_px), s, lev)
-            min_mult = float(
-                getattr(self, "_safety_cfg", "min_liq_buffer_sl_mult")
-                if hasattr(self, "_safety_cfg") else 3.0
-            )
-            if not math.isfinite(lb_mult) or lb_mult < max(1.5, float(min_mult or 3.0)):
+            min_mult_cfg = 3.0
+            try:
+                min_mult_cfg = float(
+                    getattr(self._safety_cfg, "min_liq_buffer_sl_mult", 3.0) or 3.0
+                )
+            except Exception:
+                pass
+
+            if not math.isfinite(lb_mult) or lb_mult < max(1.5, min_mult_cfg):
                 self._inc_block_reason(f"{sym}:liq_buffer_too_small")
                 return {
                     "ok": False,
@@ -2620,28 +3415,258 @@ class Worker:
                     "liq_buffer_mult": float(lb_mult),
                 }
         except Exception:
-            # диагностику liq-buffer не считаем критичной
+            # диагностику liq-buffer считаем best-effort
             pass
 
-        # --- submit (executor читает maker-first из конфига) ---
+        # === 11. Отправка заявки (Executor.place_entry под капотом) ===
         try:
-            report = await self.place_entry(sym, s, qty, sl_px=float(sl_px), tp_px=float(tp_px))
+            report = await self.place_entry(
+                sym,
+                s,
+                float(qty),
+                sl_px=float(sl_px),
+                tp_px=float(tp_px),
+            )
         except Exception as e:
-            log.exception("[place_entry_auto] failed for %s %s: %s", sym, s, e)
+            logger.exception("[place_entry_auto] failed for %s %s: %s", sym, s, e)
             self._inc_block_reason(f"{sym}:entry_error")
             return {"ok": False, "reason": "entry_error", "error": str(e)}
 
+        # Executor/adapter может вернуть dict с {ok: False, reason: ...}
         if isinstance(report, dict) and not report.get("ok", True):
-            reason = report.get("reason") or "rejected"
-            self._inc_block_reason(f"{sym}:entry_rejected_{reason}")
-            return {"ok": False, "reason": reason, "report": report}
+            r = str(report.get("reason") or "rejected")
+            self._inc_block_reason(f"{sym}:entry_rejected_{r}")
+            return {"ok": False, "reason": r, "report": report}
 
+        # === 12. Успешный результат ===
+        # target_risk_usd мы можем оценить по expected_risk_usd, так как sizing уже учёл комиссии.
         return {
-            "ok": True, "symbol": sym, "side": s, "qty": float(qty),
-            "entry_px": float(mid), "sl_px": float(sl_px), "tp_px": float(tp_px),
+            "ok": True,
+            "symbol": sym,
+            "side": s,
+            "qty": float(qty),
+            "entry_px": float(mid),
+            "sl_px": float(sl_px),
+            "tp_px": float(tp_px),
             "expected_risk_usd": float(expected_risk_usd),
-            "target_risk_usd": round(float(target_risk_usd), 6),
-            "report": report
+            "report": report,
+        }
+    
+    async def _handle_sltp_exit(self, symbol: str, position_state: PositionState) -> None:
+        """
+        Handle SL/TP exit triggered by price monitoring.
+        
+        Args:
+            symbol: Trading symbol
+            position_state: Current position state
+        """
+        sym = str(symbol).upper()
+        try:
+            if position_state.is_flat() or position_state.size is None or position_state.size <= 0.0:
+                return
+            
+            side_str = position_state.to_str_side()
+            if side_str is None:
+                return
+            
+            executor = self.execs.get(sym)
+            if executor is None:
+                logger.warning("[EXEC] sl/tp-exit %s: no executor", sym)
+                return
+            
+            # Place reduceOnly exit order
+            avg_px, filled = await place_exit_order(
+                symbol=sym,
+                side=side_str,
+                size=float(position_state.size),
+                executor=executor,
+            )
+            
+            if avg_px is not None and filled > 0.0:
+                # Update PositionState to FLAT
+                new_state = flat_state(sym)
+                save_position_state(new_state)
+                
+                # Update Worker's internal position state
+                self._pos[sym] = PositionState(
+                    state="FLAT",
+                    side=None,
+                    qty=0.0,
+                    entry_px=0.0,
+                    sl_px=None,
+                    tp_px=None,
+                    opened_ts_ms=0,
+                )
+                
+                logger.info(
+                    "[EXEC] exit-fill symbol=%s, side=%s, avg_price=%.6f, size=%.6f",
+                    sym, side_str, avg_px, filled
+                )
+                logger.info(
+                    "[POS] transition symbol=%s, from=%s to=FLAT, exit_price=%.6f, size=%.6f",
+                    sym, side_str, avg_px, filled
+                )
+            else:
+                logger.warning("[EXEC] sl/tp-exit %s: exit failed", sym)
+        
+        except Exception as e:
+            logger.exception("[EXEC] sl/tp-exit %s failed: %s", sym, e)
+    
+    async def execute_bollinger_entry(
+        self,
+        candidate,
+        *,
+        entry_usd: Optional[float] = None,
+        leverage: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute EntryCandidate using Bollinger execution helpers.
+        
+        This method:
+        1. Computes size from entry_usd and leverage
+        2. Places entry order (limit → timeout → market)
+        3. Updates PositionState
+        4. Computes and attaches SL/TP levels
+        
+        Args:
+            candidate: EntryCandidate from pick_candidate
+            entry_usd: Entry risk in USD (if None, reads from config)
+            leverage: Leverage multiplier (if None, reads from config)
+        
+        Returns:
+            Dict with execution results
+        """
+        from strategy.router import EntryCandidate
+        
+        if not isinstance(candidate, EntryCandidate):
+            return {"ok": False, "reason": "invalid_candidate"}
+        
+        sym = str(candidate.symbol).upper()
+        side_str = str(candidate.side).upper()
+        
+        # Convert side to LONG/SHORT
+        if side_str == "BUY":
+            side = "LONG"
+        elif side_str == "SELL":
+            side = "SHORT"
+        else:
+            return {"ok": False, "reason": "bad_side"}
+        
+        # Get config values (with defaults)
+        try:
+            settings = get_settings()
+            bb_cfg = getattr(settings.strategy, "bollinger_basic", None)
+            if entry_usd is None:
+                entry_usd = float(getattr(bb_cfg, "entry_usd", 25.0)) if bb_cfg else 25.0
+            if leverage is None:
+                leverage = float(getattr(bb_cfg, "leverage", 10.0)) if bb_cfg else 10.0
+        except Exception:
+            entry_usd = entry_usd or 25.0
+            leverage = leverage or 10.0
+        
+        # Get executor
+        executor = self.execs.get(sym)
+        if executor is None:
+            return {"ok": False, "reason": "no_executor"}
+        
+        # Get current price
+        try:
+            bid, ask = self.best_bid_ask(sym)
+            entry_price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else bid or ask or 0.0
+        except Exception:
+            return {"ok": False, "reason": "no_price"}
+        
+        if entry_price <= 0.0:
+            return {"ok": False, "reason": "invalid_price"}
+        
+        # Get qty_step from spec
+        spec = self.specs.get(sym)
+        qty_step = float(getattr(spec, "qty_step", 0.001)) if spec else 0.001
+        
+        # Place entry order
+        logger.info(
+            "[BOLL] candidate symbol=%s, side=%s, entry_usd=%.2f, leverage=%.1f, entry_price=%.6f",
+            sym, side, entry_usd, leverage, entry_price
+        )
+        
+        cfg = {
+            "leverage": float(leverage),
+            "qty_step": qty_step,
+        }
+        
+        logger.info("[EXEC] bollinger entry-request symbol=%s, side=%s, entry_usd=%.2f", sym, side, entry_usd)
+        avg_px, filled = await place_entry_order(
+            symbol=sym,
+            side=side,
+            nominal_size_usd=float(entry_usd),
+            price=float(entry_price),
+            executor=executor,
+            cfg=cfg,
+        )
+        
+        if avg_px is None or filled <= 0.0:
+            logger.warning("[EXEC] bollinger entry-failed symbol=%s, side=%s, filled=%.6f", sym, side, filled)
+            return {"ok": False, "reason": "entry_failed", "filled": filled}
+        
+        # Compute SL/TP from candidate or percentages
+        if candidate.tp_price is not None and candidate.sl_price is not None:
+            tp_price = float(candidate.tp_price)
+            sl_price = float(candidate.sl_price)
+        else:
+            # Fallback: use percentages from strategy config
+            try:
+                settings = get_settings()
+                bb_cfg = getattr(settings.strategy, "bollinger_basic", None)
+                tp_pct = float(getattr(bb_cfg, "tp_pct", 0.004)) if bb_cfg else 0.004
+                sl_pct = float(getattr(bb_cfg, "sl_pct", 0.0025)) if bb_cfg else 0.0025
+            except Exception:
+                tp_pct = 0.004
+                sl_pct = 0.0025
+            
+            tp_price, sl_price = compute_tp_sl_levels(avg_px, side, tp_pct, sl_pct)
+        
+        # Update PositionState
+        if side == "LONG":
+            pos_state = with_long(sym, avg_px, filled)
+        else:
+            pos_state = with_short(sym, avg_px, filled)
+        
+        # Attach SL/TP
+        pos_state = attach_sl_tp(sym, pos_state, tp_price, sl_price)
+        save_position_state(pos_state)
+        
+        # Update Worker's internal position state
+        self._pos[sym] = PositionState(
+            state="OPEN",
+            side=Side.BUY if side == "LONG" else Side.SELL,
+            qty=filled,
+            entry_px=avg_px,
+            sl_px=sl_price,
+            tp_px=tp_price,
+            opened_ts_ms=self._now_ms(),
+        )
+        
+        logger.info(
+            "[EXEC] bollinger-entry %s %s: filled=%.6f entry=%.6f sl=%.6f tp=%.6f",
+            sym, side, filled, avg_px, sl_price, tp_price
+        )
+        logger.info(
+            "[POS] transition symbol=%s, from=FLAT to=%s, entry_price=%.6f, size=%.6f",
+            sym, side, avg_px, filled
+        )
+        logger.info(
+            "[EXEC] sl/tp set symbol=%s, side=%s, tp=%.6f, sl=%.6f",
+            sym, side, tp_price, sl_price
+        )
+        
+        return {
+            "ok": True,
+            "symbol": sym,
+            "side": side,
+            "filled": filled,
+            "entry_price": avg_px,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
         }
     
     async def _place_entry_with_kind(
@@ -2835,11 +3860,15 @@ class Worker:
                         
                         if pos.tp_px is not None and not pos.tp_order_id:
                             logger.warning(
-                                "[watchdog] %s has TP price (%.2f) but NO TP order ID",
-                                sym, pos.tp_px
+                                "[watchdog] %s has TP price (%.2f) but NO TP order ID -> clearing stale TP",
+                                sym,
+                                float(pos.tp_px),
                             )
-                            # TP restoration attempted above in the same bracket call
-
+                            # Чистим неконсистентное состояние, чтобы не спамить и не мешать логике
+                            pos.tp_px = None
+                            pos.tp_order_id = None
+                            # дальше не продолжаем для этой ветки
+                            continue
                         # 1) fail-safe timeout if no SL/TP at all
                         if pos.sl_px is None and pos.tp_px is None:
                             if pos.opened_ts_ms and (now - pos.opened_ts_ms) >= pos.timeout_ms:
@@ -2939,6 +3968,7 @@ class Worker:
                                     self._tp_first_hit_ms[sym] = 0
                                 continue
         except asyncio.CancelledError:
+            logger.info("[watchdog] loop cancelled, exiting")
             return
         except Exception:
             logger.exception("watchdog loop error")
@@ -3029,15 +4059,25 @@ class Worker:
 
         Правила:
         - Для sl_hit / tp_hit в учёте PnL используем плановый уровень SL/TP
-          (чтобы не ловить -30R из-за хвоста).
+        (чтобы не ловить -30R из-за хвоста на paper).
         - Для flatten / timeout / no_protection и прочих причин берём
-          консервативную рыночную цену.
-        - Executor.place_exit вызывается всегда (если есть), поэтому на live реально
-          отправляется ордер на выход, а эта функция отвечает за приведение
-          локального стейта к FLAT и корректный учёт сделки.
+        консервативную рыночную цену через _exit_price_conservative.
+        - Executor.place_exit вызывается, когда доступен, чтобы:
+            * на live реально отдать reduce_only-ордер на выход;
+            * собрать steps/exec-метрики.
         - Если у позиции есть sl_order_id / tp_order_id, best-effort отменяем
-          защитные ордера через Executor (cancel_bracket / cancel_order), если они есть.
+        защитные ордера через Executor (cancel_bracket / cancel_order), если они есть.
+        - Локально переводим позицию в FLAT только когда:
+            * позиция изначально некорректна (qty<=0 или нет side/entry),
+            * либо трейд зарегистрирован (exit_committed=True).
+        На live, если place_exit провалился — позицию в локальном стейте НЕ закрываем.
         """
+        import contextlib
+        import asyncio
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         side = pos.side
         qty = float(pos.qty or 0.0)
         entry_px = float(pos.entry_px or 0.0)
@@ -3045,7 +4085,7 @@ class Worker:
         tp_px = float(pos.tp_px) if pos.tp_px is not None else None
         timeout_ms = int(pos.timeout_ms or 180_000)
 
-        # Если по факту позиции нет — просто приводим к FLAT.
+        # --- 0. Если по факту позиции нет — просто приводим к FLAT и выходим ---
         if qty <= 0.0 or not side or entry_px <= 0.0:
             self._pos[sym] = PositionState(
                 state="FLAT",
@@ -3056,76 +4096,145 @@ class Worker:
                 tp_px=None,
                 opened_ts_ms=0,
                 timeout_ms=timeout_ms,
-                # если ты уже добавил поля в PositionState:
                 sl_order_id=None,
                 tp_order_id=None,
             )
+            # Update unified PositionState
+            self._update_unified_position_state(sym)
             self._entry_steps.pop(sym, None)
             self._last_flat_ms[sym] = self._now_ms()
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_flat()
             return
 
+        # --- 1. Базовые параметры выхода ---
+        side = side.upper()
         close_side: Side = "SELL" if side == "BUY" else "BUY"
 
-        # Целевой уровень для SL/TP (только для sl_hit / tp_hit).
+        # Целевой уровень для SL/TP (только для sl_hit / tp_hit) — для paper/оценки PnL
         level_px: Optional[float] = None
         if reason == "sl_hit" and sl_px is not None:
-            level_px = sl_px
+            level_px = float(sl_px)
         elif reason == "tp_hit" and tp_px is not None:
-            level_px = tp_px
+            level_px = float(tp_px)
 
         exit_px: Optional[float] = None
         exit_steps: List[str] = []
+        exit_committed = False
+        exec_failed = False
+        is_live = self._get_live_adapter() is not None
 
         try:
-            # FSM: переходим в EXITING (best-effort, не роняет воркер)
+            # --- 2. FSM: переводим символ в состояние EXITING (best-effort) ---
             with contextlib.suppress(Exception):
                 await self._fsm[sym].on_exiting()
 
             ex = self.execs.get(sym)
 
-            # --- NEW: best-effort отмена защитных ордеров на бирже ---
-            # Если у позиции есть реальные SL/TP ордера — попробуем их снять.
+            # --- 3. Best-effort отмена защитных ордеров SL/TP на бирже ---
             sl_oid = getattr(pos, "sl_order_id", None)
             tp_oid = getattr(pos, "tp_order_id", None)
             if ex is not None and (sl_oid or tp_oid):
-                # 1) Предпочитаем новый API cancel_bracket
                 cancel_bracket = getattr(ex, "cancel_bracket", None)
-                if callable(cancel_bracket):
-                    with contextlib.suppress(Exception):
-                        await cancel_bracket(
-                            sym,
-                            sl_order_id=sl_oid,
-                            tp_order_id=tp_oid,
-                        )
-                else:
-                    # 2) Fallback: по одному через cancel_order, если он есть
-                    cancel_order = getattr(ex, "cancel_order", None)
-                    if callable(cancel_order):
-                        for oid in (sl_oid, tp_oid):
-                            if oid:
-                                with contextlib.suppress(Exception):
-                                    await cancel_order(sym, oid)
+                cancel_order = getattr(ex, "cancel_order", None)
 
-            # 1) Пытаемся формально вызвать Executor.place_exit (reduce_only) ради steps/аудита.
+                if callable(cancel_bracket):
+                    # Retry logic: up to 2 attempts with exponential backoff
+                    max_attempts = 2
+                    cancel_success = False
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            result = await cancel_bracket(
+                                sym,
+                                sl_order_id=sl_oid,
+                                tp_order_id=tp_oid,
+                            )
+                            # Check if result is ok (assuming it has an 'ok' attribute or is truthy)
+                            if result and (getattr(result, "ok", False) or result):
+                                logger.info(
+                                    "[close_position] cancel_bracket succeeded for %s: sl_order_id=%s, tp_order_id=%s, result=%s",
+                                    sym, sl_oid, tp_oid, result
+                                )
+                                cancel_success = True
+                                break
+                            else:
+                                logger.warning(
+                                    "[close_position] cancel_bracket returned not-ok for %s (attempt %d/%d): sl_order_id=%s, tp_order_id=%s, result=%s",
+                                    sym, attempt, max_attempts, sl_oid, tp_oid, result
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[close_position] cancel_bracket failed for %s (attempt %d/%d): sl_order_id=%s, tp_order_id=%s, error=%s",
+                                sym, attempt, max_attempts, sl_oid, tp_oid, e
+                            )
+                        
+                        # Exponential backoff before next attempt
+                        if attempt < max_attempts:
+                            await asyncio.sleep(0.5 * attempt)
+                    
+                    if not cancel_success:
+                        logger.error(
+                            "[close_position] cancel_bracket failed after %d attempts for %s: sl_order_id=%s, tp_order_id=%s",
+                            max_attempts, sym, sl_oid, tp_oid
+                        )
+                elif callable(cancel_order):
+                    for oid in (sl_oid, tp_oid):
+                        if oid:
+                            with contextlib.suppress(Exception):
+                                await cancel_order(sym, oid)
+
+            # --- 4. Пытаемся формально вызвать Executor.place_exit() ---
+            # Извлекаем trade_id из позиции для привязки exit-ордеров
+            trade_id = getattr(pos, "trade_id", None)
+            actual_exit_px: Optional[float] = None
             if ex is not None:
                 try:
-                    rep: ExecutionReport = await ex.place_exit(sym, close_side, qty)
-                    self._accumulate_exec_counters(getattr(rep, "steps", None) or [])
-                    exit_steps = list(getattr(rep, "steps", []) or [])
-                except Exception:
-                    # Не роняем закрытие, просто помечаем.
+                    rep: ExecutionReport = await ex.place_exit(sym, close_side, qty, trade_id=trade_id)
+                    steps = list(getattr(rep, "steps", []) or [])
+                    if steps:
+                        exit_steps = steps
+                        self._accumulate_exec_counters(steps)
+                    
+                    # Use actual average fill price from Binance if available
+                    if rep.avg_px is not None and rep.avg_px > 0.0:
+                        actual_exit_px = float(rep.avg_px)
+                        logger.info(
+                            "[close_position] Using actual exit price from Binance for %s: %.8f (filled_qty=%.6f)",
+                            sym, actual_exit_px, rep.filled_qty
+                        )
+                    
+                    # Wait a bit for fills to be saved to database (especially for live trading)
+                    if is_live and rep.status in ("FILLED", "PARTIAL") and rep.filled_qty > 0:
+                        await asyncio.sleep(0.2)  # Give time for fills to be saved
+                        
+                except Exception as e:
+                    exec_failed = True
                     exit_steps = ["exec_exit_error"]
+                    logger.warning(
+                        "[close_position] place_exit failed for %s: %s",
+                        sym,
+                        e,
+                    )
 
-            # 2) Определяем финальную цену выхода.
-            if level_px is not None:
-                # Для sl_hit/tp_hit в paper-режиме ЖЁСТКО используем плановый уровень.
+            # --- 5. Определяем финальную цену выхода для учёта PnL ---
+            if actual_exit_px is not None:
+                # Priority 1: Use actual fill price from Binance (most accurate)
+                exit_px = actual_exit_px
+                logger.info("[close_position] Using actual Binance fill price: %.8f", exit_px)
+            elif level_px is not None:
+                # Priority 2: For sl_hit/tp_hit use planned level
                 exit_px = float(level_px)
+                logger.info("[close_position] Using planned level price: %.8f", exit_px)
             else:
-                # Для остальных причин (timeout, flatten, no_protection, etc.)
-                # берём консервативную доступную цену.
+                # Priority 3: Fallback to conservative market price
                 exit_px = self._exit_price_conservative(sym, close_side, entry_px)
+                logger.info("[close_position] Using conservative market price: %.8f", exit_px)
+
+            # Если на live не удалось отправить exit-ордер — не считаем позицию закрытой локально.
+            # Пусть верхний уровень/оператор разрулит ситуацию.
+            # Если на live не удалось отправить exit-ордер — не считаем позицию закрытой локально.
+            if exec_failed and is_live:
+                return
 
             # 3) Регистрируем трейд, если цена вменяема.
             if exit_px is not None and exit_px > 0.0:
@@ -3138,28 +4247,149 @@ class Worker:
                     entry_steps=entry_steps,
                     exit_steps=exit_steps or None,
                 )
+
+                # --- синхронизация с БД: закрываем trade и подтягиваем real PnL ---
+                trade_id = getattr(pos, "trade_id", None)
+                if trade_id:
+                    try:
+                        from storage.repo import close_trade as repo_close_trade, get_trade as repo_get_trade  # lazy import
+
+                        # закрываем сделку в базе: pnl_usd в БД будет пересчитан с учётом fees
+                        try:
+                            repo_close_trade(
+                                trade_id=trade_id,
+                                exit_px=float(exit_px),
+                                r=float(trade.get("pnl_r", 0.0) or 0.0),
+                                pnl_usd=float(trade.get("pnl_usd", 0.0) or 0.0),
+                                reason_close=reason,
+                            )
+                            
+                            # Small delay to ensure fills are saved and daily_stats is updated
+                            await asyncio.sleep(0.1)
+                            
+                        except Exception as e:
+                            logging.getLogger(__name__).warning(
+                                "[close_position] repo_close_trade failed for %s (%s): %s",
+                                trade_id,
+                                sym,
+                                e,
+                            )
+
+                        # пробуем прочитать сделку обратно и заменить pnl_usd на real (net) с retry
+                        db_trade = None
+                        for retry in range(3):
+                            try:
+                                db_trade = repo_get_trade(trade_id)
+                                if db_trade is not None:
+                                    break
+                            except Exception as e:
+                                if retry < 2:
+                                    await asyncio.sleep(0.1)  # Wait a bit before retry
+                                else:
+                                    logging.getLogger(__name__).warning(
+                                        "[close_position] repo_get_trade failed for %s (%s) after retries: %s",
+                                        trade_id,
+                                        sym,
+                                        e,
+                                    )
+
+                        if db_trade is not None:
+                            try:
+                                # Use actual values from database (calculated from real fills)
+                                trade["pnl_usd"] = float(db_trade.get("pnl_usd", trade.get("pnl_usd", 0.0)))
+                                trade["fees_usd"] = float(db_trade.get("fees_usd", 0.0))
+                                trade["exit_px"] = float(db_trade.get("exit_px", exit_px))
+                                trade["pnl_r"] = float(db_trade.get("pnl_r", trade.get("pnl_r", 0.0)))
+                                logger.info(
+                                    "[close_position] Updated trade with DB values for %s: pnl_usd=%.4f, fees_usd=%.4f, exit_px=%.8f",
+                                    sym, trade["pnl_usd"], trade["fees_usd"], trade["exit_px"]
+                                )
+                            except Exception as e:
+                                logger.warning("[close_position] Failed to update trade with DB values: %s", e)
+                            trade["trade_id"] = trade_id
+                            trade["source"] = "db"
+                        else:
+                            trade["trade_id"] = trade_id
+                            trade.setdefault("source", "worker")
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            "[close_position] DB sync block failed for %s (%s): %s",
+                            trade_id,
+                            sym,
+                            e,
+                        )
+                        trade.setdefault("source", "worker")
+                        if trade_id:
+                            trade["trade_id"] = trade_id
+                else:
+                    # WARNING: trade_id is None — this trade won't be recorded in DB!
+                    logging.getLogger(__name__).warning(
+                        "[close_position] trade_id is None for %s - trade will NOT be saved to DB. "
+                        "Position state: side=%s, qty=%.6f, entry_px=%.2f, exit_px=%.2f, pnl_usd=%.4f, reason=%s. "
+                        "This means the position was opened without DB tracking.",
+                        sym,
+                        pos.side if pos else None,
+                        pos.qty if pos else 0.0,
+                        pos.entry_px if pos else 0.0,
+                        float(exit_px) if exit_px else 0.0,
+                        float(trade.get("pnl_usd", 0.0) or 0.0),
+                        reason,
+                    )
+                    # нет trade_id — работаем как раньше (paper / старый режим)
+                    trade.setdefault("source", "worker")
+                    trade["trade_id"] = None
+
                 self._register_trade(trade)
                 # Фоновая пересборка истории (если есть хранилище).
                 asyncio.create_task(self._rebuild_trades_safe())
+                exit_committed = True
+                
+                # Immediately sync position from exchange to ensure frontend shows correct state
+                if is_live:
+                    try:
+                        # Trigger immediate sync to get actual position state from Binance
+                        asyncio.create_task(self._sync_symbol_from_exchange(sym))
+                        logger.info("[close_position] Triggered immediate position sync for %s", sym)
+                    except Exception as e:
+                        logger.warning("[close_position] Failed to trigger position sync for %s: %s", sym, e)
+            else:
+                logger.warning(
+                    "[close_position] cannot compute valid exit price for %s "
+                    "(reason=%s, level_px=%r), keeping position state as-is",
+                    sym,
+                    reason,
+                    level_px,
+                )
 
         finally:
-            # 4) Всегда приводим состояние к FLAT и фиксируем момент FLAT для анти-спама.
-            self._pos[sym] = PositionState(
-                state="FLAT",
-                side=None,
-                qty=0.0,
-                entry_px=0.0,
-                sl_px=None,
-                tp_px=None,
-                opened_ts_ms=0,
-                timeout_ms=timeout_ms,
-                sl_order_id=None,
-                tp_order_id=None,
-            )
-            self._entry_steps.pop(sym, None)
-            self._last_flat_ms[sym] = self._now_ms()
-            with contextlib.suppress(Exception):
-                await self._fsm[sym].on_flat()
+            # --- 7. Приводим локальный стейт к FLAT, если сделка учтена или позиция битая ---
+            # На live при провале place_exit и без exit_committed мы НЕ трогаем позицию.
+            if exit_committed or qty <= 0.0 or not side or entry_px <= 0.0:
+                self._pos[sym] = PositionState(
+                    state="FLAT",
+                    side=None,
+                    qty=0.0,
+                    entry_px=0.0,
+                    sl_px=None,
+                    tp_px=None,
+                    opened_ts_ms=0,
+                    timeout_ms=timeout_ms,
+                    sl_order_id=None,
+                    tp_order_id=None,
+                )
+                # Update unified PositionState
+                self._update_unified_position_state(sym)
+                self._entry_steps.pop(sym, None)
+                self._last_flat_ms[sym] = self._now_ms()
+                with contextlib.suppress(Exception):
+                    await self._fsm[sym].on_flat()
+            else:
+                # сюда попадём в основном на live, если exit не был закоммичен
+                logger.warning(
+                    "[close_position] exit not committed for %s, keeping position OPEN (reason=%s)",
+                    sym,
+                    reason,
+                )
 
     # ---------- учёт/PNL ----------
 
@@ -3173,22 +4403,45 @@ class Worker:
         entry_steps: Optional[List[str]] = None,
         exit_steps: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        side = (pos.side or "BUY")
-        qty = float(pos.qty or 0.0)
-        entry = float(pos.entry_px or 0.0)
-        sl_px = float(pos.sl_px) if pos.sl_px is not None else None
-        tp_px = float(pos.tp_px) if pos.tp_px is not None else None
+        """
+        Собирает локальный "черновой" рекорд сделки для UI/diag.
+
+        ВАЖНО:
+        - Это ОЦЕНКА на основе локальных данных (SL/TP, fee_bps и т.д.).
+        Реальная net-PnL с учётом комиссий биржи считается в БД (trades + fills).
+        - Ключи "pnl_usd"/"fees"/"risk_usd" сохраняем, чтобы не ломать фронт.
+        """
+
+        def _f(v: Any, default: float = 0.0) -> float:
+            try:
+                if v is None:
+                    return float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        side = (pos.side or "BUY").upper()
+        # Нормализуем на BUY/SELL, чтобы не ловить "LONG"/"SHORT" и прочий мусор
+        if side not in ("BUY", "SELL"):
+            side = "BUY"
+
+        qty = _f(pos.qty, 0.0)
+        entry = _f(pos.entry_px, 0.0)
+        sl_px = _f(pos.sl_px, 0.0) if pos.sl_px is not None else None
+        tp_px = _f(pos.tp_px, 0.0) if pos.tp_px is not None else None
+        exit_px = _f(exit_px, 0.0)
 
         now = self._now_ms()
 
-        if qty <= 0.0 or entry <= 0.0:
+        # Если позиция "битая" — возвращаем нулевой PnL, чтобы не сломать агрегации
+        if qty <= 0.0 or entry <= 0.0 or exit_px <= 0.0:
             return {
                 "symbol": sym,
                 "side": side,
-                "opened_ts": int(pos.opened_ts_ms or 0),
+                "opened_ts": int(getattr(pos, "opened_ts_ms", 0) or 0),
                 "closed_ts": now,
-                "qty": qty,
-                "entry_px": entry,
+                "qty": float(qty),
+                "entry_px": float(entry),
                 "exit_px": float(exit_px),
                 "sl_px": sl_px,
                 "tp_px": tp_px,
@@ -3197,32 +4450,87 @@ class Worker:
                 "risk_usd": 0.0,
                 "reason": f"{reason}|invalid_pos",
                 "fees": 0.0,
+                "fees_usd": 0.0,
+                # дополнительные флажки для дебага, не ломают фронт
+                "pnl_source": "local_estimate",
+                "fees_estimated": True,
             }
 
-        # gross PnL и номинальный риск по SL (без комиссий)
+        # --- Gross PnL (без комиссий) и номинальный риск по SL ---
         if side == "BUY":
             pnl_usd_gross = (exit_px - entry) * qty
-            sl_ref = sl_px if sl_px is not None and sl_px < entry else entry
+            # для лонга SL должен быть ниже entry; иначе используем entry как ref
+            sl_ref = sl_px if (sl_px is not None and sl_px < entry) else entry
             risk_usd_nominal = abs(entry - sl_ref) * qty
-        else:
+        else:  # SELL (шорт)
             pnl_usd_gross = (entry - exit_px) * qty
-            sl_ref = sl_px if sl_px is not None and sl_px > entry else entry
+            # для шорта SL должен быть выше entry; иначе используем entry как ref
+            sl_ref = sl_px if (sl_px is not None and sl_px > entry) else entry
             risk_usd_nominal = abs(sl_ref - entry) * qty
 
-        # комиссии по фактическим шагам исполнения
-        entry_bps = self._fee_bps_for_steps(entry_steps or [])
-        exit_bps = self._fee_bps_for_steps(exit_steps or [])
-        fees_usd = (entry * qty * entry_bps + exit_px * qty * exit_bps) / 10_000.0
+        # --- Комиссии: попытка получить из БД или fallback на оценку через fee_bps ---
+        fees_usd = 0.0
+        fees_estimated = True
+        
+        # Пытаемся достать реальные комиссии из БД по trade_id
+        trade_id = getattr(pos, "trade_id", None)
+        if trade_id:
+            try:
+                from sqlalchemy import text
+                from storage.db import get_engine
+                
+                eng = get_engine()
+                with eng.begin() as conn:
+                    row = conn.execute(
+                        text(
+                            """
+                            SELECT COALESCE(SUM(f.fee_usd), 0.0) AS fee_sum
+                              FROM fills f
+                              JOIN orders o ON o.id = f.order_id
+                             WHERE o.trade_id = :tid
+                            """
+                        ),
+                        {"tid": trade_id},
+                    ).fetchone()
+                    
+                    if row is not None:
+                        if hasattr(row, '_mapping'):
+                            fees_usd = float(row._mapping.get("fee_sum", 0.0) or 0.0)
+                        else:
+                            fees_usd = float(row[0] or 0.0)
+                        fees_estimated = False
+            except Exception as e:
+                # Логируем, но не роняем приложение
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[_build_trade_record] Failed to query fees for trade_id={trade_id}: {e}. "
+                    f"Falling back to estimate."
+                )
+        
+        # Fallback: если не удалось получить из БД, используем оценку
+        if fees_estimated:
+            entry_bps = self._fee_bps_for_steps(entry_steps or [])
+            exit_bps = self._fee_bps_for_steps(exit_steps or [])
+            # fee = notional * (bps / 10_000)
+            entry_fee_usd = (entry * qty * entry_bps) / 10_000.0
+            exit_fee_usd = (exit_px * qty * exit_bps) / 10_000.0
+            fees_usd = entry_fee_usd + exit_fee_usd
 
+        # --- Net PnL (оценка) ---
         pnl_usd = pnl_usd_gross - fees_usd
 
-        # фактический риск сделки = SL-дистанция + комиссии
+        # --- Реальный риск сделки: SL-дистанция + комиссии ---
         gross_risk_usd = max(risk_usd_nominal, 0.0)
         risk_usd_total = gross_risk_usd + max(fees_usd, 0.0)
 
-        # читаем конфиг риска (нужен для порогов, но не для искажения R)
+        # --- Конфиг риска (для порогов, но не для искажения R) ---
         try:
-            equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
+            # ВАЖНО: здесь используем in-memory pnl_day, а не AccountState,
+            # чтобы не тянуть лишние зависимости и не ломать текущую логику.
+            equity = float(
+                self._starting_equity_usd
+                + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0)
+            )
         except Exception:
             equity = float(self._starting_equity_usd)
 
@@ -3233,30 +4541,50 @@ class Worker:
         if cfg_floor <= 0.0:
             cfg_floor = 1.0
 
-        # ВАЖНО: risk_usd = реальный риск сделки (SL + fees), а не max с risk_target.
-        # floor нужен только чтобы не делить на 0 в аккуратных/микро-сделках.
+        # ВАЖНО: risk_usd = реальный риск сделки (SL + fees), floor только чтобы
+        # не делить на 0 при вычислении R, а не чтобы "подтягивать" риск к целевому.
         risk_usd = max(risk_usd_total, cfg_floor, 1e-9)
         pnl_r = pnl_usd / risk_usd
 
         return {
             "symbol": sym,
             "side": side,
-            "opened_ts": int(pos.opened_ts_ms or 0),
+            "opened_ts": int(getattr(pos, "opened_ts_ms", 0) or 0),
             "closed_ts": now,
-            "qty": qty,
-            "entry_px": entry,
+            "qty": float(qty),
+            "entry_px": float(entry),
             "exit_px": float(exit_px),
             "sl_px": sl_px,
             "tp_px": tp_px,
-            "pnl_usd": round(pnl_usd, 6),
-            "pnl_r": round(pnl_r, 6),
-            "risk_usd": round(risk_usd, 6),
-            "reason": reason,
-            "fees": round(fees_usd, 6),
+            "pnl_usd": round(float(pnl_usd), 6),
+            "pnl_r": round(float(pnl_r), 6),
+            "risk_usd": round(float(risk_usd), 6),
+            "reason": str(reason),
+            "fees": round(float(fees_usd), 6),
+            "fees_usd": round(float(fees_usd), 6),  # expose fees_usd for API
+            # новые поля для прозрачности (не ломают фронт)
+            "pnl_source": "db" if not fees_estimated else "local_estimate",
+            "fees_estimated": fees_estimated,
         }
 
     def _register_trade(self, trade: Dict[str, Any]) -> None:
-        sym = trade["symbol"]
+        """
+        Регистрирует закрытую сделку в in-memory очереди и обновляет дневную статистику.
+
+        ВАЖНО:
+        - Работает только с тем, что пришло в trade (локальная оценка).
+        AccountState / БД могут потом показать "истинный" PnL — мы это уже
+        подхватываем в diag() через snapshot.
+        - Здесь мы обновляем:
+            _trades[sym], _pnl_day, _pnl_r_equity, _consec_losses, _last_sl_ts_ms.
+        """
+        from collections import deque
+
+        sym = trade.get("symbol") or ""
+        if not sym:
+            # без символа не знаем, куда класть — просто выходим, чтобы не ломать структуру
+            return
+
         dq = self._trades.get(sym)
         if dq is None:
             dq = self._trades[sym] = deque(maxlen=1000)
@@ -3264,7 +4592,7 @@ class Worker:
 
         now = self._now_ms()
 
-        # смена дня
+        # --- смена дня ---
         day = self._day_str()
         if self._pnl_day.get("day") != day:
             self._pnl_day = {
@@ -3275,49 +4603,83 @@ class Worker:
                 "pnl_r": 0.0,
                 "pnl_usd": 0.0,
                 "max_dd_r": None,
+                # внутренние служебные поля
+                "winrate_raw": 0.0,
+                "peak_r": 0.0,
+                "trough_r": 0.0,
             }
             self._pnl_r_equity = 0.0
             self._consec_losses = 0
 
-        pnl_usd = float(trade.get("pnl_usd", 0.0) or 0.0)
-        pnl_r = float(trade.get("pnl_r", 0.0) or 0.0)
-        risk_usd = float(trade.get("risk_usd", 0.0) or 0.0)
-        reason = str(trade.get("reason", "")).lower()
+        # --- извлекаем метрики сделки ---
+        try:
+            pnl_usd = float(trade.get("pnl_usd", 0.0) or 0.0)
+        except Exception:
+            pnl_usd = 0.0
 
-        # агрегаты
-        self._pnl_day["trades"] += 1
-        self._pnl_day["pnl_usd"] += pnl_usd
-        self._pnl_day["pnl_r"] += pnl_r
+        try:
+            pnl_r = float(trade.get("pnl_r", 0.0) or 0.0)
+        except Exception:
+            pnl_r = 0.0
 
-        wins_prev = int(round((self._pnl_day.get("winrate_raw", 0.0) or 0.0)
-                              * max(self._pnl_day["trades"] - 1, 0)))
+        try:
+            risk_usd = float(trade.get("risk_usd", 0.0) or 0.0)
+        except Exception:
+            risk_usd = 0.0
+
+        reason = str(trade.get("reason", "") or "").lower()
+
+        # --- агрегаты по дню (in-memory) ---
+        self._pnl_day["trades"] = int(self._pnl_day.get("trades", 0) or 0) + 1
+        self._pnl_day["pnl_usd"] = float(self._pnl_day.get("pnl_usd", 0.0) or 0.0) + pnl_usd
+        self._pnl_day["pnl_r"] = float(self._pnl_day.get("pnl_r", 0.0) or 0.0) + pnl_r
+
+        # winrate_raw = wins / trades
+        prev_trades = max(int(self._pnl_day["trades"]) - 1, 0)
+        prev_winrate_raw = float(self._pnl_day.get("winrate_raw", 0.0) or 0.0)
+        wins_prev = int(round(prev_winrate_raw * prev_trades))
+
         if pnl_r > 0:
             wins_now = wins_prev + 1
         else:
             wins_now = wins_prev
 
-        self._pnl_day["winrate_raw"] = wins_now / max(self._pnl_day["trades"], 1)
-        self._pnl_day["winrate"] = round(self._pnl_day["winrate_raw"], 4)
-        self._pnl_day["avg_r"] = round(self._pnl_day["pnl_r"] / max(self._pnl_day["trades"], 1), 6)
+        trades_now = int(self._pnl_day["trades"])
+        winrate_raw = wins_now / max(trades_now, 1)
 
-        # DD по R
-        self._pnl_r_equity += pnl_r
-        peak = self._pnl_day.get("peak_r", 0.0)
-        trough = self._pnl_day.get("trough_r", 0.0)
+        self._pnl_day["winrate_raw"] = winrate_raw
+        self._pnl_day["winrate"] = round(winrate_raw, 4)
+        self._pnl_day["avg_r"] = round(
+            float(self._pnl_day["pnl_r"]) / max(trades_now, 1),
+            6,
+        )
+
+        # --- DD по R (equity в R-пространстве) ---
+        self._pnl_r_equity = float(self._pnl_r_equity) + pnl_r
+
+        peak = float(self._pnl_day.get("peak_r", 0.0) or 0.0)
+        trough = float(self._pnl_day.get("trough_r", 0.0) or 0.0)
+
         if self._pnl_r_equity > peak:
             peak = self._pnl_r_equity
         if self._pnl_r_equity < trough:
             trough = self._pnl_r_equity
+
         self._pnl_day["peak_r"] = peak
         self._pnl_day["trough_r"] = trough
+        # max_dd_r — это (peak - trough) в абсолюте
         self._pnl_day["max_dd_r"] = round(max(peak - trough, 0.0), 6)
 
-        # логика последовательных стопов
+        # --- логика последовательных стопов ---
         # реальный стоп: SL-триггер, риск не микроскопический, R <= -0.8
+
         cfg_floor = float(getattr(self._risk_cfg, "min_risk_usd_floor", 1.0) or 1.0)
         try:
             risk_pct = float(getattr(self._risk_cfg, "risk_per_trade_pct", 0.0) or 0.0)
-            equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
+            equity = float(
+                self._starting_equity_usd
+                + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0)
+            )
             risk_target = equity * (risk_pct / 100.0) if risk_pct > 0.0 else cfg_floor
         except Exception:
             risk_target = cfg_floor
@@ -3327,6 +4689,7 @@ class Worker:
         is_real_stop = is_sl_reason and is_meaningful_risk and (pnl_r <= -0.8)
 
         if pnl_r > 0:
+            # любая положительная сделка полностью сбрасывает серию
             self._consec_losses = 0
         elif is_real_stop:
             self._consec_losses += 1
@@ -3362,6 +4725,8 @@ class Worker:
             exec_cfg, exec_counters, block_reasons,
             auto_signal_enabled, strategy_cfg, strategy_last_error,
             strategy_heartbeat_ms.
+        + Дополнительно:
+            account_state — компактный снапшот AccountState (equity, margin, PnL, позиции).
         """
         import dataclasses
         from typing import Dict, Any
@@ -3400,11 +4765,16 @@ class Worker:
                 if dq:
                     last = dq[-1]
                     try:
-                        latest_ts = int(
-                            (last.get("ts_ms")
-                            or last.get("ts")
-                            or 0)
-                        )
+                        if isinstance(last, dict):
+                            latest_ts = int(
+                                (last.get("ts_ms") or last.get("ts") or 0)
+                            )
+                        else:
+                            # если это датакласс/объект — пробуем через __dict__
+                            last_dict = getattr(last, "__dict__", {}) or {}
+                            latest_ts = int(
+                                (last_dict.get("ts_ms") or last_dict.get("ts") or 0)
+                            )
                     except Exception:
                         latest_ts = 0
                 history_meta[sym] = {"latest_ts_ms": latest_ts}
@@ -3420,7 +4790,10 @@ class Worker:
                     bid, ask = self.best_bid_ask(sym)
                 except Exception:
                     bid, ask = 0.0, 0.0
-                best[sym] = {"bid": float(bid or 0.0), "ask": float(ask or 0.0)}
+                best[sym] = {
+                    "bid": float(bid or 0.0),
+                    "ask": float(ask or 0.0),
+                }
         except Exception:
             best = {}
         out["best"] = best
@@ -3441,55 +4814,190 @@ class Worker:
             positions = {}
         out["positions"] = positions
 
-        # --- unrealized PnL (best-effort) ---
-        unrealized = {
+        # --- account_state (compact snapshot из AccountState) ---
+        try:
+            acc_state = getattr(self, "_account_state", None)
+            acc_out: Dict[str, Any] = {}
+            if acc_state is not None:
+                snap = None
+                try:
+                    snap = acc_state.get_snapshot()
+                except Exception:
+                    snap = None
+
+                if snap is not None:
+                    # базовые поля аккаунта
+                    try:
+                        equity = float(getattr(snap, "equity", 0.0) or 0.0)
+                    except Exception:
+                        equity = 0.0
+                    try:
+                        avail = float(getattr(snap, "available_margin", 0.0) or 0.0)
+                    except Exception:
+                        avail = 0.0
+                    try:
+                        realized_today = float(getattr(snap, "realized_pnl_today", 0.0) or 0.0)
+                    except Exception:
+                        realized_today = 0.0
+                    try:
+                        n_trades = int(getattr(snap, "num_trades_today", 0) or 0)
+                    except Exception:
+                        n_trades = 0
+                    try:
+                        age_ms = int(getattr(acc_state, "snapshot_age_ms", lambda: 0)() or 0)
+                    except Exception:
+                        age_ms = 0
+
+                    # открытые позиции с точки зрения биржи
+                    open_pos_out: Dict[str, Any] = {}
+                    try:
+                        snap_positions = getattr(snap, "open_positions", {}) or {}
+                        for psym, ps in snap_positions.items():
+                            try:
+                                oqty = float(getattr(ps, "qty", 0.0) or 0.0)
+                                oentry = float(getattr(ps, "entry_px", 0.0) or 0.0)
+                                oupnl = float(getattr(ps, "unrealized_pnl", 0.0) or 0.0)
+                                lev = float(getattr(ps, "leverage", 0.0) or 0.0)
+                                margin = float(getattr(ps, "position_margin", 0.0) or 0.0)
+                            except Exception:
+                                continue
+                            if abs(oqty) <= 0.0 and oupnl == 0.0:
+                                continue
+                            open_pos_out[psym] = {
+                                "qty": oqty,
+                                "entry_px": oentry,
+                                "unrealized_pnl": oupnl,
+                                "leverage": lev,
+                                "margin": margin,
+                            }
+                    except Exception:
+                        open_pos_out = {}
+
+                    acc_out = {
+                        "equity": equity,
+                        "available_margin": avail,
+                        "realized_pnl_today": realized_today,
+                        "num_trades_today": n_trades,
+                        "snapshot_age_ms": age_ms,
+                        "open_positions": open_pos_out,
+                    }
+            out["account_state"] = acc_out
+        except Exception:
+            out["account_state"] = {}
+
+        # --- unrealized PnL (best-effort, с использованием AccountState, если доступен) ---
+        unrealized: Dict[str, Any] = {
             "total_usd": 0.0,
             "per_symbol": {},
             "open_positions": 0,
+            "source": "none",
         }
         try:
-            per_sym = {}
-            total = 0.0
-            open_pos = 0
-            for sym, p in (positions or {}).items():
-                p = p or {}
-                if str(p.get("state", "")).upper() != "OPEN":
-                    continue
-                open_pos += 1
-                qty = float(p.get("qty") or 0.0)
-                entry = float(p.get("entry_px") or 0.0)
-                if qty <= 0.0 or entry <= 0.0:
-                    continue
-                b = best.get(sym, {}).get("bid", 0.0)
-                a = best.get(sym, {}).get("ask", 0.0)
-                mid = (float(b or 0.0) + float(a or 0.0)) / 2.0
-                if mid <= 0.0:
-                    continue
-                side = (p.get("side") or "").upper()
-                diff = (mid - entry) if side == "BUY" else (entry - mid)
-                u = diff * qty
-                per_sym[sym] = u
-                total += u
-            unrealized["total_usd"] = float(total)
-            unrealized["per_symbol"] = per_sym if per_sym else None
-            unrealized["open_positions"] = int(open_pos)
+            # 1) Пробуем взять uPnL напрямую из AccountState (Binance positionRisk)
+            acc_state = getattr(self, "_account_state", None)
+            snap = None
+            if acc_state is not None:
+                try:
+                    snap = acc_state.get_snapshot()
+                except Exception:
+                    snap = None
+
+            used_account_state = False
+            if snap is not None:
+                try:
+                    is_fresh = acc_state.is_fresh(max_age_s=15)  # type: ignore[union-attr]
+                except Exception:
+                    is_fresh = True
+
+                if is_fresh and getattr(snap, "open_positions", None):
+                    per_sym: Dict[str, float] = {}
+                    total = 0.0
+                    open_cnt = 0
+
+                    for sym, ps in (snap.open_positions or {}).items():  # type: ignore[union-attr]
+                        try:
+                            upnl = float(getattr(ps, "unrealized_pnl", 0.0) or 0.0)
+                            qty = float(getattr(ps, "qty", 0.0) or 0.0)
+                        except Exception:
+                            continue
+
+                        per_sym[sym] = upnl
+                        total += upnl
+                        if abs(qty) > 0.0:
+                            open_cnt += 1
+
+                    unrealized["total_usd"] = float(total)
+                    unrealized["per_symbol"] = per_sym if per_sym else None
+                    unrealized["open_positions"] = int(open_cnt)
+                    unrealized["source"] = "account_state"
+                    used_account_state = True
+
+            # 2) Fallback: если AccountState нет/старый — считаем по локальным позициям + best bid/ask
+            if not used_account_state:
+                per_sym = {}
+                total = 0.0
+                open_pos = 0
+
+                positions_loc = out.get("positions", {}) or {}
+                best_loc = out.get("best", {}) or {}
+
+                for sym, p in (positions_loc or {}).items():
+                    p = p or {}
+                    if str(p.get("state", "")).upper() != "OPEN":
+                        continue
+                    open_pos += 1
+                    qty = float(p.get("qty") or 0.0)
+                    entry = float(p.get("entry_px") or 0.0)
+                    if qty <= 0.0 or entry <= 0.0:
+                        continue
+
+                    b = best_loc.get(sym, {}).get("bid", 0.0)
+                    a = best_loc.get(sym, {}).get("ask", 0.0)
+                    mid = (float(b or 0.0) + float(a or 0.0)) / 2.0
+                    if mid <= 0.0:
+                        continue
+
+                    side = (p.get("side") or "").upper()
+                    diff = (mid - entry) if side == "BUY" else (entry - mid)
+                    u = diff * qty
+                    per_sym[sym] = u
+                    total += u
+
+                unrealized["total_usd"] = float(total)
+                unrealized["per_symbol"] = per_sym if per_sym else None
+                unrealized["open_positions"] = int(open_pos)
+                unrealized["source"] = "local"
         except Exception:
+            # Диагностика никогда не должна падать
             pass
         out["unrealized"] = unrealized
 
         # --- trades (in-memory) ---
         try:
             out["trades"] = {
-                sym: list(dq) for sym, dq in (getattr(self, "_trades", {}) or {}).items()
+                sym: list(dq)
+                for sym, dq in (getattr(self, "_trades", {}) or {}).items()
             }
         except Exception:
             out["trades"] = {}
 
-        # --- pnl_day ---
+        # --- trades_db (реальные сделки из SQLite) ---
         try:
-            out["pnl_day"] = dict(getattr(self, "_pnl_day", {}) or {})
+            try:
+                from storage.repo import load_recent_trades  # lazy import
+            except Exception:
+                load_recent_trades = None  # type: ignore[assignment]
+
+            trades_db = []
+            if load_recent_trades is not None:
+                try:
+                    trades_db = load_recent_trades(limit=100) or []
+                except Exception:
+                    trades_db = []
+
+            out["trades_db"] = trades_db
         except Exception:
-            out["pnl_day"] = {}
+            out["trades_db"] = []
 
         # --- risk_cfg ---
         try:
@@ -3548,6 +5056,44 @@ class Worker:
         except Exception:
             out["account_cfg"] = {}
 
+        # --- pnl_day (align with AccountState when possible) ---
+        try:
+            # базово — то, что накапливает сам воркер
+            pnl_day = dict(getattr(self, "_pnl_day", {}) or {})
+
+            acc_state = getattr(self, "_account_state", None)
+            snapshot = None
+            is_fresh = False
+
+            if acc_state is not None:
+                try:
+                    snapshot = acc_state.get_snapshot()
+                    # для дневной статистики достаточно, чтобы снапшот был не старее пары минут
+                    is_fresh = acc_state.is_fresh(max_age_s=120)
+                except Exception:
+                    snapshot = None
+                    is_fresh = False
+
+            # Если есть живой снапшот аккаунта — переопределяем деньги/кол-во сделок
+            if snapshot is not None and is_fresh:
+                try:
+                    trades_today = getattr(snapshot, "num_trades_today", None)
+                    if trades_today is not None:
+                        pnl_day["trades"] = int(trades_today or 0)
+                except Exception:
+                    pass
+
+                try:
+                    realized_today = getattr(snapshot, "realized_pnl_today", None)
+                    if realized_today is not None:
+                        pnl_day["pnl_usd"] = float(realized_today or 0.0)
+                except Exception:
+                    pass
+
+            out["pnl_day"] = pnl_day
+        except Exception:
+            out["pnl_day"] = {}
+
         # --- exec_cfg ---
         exec_cfg: Dict[str, Any] = {}
         try:
@@ -3588,16 +5134,14 @@ class Worker:
             if get_settings:
                 s = get_settings()
                 acc = getattr(s, "account", object())
-                out["trading_mode"] = str(getattr(acc, "mode", "paper"))
+                out["trading_mode"] = str(getattr(acc, "mode", "live"))
                 out["exchange"] = str(getattr(acc, "exchange", "binance_usdtm"))
         except Exception:
             # дефолты, если конфиг не читается
-            out.setdefault("trading_mode", "paper")
+            out.setdefault("trading_mode", "live")
             out.setdefault("exchange", "binance_usdtm")
 
         return out
-    
-    # === BEGIN: Worker per-symbol fees/leverage & safe sizing ===
 
     def update_exec_cfg(self, cfg: dict) -> None:
         """
@@ -3712,6 +5256,7 @@ class Worker:
     def _leverage_for_symbol(self, symbol: str) -> float:
         """
         Эффективное плечо: сначала per-symbol, затем глобальная настройка аккаунта, затем дефолт 15.
+        TEMP: single-symbol mode GALAUSDT, 10x leverage (configured in settings.json per_symbol_leverage).
         """
         self._init_per_symbol_maps()
         sym = str(symbol).upper()
@@ -4575,104 +6120,113 @@ class Worker:
 
     # --- sizing helpers ---
 
-    def _compute_auto_qty(self, symbol: str, side: Side, sl_distance_px: float) -> float:
+    def _compute_auto_qty(self, symbol: str, side: Side, sl_distance_px: float, stop_distance_usd: float | None = None) -> float:
         """
-        Размер позиции от процента риска и SL-дистанции.
-
-        NEW: учитываем комиссии (taker+taker) при расчёте qty так,
-        чтобы общий убыток на стопе (цена + комиссии) ≈ risk_usd_target.
+        Position sizing based on fixed USD risk per trade and strategy-provided stop distance (R-scaling).
+        
+        Uses the new R-scaling formula: qty = risk_per_trade_usd / stop_distance_usd
+        
+        Args:
+            symbol: Trading symbol
+            side: Trade side (BUY/SELL)
+            sl_distance_px: Stop distance in price units (legacy, for backward compatibility)
+            stop_distance_usd: Stop distance in USD (from EntryCandidate.stop_distance_usd, preferred)
+        
+        Returns:
+            Calculated quantity, or 0.0 if sizing fails
         """
         sym = symbol.upper()
-        spec = self.specs[sym]
 
-        # --- риск-таргет в USD ---
+        # Get current price
         try:
-            risk_pct = float(self._risk_cfg.risk_per_trade_pct)
+            bid, ask = self.hub.best_bid_ask(sym)
         except Exception:
-            risk_pct = 0.0
-
-        try:
-            equity = float(self._starting_equity_usd + float(self._pnl_day.get("pnl_usd", 0.0) or 0.0))
-        except Exception:
-            equity = float(self._starting_equity_usd)
-
-        try:
-            min_floor = float(self._risk_cfg.min_risk_usd_floor)
-        except Exception:
-            min_floor = 1.0
-
-        risk_usd_target = max(min_floor, equity * (risk_pct / 100.0)) if risk_pct > 0.0 else min_floor
-        if sl_distance_px <= 0.0 or risk_usd_target <= 0.0:
             return 0.0
 
-        # --- рынок и цена ---
-        bid, ask = self.best_bid_ask(sym)
-        px = ask if side == "BUY" else bid
+        try:
+            if bid > 0.0 and ask > 0.0:
+                px = (float(bid) + float(ask)) / 2.0
+            else:
+                px = float(max(bid, ask))
+        except Exception:
+            px = 0.0
+
         if px <= 0.0:
             return 0.0
 
-        # --- комиссии в долях (taker + taker, консервативно) ---
-        try:
-            maker_bps, taker_bps = self._fees_for_symbol(sym)
-        except Exception:
-            maker_bps, taker_bps = 2.0, 4.0
-
-        fee_bps_total = 2.0 * float(taker_bps)  # вход + выход как taker
-        c = fee_bps_total / 10_000.0           # доля нотиционала
-
-        # относительное движение до SL (в доле цены)
-        d = sl_distance_px / px
-        if d <= 0.0:
-            return 0.0
-
-        denom = d + c
-        if denom <= 0.0:
-            return 0.0
-
-        # --- целевой нотиционал с учётом комиссий ---
-        notional_target = risk_usd_target / denom  # N = R / (d + c)
-
-        # лимит по плечу
-        lev = float(self._leverage_for_symbol(sym))
-        if lev < 1.0:
-            lev = 1.0
-        max_notional = equity * lev
-        if max_notional <= 0.0:
-            return 0.0
-
-        notional = min(notional_target, max_notional)
-        qty_raw = notional / px
-
-        # --- минимальная нотиональ ---
-        min_notional = float(getattr(self, "_min_notional_usd", 5.0))
-        min_qty_by_notional = min_notional / px if px > 0.0 else 0.0
-
-        # --- шаг лота ---
-        step = max(float(getattr(spec, "qty_step", 0.001)), 1e-12)
-
-        def floor_to_step(x: float, st: float) -> float:
-            return (int(x / st)) * st
-
-        qty = max(min_qty_by_notional, qty_raw)
-        qty = floor_to_step(qty, step)
-
-        # если после округления всё равно 0 — пробуем минимум, если он валиден
-        if qty <= 0.0:
-            qty = step
-            if qty * px < min_notional or qty * px > max_notional:
+        # Get stop_distance_usd: prefer provided value, otherwise convert sl_distance_px to USD
+        # For linear USDT-M futures, multiplier = 1, so stop_distance_usd = sl_distance_px
+        if stop_distance_usd is None or stop_distance_usd <= 0:
+            if sl_distance_px is None or sl_distance_px <= 0:
                 return 0.0
+            # Convert price units to USD (for linear contracts, 1:1)
+            stop_distance_usd = float(sl_distance_px)
 
-        # --- liq-buffer: SL не должен быть рядом с ликвидацией ---
+        # Get risk_per_trade_usd from config
+        risk_per_trade_usd = 20.0  # default
         try:
-            sl_px = px - sl_distance_px if side == "BUY" else px + sl_distance_px
-            lb_mult = self._liq_buffer_mult(px, sl_px, side, lev)
-            min_mult = float(
-                getattr(self._safety_cfg, "min_liq_buffer_sl_mult", 3.0) or 3.0
-            )
-            if lb_mult < max(1.5, min_mult):
-                return 0.0
+            risk_cfg = getattr(self, "_risk_cfg", None)
+            if risk_cfg and hasattr(risk_cfg, "risk_per_trade_usd"):
+                risk_per_trade_usd = float(risk_cfg.risk_per_trade_usd or 20.0)
+            else:
+                # Fallback: try to get from settings
+                try:
+                    settings = get_settings()
+                    if settings and settings.risk:
+                        risk_per_trade_usd = float(settings.risk.risk_per_trade_usd or 20.0)
+                except Exception:
+                    pass
         except Exception:
             pass
+
+        if risk_per_trade_usd <= 0:
+            return 0.0
+
+        # Get symbol specifications
+        spec = getattr(self, "specs", {}).get(sym) if hasattr(self, "specs") else None
+        try:
+            if spec is not None:
+                qty_step = float(getattr(spec, "qty_step", 0.001) or 0.001)
+                min_qty = float(getattr(spec, "min_qty", 0.0) or 0.0)
+            else:
+                qty_step = float(getattr(self, "_qty_step_fallback", 0.001) or 0.001)
+                min_qty = 0.0
+        except Exception:
+            qty_step = 0.001
+            min_qty = 0.0
+
+        if qty_step <= 0.0:
+            qty_step = 0.001
+
+        # Get min_notional
+        min_notional = 0.0
+        try:
+            if hasattr(self, "_min_notional_for_symbol"):
+                min_notional = float(self._min_notional_for_symbol(sym) or 0.0)
+            else:
+                # Fallback: try to get from account config
+                try:
+                    settings = get_settings()
+                    if settings and settings.account:
+                        min_notional = float(settings.account.min_notional_usd or 0.0)
+                except Exception:
+                    pass
+        except Exception:
+            min_notional = 0.0
+
+        # Use the new R-scaling sizing function
+        qty = calc_qty_from_stop_distance_usd(
+            risk_per_trade_usd=risk_per_trade_usd,
+            stop_distance_usd=stop_distance_usd,
+            qty_step=qty_step,
+            min_qty=min_qty,
+            max_qty=None,  # No max_qty constraint for now
+            min_notional_usd=min_notional,
+            price=px,
+        )
+
+        if qty is None or qty <= 0.0:
+            return 0.0
 
         return float(qty)
 

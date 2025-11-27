@@ -21,6 +21,11 @@ class IndiEngine:
     """
     Лёгкий набор индикаторов на последнем mid/price.
     Важно: считаем волатильность корректно как std(log-returns) и возвращаем в bp.
+    
+    TIMEFRAME: Reversion strategy for GALAUSDT uses 1-minute candles.
+    The default bb_win=60 represents approximately 1 minute of tick data for active symbols
+    (~60 ticks per minute). All indicators (bb_z, ema21, rsi, realized_vol_bp) are computed
+    from 1-minute timeframe data.
     """
 
     def __init__(self, price_step: float, ema_fast=9, ema_slow=21, bb_win=60, rsi_win=14):

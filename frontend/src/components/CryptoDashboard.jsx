@@ -3,7 +3,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import CandleChart from "./CandleChart";
 import TradesTable from "./TradesTable";
 import OpenPositionsPanel from "./OpenPositionsPanel";
-import { getPnlNow, getTrades, resetMetrics } from "../services/cryptoApi";
+import { getPnlNow, getTradesRecent, resetMetrics } from "../services/cryptoApi";
 
 // Ті самі 3 монети
 const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
@@ -82,10 +82,11 @@ async function postCloseAll() {
 
 const CryptoDashboard = () => {
   const [pnlNow, setPnlNow] = useState(null);
-  const [trades, setTrades] = useState([]);
+  const [tradesData, setTradesData] = useState(null); // { trades: [], stats: {} }
   const [positions, setPositions] = useState({});
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
+  const [dataUnavailable, setDataUnavailable] = useState(false);
 
   const [actionsLoading, setActionsLoading] = useState(false);
   const [actionsError, setActionsError] = useState("");
@@ -99,16 +100,23 @@ const CryptoDashboard = () => {
     async function load() {
       try {
         setErrorMsg("");
-        const [pnlData, tradesData, positionsData, autoData] = await Promise.all([
-          getPnlNow(),
-          getTrades({ limit: 50 }),
-          fetchPositionsRaw(),
+        setDataUnavailable(false);
+        const [pnlData, tradesResponse, positionsData, autoData] = await Promise.all([
+          getPnlNow().catch((e) => {
+            console.error("Failed to load PnL:", e);
+            throw new Error("Failed to load PnL data");
+          }),
+          getTradesRecent({ limit: 100 }).catch((e) => {
+            console.error("Failed to load trades:", e);
+            return { trades: [], stats: {} };
+          }),
+          fetchPositionsRaw().catch(() => ({})),
           fetchAutoStatus().catch(() => null), // не падаем, если endpoint вернёт ошибку
         ]);
         if (cancelled) return;
 
         setPnlNow(pnlData);
-        setTrades(tradesData?.items || []);
+        setTradesData(tradesResponse);
         setPositions(positionsData?.positions ?? positionsData ?? {});
 
         if (autoData && typeof autoData.auto_signal_enabled === "boolean") {
@@ -120,6 +128,7 @@ const CryptoDashboard = () => {
         console.error("LiveDashboard load error", err);
         if (!cancelled) {
           setErrorMsg(err?.message || "Failed to load data");
+          setDataUnavailable(true);
           setLoading(false);
         }
       }
@@ -135,6 +144,9 @@ const CryptoDashboard = () => {
   }, []);
 
   // --- группировка трейдов по символу -----------------------------------
+  const trades = tradesData?.trades || [];
+  const tradesStats = tradesData?.stats || {};
+  
   const tradesBySymbol = useMemo(() => {
     const map = {};
     SYMBOLS.forEach((s) => {
@@ -177,28 +189,40 @@ const CryptoDashboard = () => {
     return map;
   }, [allOpenPositions]);
 
-  // --- агрегаты по PnL -------------------------------------------------
+  // --- агрегаты по PnL (from backend single source of truth) -----------
+  // Use /pnl/now response structure: equity, realized_pnl_today, unrealized_pnl, open_positions_count
+  const equity = pnlNow?.equity ?? 0;
+  const realizedPnlToday = pnlNow?.realized_pnl_today ?? 0;
+  const unrealizedPnl = pnlNow?.unrealized_pnl ?? 0;
+  const openPositionsCount = pnlNow?.open_positions_count ?? 0;
+  
+  // Get daily stats from pnl_day object
   const pnlDay = pnlNow?.pnl_day || {};
-  const unrealized = pnlNow?.unrealized || {};
-  const openPositionsCount = pnlNow?.open_positions ?? 0;
-
-  const pnlUsd = formatNumber(pnlDay.pnl_usd, 2);
   const pnlR = formatNumber(pnlDay.pnl_r, 2);
-  const winrate =
-    pnlDay.winrate != null ? `${formatNumber(pnlDay.winrate * 100, 1)}%` : "—";
-  const uPnlUsd = formatNumber(unrealized.total_usd, 2);
+  
+  // Winrate: prefer from trades/recent stats, fallback to pnl_day
+  const winrateFromStats = tradesStats.winrate != null 
+    ? `${formatNumber(tradesStats.winrate * 100, 1)}%` 
+    : (pnlDay.winrate != null ? `${formatNumber(pnlDay.winrate * 100, 1)}%` : "—");
+  
+  // Format values
+  const equityFormatted = formatNumber(equity, 2);
+  const realizedPnlFormatted = formatNumber(realizedPnlToday, 2);
+  const unrealizedPnlFormatted = formatNumber(unrealizedPnl, 2);
 
-  const pnlUsdColor =
-    Number(pnlDay.pnl_usd || 0) > 0
+  // Colors
+  const equityColor = "#e5e7eb";
+  const realizedPnlColor =
+    Number(realizedPnlToday || 0) > 0
       ? "#22c55e"
-      : Number(pnlDay.pnl_usd || 0) < 0
+      : Number(realizedPnlToday || 0) < 0
       ? "#f97316"
       : "#e5e7eb";
 
-  const uPnlColor =
-    Number(unrealized.total_usd || 0) > 0
+  const unrealizedPnlColor =
+    Number(unrealizedPnl || 0) > 0
       ? "#22c55e"
-      : Number(unrealized.total_usd || 0) < 0
+      : Number(unrealizedPnl || 0) < 0
       ? "#f97316"
       : "#e5e7eb";
 
@@ -256,27 +280,21 @@ const CryptoDashboard = () => {
   };
 
   const handleResetStats = async () => {
+    if (!window.confirm("Are you sure you want to clear all trades and stats? This action cannot be undone.")) {
+      return;
+    }
+    
     try {
       setActionsLoading(true);
       setActionsError("");
-      // 1) чистим метрики на бэкенде (через твой сервис)
-      await resetMetrics("today"); // или "now" – как реализовано в cryptoApi.js
+      // Clear all trades and stats on backend
+      await resetMetrics();
 
-      // 2) локально обнуляем UI
+      // Reload data to reflect cleared state
       setTrades([]);
-      setPnlNow((prev) => ({
-        ...(prev || {}),
-        pnl_day: {
-          pnl_usd: 0,
-          pnl_r: 0,
-          trades: 0,
-          winrate: 0,
-        },
-        unrealized: {
-          total_usd: 0,
-        },
-        open_positions: prev?.open_positions ?? 0,
-      }));
+      // Force refresh of PnL data
+      const pnlData = await getPnlNow();
+      setPnlNow(pnlData);
     } catch (err) {
       console.error("resetStats failed", err);
       setActionsError(err?.message || "Failed to reset stats");
@@ -411,115 +429,196 @@ const CryptoDashboard = () => {
         </div>
       </div>
 
-      {/* PnL cards */}
-      <div
-        style={{
-          display: "flex",
-          gap: 10,
-          marginBottom: 16,
-          flexWrap: "wrap",
-        }}
-      >
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            PnL (USD)
-          </span>
-          <span
-            style={{ fontSize: 18, fontWeight: 600, color: pnlUsdColor }}
-          >
-            {pnlUsd}
-          </span>
+      {/* PnL cards - using backend as single source of truth */}
+      {dataUnavailable ? (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "12px 16px",
+            borderRadius: 8,
+            background: "#111827",
+            border: "1px solid #b91c1c",
+            color: "#fecaca",
+            fontSize: 13,
+          }}
+        >
+          ⚠️ Data unavailable: Backend connection failed. Please check the backend status.
         </div>
+      ) : (
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            marginBottom: 16,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Equity
+            </span>
+            <span
+              style={{ fontSize: 18, fontWeight: 600, color: equityColor }}
+            >
+              {equityFormatted}
+            </span>
+          </div>
 
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            PnL (R)
-          </span>
-          <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
-            {pnlR}
-          </span>
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Realized PnL (USD)
+            </span>
+            <span
+              style={{ fontSize: 18, fontWeight: 600, color: realizedPnlColor }}
+            >
+              {realizedPnlFormatted}
+            </span>
+          </div>
+
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              uPnL (USD)
+            </span>
+            <span style={{ fontSize: 18, fontWeight: 600, color: unrealizedPnlColor }}>
+              {unrealizedPnlFormatted}
+            </span>
+          </div>
+
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              PnL (R)
+            </span>
+            <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
+              {pnlR}
+            </span>
+          </div>
+
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Trades
+            </span>
+            <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
+              {pnlDay.trades ?? tradesStats.total_trades ?? 0}
+            </span>
+          </div>
+
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Winrate
+            </span>
+            <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
+              {winrateFromStats}
+            </span>
+          </div>
+
+          <div style={cardBase}>
+            <span
+              style={{
+                fontSize: 11,
+                color: "#9ca3af",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Open Positions
+            </span>
+            <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
+              {openPositionsCount}
+            </span>
+          </div>
+
+          {tradesStats.total_realized_pnl_usd != null && (
+            <div style={cardBase}>
+              <span
+                style={{
+                  fontSize: 11,
+                  color: "#9ca3af",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Total PnL (USD)
+              </span>
+              <span
+                style={{
+                  fontSize: 18,
+                  fontWeight: 600,
+                  color:
+                    Number(tradesStats.total_realized_pnl_usd || 0) > 0
+                      ? "#22c55e"
+                      : Number(tradesStats.total_realized_pnl_usd || 0) < 0
+                      ? "#f97316"
+                      : "#e5e7eb",
+                }}
+              >
+                {formatNumber(tradesStats.total_realized_pnl_usd, 2)}
+              </span>
+            </div>
+          )}
+
+          {tradesStats.average_r != null && (
+            <div style={cardBase}>
+              <span
+                style={{
+                  fontSize: 11,
+                  color: "#9ca3af",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Avg R
+              </span>
+              <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
+                {formatNumber(tradesStats.average_r, 2)}
+              </span>
+            </div>
+          )}
         </div>
+      )}
 
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            Trades
-          </span>
-          <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
-            {pnlDay.trades ?? 0}
-          </span>
-        </div>
-
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            Winrate
-          </span>
-          <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
-            {winrate}
-          </span>
-        </div>
-
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            uPnL (USD)
-          </span>
-          <span style={{ fontSize: 18, fontWeight: 600, color: uPnlColor }}>
-            {uPnlUsd}
-          </span>
-        </div>
-
-        <div style={cardBase}>
-          <span
-            style={{
-              fontSize: 11,
-              color: "#9ca3af",
-              textTransform: "uppercase",
-              letterSpacing: "0.04em",
-            }}
-          >
-            Open Positions
-          </span>
-          <span style={{ fontSize: 18, fontWeight: 600, color: "#e5e7eb" }}>
-            {openPositionsCount}
-          </span>
-        </div>
-      </div>
-
-      {errorMsg && (
+      {errorMsg && !dataUnavailable && (
         <div
           style={{
             marginBottom: 12,

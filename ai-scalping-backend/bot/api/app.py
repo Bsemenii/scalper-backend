@@ -11,7 +11,7 @@ from bot.core.config import reload_settings
 from strategy.cross_guard import CrossCfg, decide_cross_guard, pick_best_symbol_by_speed
 
 
-from fastapi import FastAPI, HTTPException, Query, Body, Depends, Header
+from fastapi import FastAPI, HTTPException, Query, Body, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -116,7 +116,7 @@ def _symbols_from_settings() -> List[str]:
         s = get_settings()
         return [sym.upper() for sym in getattr(s, "symbols", [])]
     except Exception:
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        return ["GALAUSDT"]  # TEMP: single-symbol mode GALAUSDT, 10x leverage
 
 
 def _coalesce_from_settings() -> int:
@@ -314,7 +314,47 @@ async def _startup() -> None:
       2) Перечитываем конфиг.
       3) Поднимаем единственный Worker и сохраняем в app.state.
     """
+    # STEP 1: Configure global logging to ensure all loggers are visible
+    import sys
+    root_logger = logging.getLogger()
+    
+    # Get log level from settings or environment
+    try:
+        s = get_settings()
+        log_level_str = getattr(s, "log_level", os.getenv("LOG_LEVEL", "INFO")).upper()
+    except Exception:
+        log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    # Configure root logger with console handler if not already configured
+    if not root_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(log_level)
+        formatter = logging.Formatter(
+            fmt='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+        root_logger.setLevel(log_level)
+    
+    # Ensure all relevant loggers propagate to root
+    for logger_name in [
+        "bot.worker",
+        "bot.worker._strategy",
+        "adapters.binance_ws",
+        "adapters.binance_rest",
+        "stream.coalescer",
+        "strategy",
+        "exec",
+        "risk",
+    ]:
+        module_logger = logging.getLogger(logger_name)
+        module_logger.setLevel(log_level)
+        module_logger.propagate = True
+    
     log = logging.getLogger("uvicorn.error")
+    log.info(f"[startup] logging configured, level={log_level_str} (root level: {log_level})")
 
     # 1) Инициализация БД (без падения, если модуль/файл отсутствует)
     try:
@@ -699,6 +739,38 @@ async def debug_diag() -> Dict[str, Any]:
 
     ws_detail = d.get("ws_detail") or {}
     coal = d.get("coal") or {}
+    
+    # Get WS diagnostics from worker
+    ws_diag = {}
+    try:
+        if hasattr(w, "ws") and hasattr(w.ws, "diag"):
+            ws_diag = w.ws.diag() or {}
+    except Exception:
+        pass
+    
+    # Get coalescer stats
+    coal_stats = {}
+    try:
+        if hasattr(w, "coal") and hasattr(w.coal, "stats"):
+            coal_stats = w.coal.stats() or {}
+    except Exception:
+        pass
+    
+    # Get strategy loop status
+    strategy_status = {
+        "running": False,
+        "heartbeat_ms": 0,
+        "last_error": None,
+    }
+    try:
+        if hasattr(w, "_strat_task"):
+            strategy_status["running"] = w._strat_task is not None and not w._strat_task.done()
+        if hasattr(w, "_strategy_heartbeat_ms"):
+            strategy_status["heartbeat_ms"] = int(w._strategy_heartbeat_ms or 0)
+        if hasattr(w, "_last_strategy_error"):
+            strategy_status["last_error"] = w._last_strategy_error
+    except Exception:
+        pass
 
     return {
         "symbols": d.get("symbols", []),
@@ -707,10 +779,15 @@ async def debug_diag() -> Dict[str, Any]:
         "ws": {
             "count": int((ws_detail or {}).get("messages", 0)),
             "last_rx_ts_ms": int((ws_detail or {}).get("last_rx_ms", 0)),
+            "connects": int(ws_diag.get("connects", 0)),
+            "errors": int(ws_diag.get("errors", 0)),
+            "last_error": ws_diag.get("last_error", ""),
+            "url": ws_diag.get("url", ""),
         },
         "ws_detail": ws_detail,
         "coal": coal,
         "coalesce_ms": coal.get("window_ms"),
+        "coalescer_stats": coal_stats,
         "history": d.get("history", {}),
         "history_seconds": 600,  # для фронта как ориентир окна
 
@@ -737,6 +814,7 @@ async def debug_diag() -> Dict[str, Any]:
         # Стратегия / авто
         "auto_signal_enabled": bool(d.get("auto_signal_enabled", False)),
         "strategy_cfg": d.get("strategy_cfg", {}),
+        "strategy_status": strategy_status,
     }
 
 
@@ -1347,42 +1425,75 @@ async def control_set_timeout_get(
 # Auto-trading toggle (MVP)
 # ------------------------------------------------------------------------------
 
-class AutoReq(BaseModel):
-    enabled: bool
-
-
 @app.get("/control/auto")
 def control_auto_get() -> Dict[str, Any]:
     w = _worker_required()
     d = w.diag() or {}
-    return {"ok": True, "auto_signal_enabled": bool(d.get("auto_signal_enabled", False))}
+    enabled = bool(d.get("auto_signal_enabled", False))
+    return {"ok": True, "enabled": enabled}
 
 
 @app.post("/control/auto")
-def control_auto_set(req: AutoReq) -> Dict[str, Any]:
+def control_auto_set(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
     Надёжно включает/выключает авто-сигналы, не ломая текущие cooldown/min_flat:
     используем Worker.set_strategy(enabled, cooldown_ms, min_flat_ms) если он есть.
+    
+    Accepts either {"enabled": true/false} or {"auto": true/false}.
+    If both are provided, "enabled" takes precedence.
     """
+    log = logging.getLogger("uvicorn.error")
     w = _worker_required()
+    
+    # Extract enabled value from payload - accept both "enabled" and "auto" fields
+    enabled_val = payload.get("enabled")
+    auto_val = payload.get("auto")
+    
+    # Determine the enabled value: use enabled if set, otherwise use auto
+    if enabled_val is not None:
+        enabled = bool(enabled_val)
+    elif auto_val is not None:
+        enabled = bool(auto_val)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Either 'enabled' or 'auto' field is required"
+        )
+    
+    # Get current config to preserve cooldown/min_flat
     d = w.diag() or {}
     cfg = (d.get("strategy_cfg") or {}) if isinstance(d, dict) else {}
     cooldown = int(cfg.get("cooldown_ms", 500))
     min_flat = int(cfg.get("min_flat_ms", 200))
 
+    # Set the strategy state
     set_strategy = getattr(w, "set_strategy", None)
     if callable(set_strategy):
-        res = set_strategy(enabled=bool(req.enabled), cooldown_ms=cooldown, min_flat_ms=min_flat)
+        res = set_strategy(enabled=enabled, cooldown_ms=cooldown, min_flat_ms=min_flat)
         if isinstance(res, dict):
-            return {"ok": True, **res}
+            # Log the state change
+            if enabled:
+                log.info("[CONTROL] auto mode enabled")
+            else:
+                log.info("[CONTROL] auto mode disabled")
+            return {"ok": True, "enabled": enabled, **res}
 
     # фолбэк — выставим очевидное поле; diag всё равно прочитает актуальный флаг
     try:
-        setattr(w, "_auto_enabled", bool(req.enabled))
+        setattr(w, "_auto_enabled", enabled)
     except Exception:
         pass
+    
+    # Log the state change
+    if enabled:
+        log.info("[CONTROL] auto mode enabled")
+    else:
+        log.info("[CONTROL] auto mode disabled")
+    
+    # Verify the state was set correctly
     nd = w.diag() or {}
-    return {"ok": True, "auto_signal_enabled": bool(nd.get("auto_signal_enabled", req.enabled))}
+    final_enabled = bool(nd.get("auto_signal_enabled", enabled))
+    return {"ok": True, "enabled": final_enabled}
 
 
 # ------------------------------------------------------------------------------
@@ -1413,21 +1524,6 @@ def fees() -> Dict[str, Any]:
             fees_binance = dict(getattr(fees_cfg, "binance_usdtm"))
         except Exception:
             pass
-        
-    @app.post("/metrics/reset")
-    async def metrics_reset() -> Dict[str, Any]:
-        """
-        Сброс дневных метрик / pnl / счётчиков.
-        Реализация зависит от того, как у тебя сделан Worker,
-        но MVP-идея примерно такая: вызвать метод reset_metrics() если он есть.
-        """
-        w = _worker_required()
-        reset = getattr(w, "reset_metrics", None)
-        if callable(reset):
-            res = reset()
-            if isinstance(res, dict):
-                return {"ok": True, **res}
-        return {"ok": True}
 
     w = _worker_required()
     per_symbol = {}
@@ -1532,27 +1628,66 @@ def db_sanity():
 # ------------------------------------------------------------------------------
 
 @app.get("/trades")
-async def trades(
-    symbol: Optional[str] = Query(None, description="Фильтр по символу, напр. BTCUSDT"),
-    limit: int = Query(50, ge=1, le=500),
-) -> Dict[str, Any]:
-    w = _worker_required()
-    d = w.diag()
-    store = d.get("trades")
+async def get_trades(limit: int = 50, offset: int = 0):
+    eng = get_engine()
+    with eng.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                  t.id,
+                  t.symbol,
+                  t.side,
+                  t.qty,
+                  t.entry_px,
+                  t.exit_px,
+                  t.pnl_usd,
+                  t.pnl_r,
+                  t.entry_ts_ms,
+                  t.exit_ts_ms,
+                  t.reason_open,
+                  t.reason_close,
+                  COALESCE(t.fees_usd, 0.0) AS fees_usd
+                FROM trades t
+                ORDER BY t.exit_ts_ms DESC, t.entry_ts_ms DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"limit": limit, "offset": offset},
+        ).fetchall()
 
-    items: List[Dict[str, Any]] = []
-    if isinstance(store, list):
-        items = [t for t in store if (not symbol or t.get("symbol") == symbol)]
-    elif isinstance(store, dict):
-        if symbol:
-            items = list(store.get(symbol.upper(), []))
-        else:
-            for arr in store.values():
-                items.extend(list(arr))
-    items.sort(key=lambda x: x.get("closed_ts", x.get("opened_ts", 0)), reverse=True)
-    if len(items) > limit:
-        items = items[:limit]
-    return {"items": items, "count": len(items)}
+        total = conn.execute(
+            text("SELECT COUNT(*) FROM trades")
+        ).scalar() or 0
+
+    items = []
+    for row in rows:
+        m = row._mapping if hasattr(row, "_mapping") else None
+
+        def col(name, idx, default=None):
+            if m is not None:
+                return m.get(name, default)
+            return row[idx] if row[idx] is not None else default
+
+        items.append(
+            {
+                "id": col("id", 0),
+                "symbol": col("symbol", 1),
+                "side": col("side", 2),
+                "qty": float(col("qty", 3, 0.0) or 0.0),
+                "entry_px": float(col("entry_px", 4, 0.0) or 0.0),
+                "exit_px": float(col("exit_px", 5, 0.0) or 0.0),
+                "pnl_usd": float(col("pnl_usd", 6, 0.0) or 0.0),
+                "pnl_r": float(col("pnl_r", 7, 0.0) or 0.0),
+                "opened_ts": int(col("entry_ts_ms", 8, 0) or 0),
+                "closed_ts": int(col("exit_ts_ms", 9, 0) or 0),
+                "reason_open": col("reason_open", 10),
+                "reason_close": col("reason_close", 11),
+                "fees_usd": float(col("fees_usd", 12, 0.0) or 0.0),
+            }
+        )
+
+    return {"items": items, "count": int(total)}
 
 
 @app.get("/trades/last")
@@ -1580,6 +1715,157 @@ def trades_last(per_symbol: int = Query(1, ge=1, le=10)) -> Dict[str, Any]:
     return {"items": out}
 
 
+@app.get("/trades/recent")
+async def trades_recent(
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of trades to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+) -> Dict[str, Any]:
+    """
+    Clean trade history with aggregated performance statistics.
+    
+    Returns:
+    - trades: list of recent trades with all required fields
+    - stats: aggregated statistics (total_trades, wins, losses, winrate, total_realized_pnl_usd, average_r)
+    
+    Uses stored trades from database, NOT recomputed from raw candles.
+    """
+    log = logging.getLogger("uvicorn.error")
+    eng = get_engine()
+    
+    # Fetch recent trades
+    with eng.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                  t.id,
+                  t.symbol,
+                  t.side,
+                  t.qty,
+                  t.entry_px,
+                  t.exit_px,
+                  t.pnl_usd,
+                  t.r,
+                  t.pnl_r,
+                  t.entry_ts_ms,
+                  t.exit_ts_ms,
+                  t.reason_open,
+                  t.reason_close,
+                  COALESCE(t.fees_usd, 0.0) AS fees_usd
+                FROM trades t
+                WHERE t.exit_ts_ms > 0
+                ORDER BY t.exit_ts_ms DESC, t.entry_ts_ms DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"limit": limit, "offset": offset},
+        ).fetchall()
+
+        # Get total count of closed trades
+        total_row = conn.execute(
+            text("SELECT COUNT(*) FROM trades WHERE exit_ts_ms > 0")
+        ).fetchone()
+        total_count = int(total_row[0] if total_row else 0)
+
+        # Get aggregated stats for ALL closed trades (not just the page)
+        stats_row = conn.execute(
+            text(
+                """
+                SELECT
+                  COUNT(*) AS total_trades,
+                  COALESCE(SUM(CASE WHEN pnl_usd > 0.01 THEN 1 ELSE 0 END), 0) AS wins,
+                  COALESCE(SUM(CASE WHEN pnl_usd < -0.01 THEN 1 ELSE 0 END), 0) AS losses,
+                  COALESCE(SUM(pnl_usd), 0.0) AS total_realized_pnl_usd,
+                  COALESCE(AVG(r), 0.0) AS average_r
+                FROM trades
+                WHERE exit_ts_ms > 0
+                """
+            )
+        ).fetchone()
+
+    # Parse trades
+    trades = []
+    for row in rows:
+        m = row._mapping if hasattr(row, "_mapping") else None
+
+        def col(name, idx, default=None):
+            if m is not None:
+                return m.get(name, default)
+            return row[idx] if row[idx] is not None else default
+
+        # Calculate r_value = realized_pnl_usd / risk_per_trade_usd
+        # For now, r_value is the same as r (stored in DB)
+        # If you need to recalculate based on equity at time of trade, that would require more complex logic
+        r_value = float(col("r", 7, 0.0) or 0.0)
+        
+        trades.append({
+            "id": col("id", 0),
+            "symbol": col("symbol", 1),
+            "side": col("side", 2),
+            "qty": float(col("qty", 3, 0.0) or 0.0),
+            "entry_price": float(col("entry_px", 4, 0.0) or 0.0),
+            "exit_price": float(col("exit_px", 5, 0.0) or 0.0),
+            "realized_pnl_usd": float(col("pnl_usd", 6, 0.0) or 0.0),
+            "r_value": r_value,
+            "opened_at": int(col("entry_ts_ms", 9, 0) or 0),
+            "closed_at": int(col("exit_ts_ms", 10, 0) or 0),
+            "reason_open": col("reason_open", 11),
+            "reason_close": col("reason_close", 12),
+            "fees_usd": float(col("fees_usd", 13, 0.0) or 0.0),
+        })
+
+    # Parse aggregated stats
+    stats = {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "winrate": None,
+        "total_realized_pnl_usd": 0.0,
+        "average_r": 0.0,
+    }
+    
+    if stats_row is not None:
+        try:
+            m = stats_row._mapping if hasattr(stats_row, "_mapping") else None
+            
+            def stat_col(name, idx, default=0):
+                if m is not None:
+                    return m.get(name, default) or default
+                return stats_row[idx] if stats_row[idx] is not None else default
+            
+            total_trades = int(stat_col("total_trades", 0, 0))
+            wins = int(stat_col("wins", 1, 0))
+            losses = int(stat_col("losses", 2, 0))
+            total_realized_pnl_usd = float(stat_col("total_realized_pnl_usd", 3, 0.0))
+            average_r = float(stat_col("average_r", 4, 0.0))
+            
+            # Calculate winrate
+            winrate = None
+            if total_trades > 0:
+                winrate = round(wins / total_trades, 4) if wins + losses > 0 else None
+            
+            stats = {
+                "total_trades": total_trades,
+                "wins": wins,
+                "losses": losses,
+                "winrate": winrate,
+                "total_realized_pnl_usd": round(total_realized_pnl_usd, 6),
+                "average_r": round(average_r, 4),
+            }
+        except Exception as e:
+            log.warning(f"[/trades/recent] Failed to parse stats: {e}")
+
+    return {
+        "trades": trades,
+        "stats": stats,
+        "pagination": {
+            "total": total_count,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
 @app.get("/pnl/daily")
 async def pnl_daily() -> Dict[str, Any]:
     s = get_settings()
@@ -1601,82 +1887,333 @@ async def pnl_daily() -> Dict[str, Any]:
 @app.get("/pnl/now")
 async def pnl_now():
     """
-    Надёжный PnL-now:
-    - не падает, если в diag() чего-то нет;
-    - day заполняется текущей датой;
-    - unrealized берётся из diag().unrealized, а если его нет — высчитывается из positions;
-    - per_symbol = None, если пусто (чтобы фронт не рисовал пустой список);
+    Clean PnL snapshot from AccountState and stored trades (single source of truth).
+    
+    Returns:
+    - equity: total wallet balance from AccountState
+    - realized_pnl_today: realized PnL for today (from daily_stats)
+    - unrealized_pnl: total unrealized PnL for open positions (from AccountState)
+    - open_positions_count: number of open positions
+    
+    Uses stored trades and AccountState, NOT recomputed from raw candles.
+    """
+    log = logging.getLogger("uvicorn.error")
+    w = _worker_required()
+    
+    # Get AccountState service from worker
+    acc_state = getattr(w, "_account_state", None)
+    if acc_state is None:
+        log.error("[/pnl/now] AccountState not configured in worker")
+        raise HTTPException(
+            status_code=503,
+            detail="AccountState not configured - cannot compute PnL"
+        )
+    
+    # Refresh account snapshot (this computes unrealized PnL and fetches daily stats)
+    try:
+        snap = await acc_state.refresh()
+    except Exception as e:
+        log.error(f"[/pnl/now] AccountState.refresh() failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to refresh account state: {e}"
+        )
+    
+    if snap is None:
+        log.error("[/pnl/now] AccountState.refresh() returned None")
+        raise HTTPException(
+            status_code=503,
+            detail="AccountState refresh returned no snapshot"
+        )
+    
+    # Check if snapshot is stale or has errors
+    age_ms = acc_state.snapshot_age_ms()
+    consecutive_errors = acc_state.consecutive_errors
+    
+    if consecutive_errors > 0:
+        log.warning(
+            f"[/pnl/now] AccountState has {consecutive_errors} consecutive errors, "
+            f"snapshot may be degraded (age: {age_ms}ms)"
+        )
+    
+    # Get current day string
+    try:
+        day_str = snap.ts.strftime("%Y-%m-%d")
+    except Exception:
+        day_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    trades_day = 0
+    pnl_usd_day = 0.0
+    pnl_r_day = 0.0
+    fees_usd_day = 0.0
+    winrate = None
+    avg_r = None
+    max_dd_r = None  # можем позже посчитать отдельно
+
+    try:
+        eng = get_engine()
+        with eng.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(pnl_usd), 0.0) AS pnl_usd_sum,
+                    COALESCE(SUM(pnl_r), 0.0) AS pnl_r_sum,
+                    COALESCE(SUM(fees_usd), 0.0) AS fees_usd_sum,
+                    COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END), 0) AS losses
+                    FROM trades
+                    WHERE DATE(exit_ts_ms / 1000.0, 'unixepoch') = :day
+                    AND exit_ts_ms > 0
+                    """
+                ),
+                {"day": day_str},
+            ).fetchone()
+
+            if row is not None:
+                m = row._mapping if hasattr(row, "_mapping") else None
+
+                def col(name, idx, default=0.0):
+                    if m is not None:
+                        return m.get(name, default) or default
+                    return row[idx] if row[idx] is not None else default
+
+                trades_day = int(col("trades", 0, 0))
+                pnl_usd_day = float(col("pnl_usd_sum", 1, 0.0))
+                pnl_r_day = float(col("pnl_r_sum", 2, 0.0))
+                fees_usd_day = float(col("fees_usd_sum", 3, 0.0))
+                wins = int(col("wins", 4, 0))
+                losses = int(col("losses", 5, 0))
+
+                total_decided = wins + losses
+                if total_decided > 0:
+                    winrate = wins / total_decided
+
+                if trades_day > 0:
+                    avg_r = pnl_r_day / trades_day
+
+    except Exception as e:
+        log.warning("[/pnl/now] failed to aggregate trades for %s: %s", day_str, e)
+    
+    # Build per_symbol unrealized PnL breakdown
+    per_symbol: Dict[str, float] = {}
+    open_positions_count = 0
+    
+    for sym, pos_snap in snap.open_positions.items():
+        if pos_snap.unrealized_pnl is not None:
+            per_symbol[sym] = round(float(pos_snap.unrealized_pnl), 6)
+            open_positions_count += 1
+    
+    # Compute realized PnL R-multiple (if we have equity)
+    pnl_r = 0.0
+    if snap.equity > 0:
+        try:
+            s = get_settings()
+            risk_pct = float(getattr(getattr(s, "risk", object()), "risk_per_trade_pct", 0.25))
+            if risk_pct > 0:
+                # realized_pnl_today / (equity * risk_pct / 100)
+                pnl_r = snap.realized_pnl_today / (snap.equity * risk_pct / 100.0)
+        except Exception:
+            pnl_r = 0.0
+    
+    # Query daily_stats from DB for today (winrate, avg_r, max_dd_r, trades count)
+    winrate = None
+    avg_r = None
+    max_dd_r = None
+    trades_count_from_stats = 0
+    pnl_r_from_stats = 0.0
+    pnl_usd_from_stats = 0.0
+    
+    try:
+        eng = get_engine()
+        with eng.begin() as conn:
+            # Get daily_stats for today
+            stats_row = conn.execute(
+                text(
+                    """
+                    SELECT trades, wins, losses, pnl_usd, pnl_r, max_dd_r
+                      FROM daily_stats
+                     WHERE day_utc = :day
+                    """
+                ),
+                {"day": day_str},
+            ).fetchone()
+            
+            if stats_row is not None:
+                try:
+                    if hasattr(stats_row, '_mapping'):
+                        mapping = stats_row._mapping
+                        trades_count_from_stats = int(mapping.get("trades", 0) or 0)
+                        wins = int(mapping.get("wins", 0) or 0)
+                        losses = int(mapping.get("losses", 0) or 0)
+                        pnl_usd_from_stats = float(mapping.get("pnl_usd", 0.0) or 0.0)
+                        pnl_r_from_stats = float(mapping.get("pnl_r", 0.0) or 0.0)
+                        max_dd_r = float(mapping.get("max_dd_r", 0.0) or 0.0)
+                    else:
+                        # Fallback to positional access
+                        trades_count_from_stats = int(stats_row[0] or 0)
+                        wins = int(stats_row[1] or 0)
+                        losses = int(stats_row[2] or 0)
+                        pnl_usd_from_stats = float(stats_row[3] or 0.0)
+                        pnl_r_from_stats = float(stats_row[4] or 0.0)
+                        max_dd_r = float(stats_row[5] or 0.0)
+                    
+                    # Calculate winrate: wins / (wins + losses), but only if there are decided trades
+                    total_decided = wins + losses
+                    if total_decided > 0:
+                        winrate = round(wins / total_decided, 4)
+                    
+                    # Calculate avg_r: pnl_r / trades (if trades > 0)
+                    if trades_count_from_stats > 0:
+                        avg_r = round(pnl_r_from_stats / trades_count_from_stats, 4)
+                        
+                except Exception as e_parse:
+                    log.warning(f"[/pnl/now] Failed to parse daily_stats for {day_str}: {e_parse}")
+                    
+    except Exception as e:
+        log.warning(f"[/pnl/now] Failed to query daily_stats for {day_str}: {e}")
+    
+    # Compute daily fees from DB (total fees for all closed trades today)
+    fees_today = 0.0
+    try:
+        eng = get_engine()
+        with eng.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT COALESCE(SUM(f.fee_usd), 0.0) AS fees_today
+                      FROM fills f
+                      JOIN orders o ON o.id = f.order_id
+                      JOIN trades t ON t.id = o.trade_id
+                     WHERE DATE(t.exit_ts_ms/1000, 'unixepoch') = :day
+                    """
+                ),
+                {"day": day_str},
+            ).fetchone()
+            
+            if row is not None:
+                if hasattr(row, '_mapping'):
+                    fees_today = float(row._mapping.get("fees_today", 0.0) or 0.0)
+                else:
+                    fees_today = float(row[0] or 0.0)
+    except Exception as e:
+        log.warning(f"[/pnl/now] Failed to query daily fees for {day_str}: {e}. Using 0.0")
+        fees_today = 0.0
+    
+    # Build response
+    # Use daily_stats values if available, otherwise fall back to AccountState snapshot
+    # daily_stats should be authoritative since it's updated by close_trade()
+    trades_final = trades_count_from_stats if trades_count_from_stats > 0 else int(trades_day)
+    pnl_usd_final = pnl_usd_from_stats if trades_count_from_stats > 0 else float(pnl_usd_day)
+    pnl_r_final = pnl_r_from_stats if trades_count_from_stats > 0 else float(pnl_r_day)
+    
+    resp = {
+        "equity": round(float(snap.equity), 6),
+        "realized_pnl_today": round(float(pnl_usd_final), 6),
+        "unrealized_pnl": round(float(snap.unrealized_pnl_now), 6),
+        "open_positions_count": open_positions_count,
+        "pnl_day": {
+            "day": day_str,
+            "trades": trades_final,
+            "pnl_usd": round(float(pnl_usd_final), 6),
+            "pnl_r": round(float(pnl_r_final), 4),
+            "fees_usd": round(float(fees_today), 6),
+            "winrate": winrate,
+            "avg_r": avg_r,
+            "max_dd_r": max_dd_r,
+        },
+        "unrealized_breakdown": per_symbol if per_symbol else {},
+        "available_margin": round(float(snap.available_margin), 6),
+        "meta": {
+            "snapshot_ts": snap.ts.isoformat(),
+            "snapshot_age_ms": age_ms,
+            "consecutive_errors": consecutive_errors,
+        },
+    }
+    
+    return JSONResponse(resp)
+
+# ------------------------------------------------------------------------------
+# Stats management endpoints
+# ------------------------------------------------------------------------------
+
+@app.post("/paper/reset_metrics")
+async def paper_reset_metrics(request: Request) -> Dict[str, Any]:
+    """
+    DEPRECATED: Use /stats/clear instead.
+    Reset daily metrics for paper trading.
+    Accepts optional 'baseline' parameter in request body: "now" or "today"
+    """
+    # Redirect to clear_stats for backward compatibility
+    return await clear_stats()
+
+@app.post("/metrics/reset")
+async def metrics_reset() -> Dict[str, Any]:
+    """
+    Сброс дневных метрик / pnl / счётчиков.
+    Реализация зависит от того, как у тебя сделан Worker,
+    но MVP-идея примерно такая: вызвать метод reset_metrics() если он есть.
     """
     w = _worker_required()
+    reset = getattr(w, "reset_metrics", None)
+    if callable(reset):
+        res = reset()
+        if isinstance(res, dict):
+            return {"ok": True, **res}
+    return {"ok": True}
+
+@app.post("/stats/clear")
+async def clear_stats() -> Dict[str, Any]:
+    """
+    Clear all trades and reset daily_stats.
+    This deletes all trades from the database and resets all daily_stats to zero.
+    WARNING: This is irreversible!
+    """
+    log = logging.getLogger("uvicorn.error")
+    eng = get_engine()
+    
     try:
-        d = w.diag() or {}
-    except Exception:
-        d = {}
-
-    # ---- pnl_day (сейфовые дефолты) ----
-    pnl_day = d.get("pnl_day") or {}
-    try:
-        day_str = pnl_day.get("day") or datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
-    except Exception:
-        day_str = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
-
-    def _f(v, dv=0.0):
-        try:
-            return float(v)
-        except Exception:
-            return float(dv)
-
-    def _i(v, dv=0):
-        try:
-            return int(v)
-        except Exception:
-            return int(dv)
-
-    out_day = {
-        "day": day_str,
-        "trades": _i(pnl_day.get("trades")),
-        "winrate": pnl_day.get("winrate", None),
-        "avg_r": pnl_day.get("avg_r", None),
-        "pnl_r": _f(pnl_day.get("pnl_r")),
-        "pnl_usd": _f(pnl_day.get("pnl_usd")),
-        "max_dd_r": pnl_day.get("max_dd_r", None),
-    }
-
-    # ---- unrealized ----
-    unrl = d.get("unrealized") or {}
-    total_usd = _f(unrl.get("total_usd"))
-    per_symbol = unrl.get("per_symbol")
-    open_positions = _i(unrl.get("open_positions"))
-
-    # если блочка unrealized нет — попробуем собрать из positions
-    if not unrl:
-        total_usd = 0.0
-        per_symbol = {}
-        open_positions = 0
-        pos = d.get("positions") or {}
-        if isinstance(pos, dict):
-            for sym, p in pos.items():
-                p = p or {}
-                if p.get("state") == "OPEN":
-                    open_positions += 1
-                    # поддержка полей: unrealized_usd | upnl | pnl_unrealized
-                    u = p.get("unrealized_usd", p.get("upnl", p.get("pnl_unrealized", 0.0)))
-                    u = _f(u)
-                    per_symbol[sym] = u
-                    total_usd += u
-
-        if not per_symbol:
-            per_symbol = None  # чтобы фронт не рисовал пустой объект
-
-    resp = {
-        "pnl_day": out_day,
-        "unrealized": {
-            "total_usd": round(total_usd, 6),
-            "per_symbol": per_symbol,
-        },
-        "open_positions": open_positions,
-    }
-    return JSONResponse(resp)
+        with eng.begin() as conn:
+            # Delete all trades
+            trades_deleted = conn.execute(
+                text("DELETE FROM trades")
+            ).rowcount
+            
+            # Delete all orders (cascade should handle fills)
+            orders_deleted = conn.execute(
+                text("DELETE FROM orders")
+            ).rowcount
+            
+            # Delete all fills
+            fills_deleted = conn.execute(
+                text("DELETE FROM fills")
+            ).rowcount
+            
+            # Delete all daily_stats
+            stats_deleted = conn.execute(
+                text("DELETE FROM daily_stats")
+            ).rowcount
+            
+            log.info(
+                f"[/stats/clear] Cleared: {trades_deleted} trades, "
+                f"{orders_deleted} orders, {fills_deleted} fills, "
+                f"{stats_deleted} daily_stats"
+            )
+            
+            return {
+                "ok": True,
+                "trades_deleted": trades_deleted,
+                "orders_deleted": orders_deleted,
+                "fills_deleted": fills_deleted,
+                "stats_deleted": stats_deleted,
+            }
+    except Exception as e:
+        log.error(f"[/stats/clear] Failed to clear stats: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear stats: {e}"
+        )
 
 # ------------------------------------------------------------------------------
 # SSE stream (compact snapshot each second)

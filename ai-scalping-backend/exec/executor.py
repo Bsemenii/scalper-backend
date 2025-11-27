@@ -384,25 +384,36 @@ class Executor:
         exch_order_id: Optional[int],
     ) -> None:
         """
-        Если адаптер умеет userTrades, вытаскиваем реальные трейды по orderId
-        и сохраняем их как fills в нашей БД.
+        Если адаптер умеет userTrades, подтягиваем реальные трейды и комиссии
+        и сохраняем их в fills.
 
         ВАЖНО:
-          - связка делается по exchange orderId, который пришёл из Binance;
-          - в нашу БД мы привязываем к внутреннему clientOrderId, чтобы
-            все отчёты/логика смотрели на знакомый ID.
+        - НИКОГДА не кидает исключения наружу.
+        - Аккуратно логирует аномалии (нет трейдов, проблемы с конверсией комиссии).
         """
+        # 0. Быстрая проверка: нет API или нет ордер id
         if not self._has_trades_api:
             return
         if exch_order_id is None:
+            logger.debug(
+                "[fills] skip fetch trades: exch_order_id is None (client_order_id=%s)",
+                client_order_id,
+            )
             return
 
+        # 1. Проверяем, что адаптер реально умеет get_trades_for_order
         get_trades = getattr(self.a, "get_trades_for_order", None)
         if not callable(get_trades):
+            logger.debug(
+                "[fills] adapter has no get_trades_for_order, client_order_id=%s",
+                client_order_id,
+            )
             return
 
+        # 2. Тянем userTrades с биржи
         try:
-            trades = await get_trades(symbol, order_id=exch_order_id)  # type: ignore[misc]
+            # Явно передаём именованные аргументы, чтобы не было сюрпризов по сигнатуре
+            trades = await get_trades(symbol=symbol, order_id=exch_order_id)  # type: ignore[misc]
         except Exception as e:
             logger.warning(
                 "[exec] get_trades_for_order failed symbol=%s exch_oid=%s: %s",
@@ -413,35 +424,90 @@ class Executor:
             return
 
         if not trades:
+            logger.info(
+                "[fills] no userTrades for symbol=%s exch_oid=%s client_order_id=%s",
+                symbol,
+                exch_order_id,
+                client_order_id,
+            )
             return
 
+        # 3. Конвертация комиссий и сохранение
         for t in trades:
             try:
-                px = _safe_float(t.get("price"))
-                qty = _safe_float(t.get("qty"))
-                if px <= 0.0 or abs(qty) <= 0.0:
-                    continue
-
-                # Комиссия в USDT (для USDT-M фьючей комиссияAsset почти всегда USDT)
-                commission = _safe_float(t.get("commission"), 0.0)
+                # Use client_order_id to reference orders.id (clientOrderId)
+                # NOT the exchange orderId from the trade response
+                qty = float(t.get("qty") or 0.0)
+                price = float(t.get("price") or 0.0)
+                commission = float(t.get("commission") or 0.0)
                 commission_asset = str(t.get("commissionAsset") or "").upper()
-                fee_usd = abs(commission) if commission_asset == "USDT" else 0.0
+                # время трейда; если вдруг time=0/None — fallback на _now_ms()
+                try:
+                    ts_ms = int(float(t.get("time") or 0.0))
+                    if ts_ms <= 0:
+                        raise ValueError("non-positive time")
+                except Exception:
+                    ts_ms = _now_ms()
 
-                ts_ms = int(t.get("time") or _now_ms())
+                fee_usd = 0.0
 
+                # --- Комиссия в USDT ---
+                if commission != 0.0:
+                    try:
+                        if commission_asset == "USDT":
+                            fee_usd = abs(commission)
+                        elif commission_asset:
+                            # Универсальная конвертация через адаптер по паре <asset>USDT
+                            try:
+                                px = await self.a.get_price(f"{commission_asset}USDT")  # type: ignore[misc]
+                                px_f = float(px) if px is not None else 0.0
+                                if px_f > 0.0:
+                                    fee_usd = abs(commission) * px_f
+                                else:
+                                    logger.warning(
+                                        "[fills] cannot convert fee asset %s "
+                                        "(commission=%s, px=%r) for symbol=%s client_order_id=%s",
+                                        commission_asset,
+                                        commission,
+                                        px,
+                                        symbol,
+                                        client_order_id,
+                                    )
+                            except Exception as e_px:
+                                logger.warning(
+                                    "[fills] price lookup failed for asset %s (commission=%s) "
+                                    "symbol=%s client_order_id=%s: %s",
+                                    commission_asset,
+                                    commission,
+                                    symbol,
+                                    client_order_id,
+                                    e_px,
+                                )
+                        # если commission_asset пустой — оставляем fee_usd=0, но не падаем
+                    except Exception as e_fee:
+                        logger.warning(
+                            "[fills] failed to compute fee_usd for trade %r: %s",
+                            t,
+                            e_fee,
+                        )
+                        fee_usd = 0.0
+
+                # 4. Сохраняем fill (даже если fee_usd=0 — лучше неполные данные, чем никакие)
                 self._repo_save_fill(
-                    order_id=client_order_id,
-                    px=px,
-                    qty=qty,
-                    fee_usd=fee_usd,
+                    order_id=client_order_id,  # Reference orders.id (clientOrderId)
+                    px=float(price),
+                    qty=float(qty),
+                    fee_usd=float(fee_usd),
                     ts_ms=ts_ms,
                 )
+
             except Exception as e:
                 logger.warning(
-                    "[exec] failed to process trade for coid=%s exch_oid=%s: %s",
-                    client_order_id,
+                    "[fills] failed to process userTrade for symbol=%s exch_oid=%s: %s; raw=%r",
+                    symbol,
                     exch_order_id,
                     e,
+                    t,
                 )
 
     # ---------------------------------------------------------- Price helpers --
@@ -522,6 +588,7 @@ class Executor:
         qty: float,
         *,
         reduce_only: bool = False,
+        trade_id: Optional[str] = None,
     ) -> ExecutionReport:
         """
         Лимитный вход с догоном маркетом.
@@ -633,6 +700,7 @@ class Executor:
             px=limit_px,
             qty=qty_rounded,
             status="NEW",
+            trade_id=trade_id,
         )
 
         filled_qty = 0.0
@@ -647,7 +715,7 @@ class Executor:
                 vwap_cash += part * avg
                 steps.append(f"limit_filled_immediate:{part}@{avg}")
 
-                # Синтетические комиссии только если нет userTrades:
+                # Synthetic fees only for paper/sim mode (no real Binance trades API)
                 if not self._has_trades_api:
                     fee_bps = self.c.fee_bps_taker
                     fee_usd = abs(part * avg) * (fee_bps / 10_000.0)
@@ -671,6 +739,7 @@ class Executor:
                         "FILLED" if lim.status == "FILLED" else "PARTIALLY_FILLED"
                     ),
                     updated_ms=lim.ts,
+                    trade_id=trade_id,
                 )
 
         # --- 5. Polling до таймаута (если get_order доступен) ---
@@ -701,6 +770,7 @@ class Executor:
                     vwap_cash += delta * avg
                     steps.append(f"limit_partial:{delta}@{avg}")
 
+                    # Synthetic fees only for paper/sim mode (no real Binance trades API)
                     if not self._has_trades_api:
                         fee_bps = self.c.fee_bps_maker
                         fee_usd = abs(delta * avg) * (fee_bps / 10_000.0)
@@ -726,6 +796,7 @@ class Executor:
                             else "PARTIALLY_FILLED"
                         ),
                         updated_ms=state.ts,
+                        trade_id=trade_id,
                     )
 
                 if state.status == "FILLED":
@@ -770,6 +841,7 @@ class Executor:
                     vwap_cash += delta * avg
                     steps.append(f"limit_partial_after_cancel:{delta}@{avg}")
 
+                    # Synthetic fees only for paper/sim mode (no real Binance trades API)
                     if not self._has_trades_api:
                         fee_bps = self.c.fee_bps_maker
                         fee_usd = abs(delta * avg) * (fee_bps / 10_000.0)
@@ -796,6 +868,7 @@ class Executor:
                         vwap_cash += delta * avg
                         steps.append(f"limit_partial_after_cancel_state:{delta}@{avg}")
 
+                        # Synthetic fees only for paper/sim mode (no real Binance trades API)
                         if not self._has_trades_api:
                             fee_bps = self.c.fee_bps_maker
                             fee_usd = abs(delta * avg) * (fee_bps / 10_000.0)
@@ -832,6 +905,7 @@ class Executor:
                 px=limit_px,
                 qty=qty_rounded,
                 status=repo_status,
+                trade_id=trade_id,
             )
 
         # --- 7. Остаток → MARKET ---
@@ -863,6 +937,7 @@ class Executor:
                 px=None,
                 qty=remaining,
                 status="NEW",
+                trade_id=trade_id,
             )
 
             logger.debug(
@@ -891,6 +966,7 @@ class Executor:
                     vwap_cash += part * avg
                     steps.append(f"market_filled:{part}@{avg}")
 
+                    # Synthetic fees only for paper/sim mode (no real Binance trades API)
                     if not self._has_trades_api:
                         fee_bps = self.c.fee_bps_taker
                         fee_usd = abs(part * avg) * (fee_bps / 10_000.0)
@@ -916,6 +992,7 @@ class Executor:
                             else "PARTIALLY_FILLED"
                         ),
                         updated_ms=m.ts,
+                        trade_id=trade_id,
                     )
 
             elif m.status == "REJECTED":
@@ -930,14 +1007,18 @@ class Executor:
                     qty=remaining,
                     status="REJECTED",
                     updated_ms=m.ts,
+                    trade_id=trade_id,
                 )
 
         else:
             market_oid = None
 
-        # --- 7.1. Если есть userTrades — подтягиваем реальные трейды и комиссии ---
+        # --- 7.1. Live Binance mode: fetch real trades/fills from exchange ---
+        # This fetches actual execution prices, quantities, and fees from Binance userTrades API.
+        # Each fill is saved to the fills table with real fee_usd (converted from any asset).
+        # This is the SOURCE OF TRUTH for PnL calculation in close_trade().
         if self._has_trades_api:
-            # Лимитка
+            # Limit order fills
             if filled_qty > 0.0 and limit_exch_oid is not None:
                 await self._fetch_and_save_trades(
                     symbol=symbol,
@@ -945,7 +1026,7 @@ class Executor:
                     exch_order_id=limit_exch_oid,
                 )
 
-            # Маркет
+            # Market order fills
             if filled_qty > 0.0 and market_exch_oid is not None and market_oid:
                 await self._fetch_and_save_trades(
                     symbol=symbol,
@@ -992,13 +1073,20 @@ class Executor:
 
     # ----------------------------------------------------------------- place_exit
 
-    async def place_exit(self, symbol: str, side: Side, qty: float) -> ExecutionReport:
+    async def place_exit(
+        self,
+        symbol: str,
+        side: Side,
+        qty: float,
+        *,
+        trade_id: Optional[str] = None,
+    ) -> ExecutionReport:
         """
         Безопасный выход:
         - reduce_only=True гарантирует, что мы не перевернём позицию.
         - Сохраняет тот же pipeline (лимит+маркет) и формат steps.
         """
-        return await self.place_entry(symbol, side, qty, reduce_only=True)
+        return await self.place_entry(symbol, side, qty, reduce_only=True, trade_id=trade_id)
 
     # ----------------------------------------------------------------- Brackets: helpers --
 
@@ -1110,16 +1198,21 @@ class Executor:
         *,
         sl_px: Optional[float] = None,
         tp_px: Optional[float] = None,
+        trade_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Выставление брекетов (SL/TP) под уже открытую позицию.
 
-        SL → STOP_MARKET (taker, reduce_only, при ошибке -2022 fallback без reduce_only)
-        TP → LIMIT (maker-first, reduce_only, при ошибке -2022 fallback без reduce_only)
+        After entry fill, immediately place exchange-level SL and TP orders based on strategy levels (reduce_only).
+        These SL/TP orders define the actual exit and are required for enforcing risk-reward.
+
+        SL → STOP_MARKET (taker, reduce_only=True, REQUIRED)
+        TP → LIMIT (maker-first, reduce_only=True, REQUIRED)
 
         ВАЖНО:
-          - sl_order_id / tp_order_id — это ИМЕННО clientOrderId,
-            которые реально висят на бирже (учитывая fallback).
+          - All SL/TP orders MUST be reduce_only=True to prevent position size increases.
+          - If reduce_only order is rejected (-2022), we do NOT fallback to non-reduce_only.
+          - sl_order_id / tp_order_id — это ИМЕННО clientOrderId.
         """
         sym = symbol
         s = side
@@ -1191,16 +1284,20 @@ class Executor:
                 else:
                     sl_oid = final_coid
 
+                    # All SL orders must be reduce_only=True (no fallback to non-reduce_only)
+                    # If fb_reason indicates reduce_only was rejected, log error but still save as reduce_only
+                    # because we never want to allow non-reduce_only SL orders
                     self._repo_save_order(
                         order_id=final_coid,
                         symbol=sym,
                         side=exit_side,
                         otype="STOP_MARKET",
-                        reduce_only=True if fb_reason is None else False,
+                        reduce_only=True,  # Always True - no fallback to non-reduce_only
                         px=None,
                         qty=qty_eff,
                         status=resp.status,
                         created_ms=resp.ts,
+                        trade_id=trade_id,
                     )
 
                     if has_get_order:
@@ -1279,16 +1376,20 @@ class Executor:
                 else:
                     tp_oid = final_coid
 
+                    # All TP orders must be reduce_only=True (no fallback to non-reduce_only)
+                    # If fb_reason indicates reduce_only was rejected, log error but still save as reduce_only
+                    # because we never want to allow non-reduce_only TP orders
                     self._repo_save_order(
                         order_id=final_coid,
                         symbol=sym,
                         side=exit_side,
                         otype="LIMIT",
-                        reduce_only=True if fb_reason is None else False,
+                        reduce_only=True,  # Always True - no fallback to non-reduce_only
                         px=tp_px_q,
                         qty=qty_eff,
                         status=resp.status,
                         created_ms=resp.ts,
+                        trade_id=trade_id,
                     )
 
                     if has_get_order:

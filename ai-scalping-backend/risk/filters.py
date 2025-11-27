@@ -21,6 +21,7 @@ class RiskCfg:
     risk_per_trade_pct: float = 0.25   # проценты (0.25 => 0.25%)
     daily_stop_r: float = -10.0
     daily_target_r: float = 15.0
+    max_daily_loss_usd: float = 100.0  # Hard daily loss limit in USD (blocks new entries if realized_pnl_today <= -max_daily_loss_usd)
     max_consec_losses: int = 3
     cooldown_after_sl_s: int = 120
     min_risk_usd_floor: float = 0.25
@@ -195,6 +196,33 @@ def check_day_limits(
         reasons.append("daily_target")
     if state.consec_losses >= risk.max_consec_losses:
         reasons.append("cooldown_required")
+    return RiskDecision(allow=(len(reasons) == 0), reasons=reasons)
+
+
+def check_daily_loss_usd(
+    realized_pnl_today: float,
+    risk: RiskCfg,
+) -> RiskDecision:
+    """
+    Hard daily loss limit check using AccountState.realized_pnl_today (USD).
+    
+    Block new entries if realized_pnl_today <= -max_daily_loss_usd threshold (daily stop).
+    
+    Args:
+        realized_pnl_today: Realized PnL for today in USD from AccountState
+        risk: RiskCfg with max_daily_loss_usd parameter
+        
+    Returns:
+        RiskDecision with allow=False if daily loss limit is hit
+    """
+    reasons: List[str] = []
+    
+    max_loss = float(getattr(risk, "max_daily_loss_usd", 0.0) or 0.0)
+    if max_loss > 0.0:
+        # Block new entries if daily realized PnL is below the max_daily_loss_usd threshold (daily stop)
+        if realized_pnl_today <= -max_loss:
+            reasons.append(f"daily_loss_limit_usd:{realized_pnl_today:.2f}<={-max_loss:.2f}")
+    
     return RiskDecision(allow=(len(reasons) == 0), reasons=reasons)
 
 
